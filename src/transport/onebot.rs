@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc};
 use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
@@ -176,19 +176,28 @@ pub struct OneBotMetaStatusDto {
 
 impl OneBotMessageSegmentDto {
     /// 将 OneBot 消息段数组渲染成适合写入聊天记录和提示词的临时文本。
-    fn render_message_text(segments: &[Self], bot_id: i64) -> String {
+    fn render_message_text(
+        segments: &[Self],
+        bot_id: i64,
+        at_display_names: &HashMap<String, String>,
+    ) -> String {
         let mut text = String::new();
         for segment in segments {
-            segment.push_display_text(&mut text, bot_id);
+            segment.push_display_text(&mut text, bot_id, at_display_names);
         }
         text.trim().to_string()
     }
 
     /// 将单个消息段追加到展示文本中；非文本段用简短占位符表达。
-    fn push_display_text(&self, output: &mut String, bot_id: i64) {
+    fn push_display_text(
+        &self,
+        output: &mut String,
+        bot_id: i64,
+        at_display_names: &HashMap<String, String>,
+    ) {
         match self.type_.as_str() {
             "text" => Self::push_text(output, self.data_string("text").as_deref().unwrap_or_default()),
-            "at" => Self::push_token(output, &self.render_at_text(bot_id)),
+            "at" => Self::push_token(output, &self.render_at_text(bot_id, at_display_names)),
             "face" => Self::push_token(output, "[表情]"),
             "image" => Self::push_token(output, "[图片]"),
             "record" => Self::push_token(output, "[语音]"),
@@ -212,8 +221,8 @@ impl OneBotMessageSegmentDto {
         }
     }
 
-    /// 渲染 @ 消息段；标准 OneBot at 段通常只有 qq，因此默认显示 QQ 号。
-    fn render_at_text(&self, bot_id: i64) -> String {
+    /// 渲染 @ 消息段；优先使用调用方解析出的昵称，失败时退回 QQ 号。
+    fn render_at_text(&self, bot_id: i64, at_display_names: &HashMap<String, String>) -> String {
         let Some(qq) = self.data_string("qq") else {
             return "@未知用户".to_string();
         };
@@ -221,6 +230,8 @@ impl OneBotMessageSegmentDto {
             "@全体成员".to_string()
         } else if qq == bot_id.to_string() {
             "@你".to_string()
+        } else if let Some(display_name) = at_display_names.get(&qq) {
+            format!("@{}", display_name)
         } else {
             format!("@{}", qq)
         }
@@ -279,17 +290,41 @@ impl OneBotMessageSegmentDto {
 
 impl OneBotMessageEnvelopeDto {
     /// 转换为 transport 层通用消息结构。
-    fn into_incoming_message(self) -> IncomingMessage {
+    async fn into_incoming_message(self, server: &OneBotHttpServer) -> IncomingMessage {
         match self.message {
-            OneBotMessageDto::Private(message) => message.into_incoming_message(self.time, self.self_id),
-            OneBotMessageDto::Group(message) => message.into_incoming_message(self.time, self.self_id),
+            OneBotMessageDto::Private(message) => {
+                server.cache_user_display_name(message.user_id, &message.sender.nickname);
+                message.into_incoming_message(self.time, self.self_id, &HashMap::new())
+            }
+            OneBotMessageDto::Group(message) => {
+                let sender_display_name = OneBotHttpServer::member_display_name(
+                    &message.sender.nickname,
+                    message.sender.card.as_deref(),
+                );
+                server.cache_group_member_display_name(
+                    message.group_id,
+                    message.sender.user_id,
+                    &sender_display_name,
+                );
+                let at_display_names = server.resolve_at_display_names(
+                    &message.message,
+                    self.self_id,
+                    message.group_id,
+                ).await;
+                message.into_incoming_message(self.time, self.self_id, &at_display_names)
+            }
         }
     }
 }
 
 impl OneBotPrivateMessageDto {
     /// 将 OneBot 私聊消息转换为通用消息。
-    fn into_incoming_message(self, timestamp: i64, self_id: i64) -> IncomingMessage {
+    fn into_incoming_message(
+        self,
+        timestamp: i64,
+        self_id: i64,
+        at_display_names: &HashMap<String, String>,
+    ) -> IncomingMessage {
         let OneBotPrivateMessageDto {
             sub_type,
             message_id,
@@ -305,7 +340,7 @@ impl OneBotPrivateMessageDto {
             sex,
             age,
         } = sender;
-        let text = OneBotMessageSegmentDto::render_message_text(&message, self_id);
+        let text = OneBotMessageSegmentDto::render_message_text(&message, self_id, at_display_names);
         let parts = message
             .into_iter()
             .map(OneBotMessageSegmentDto::into_message_part)
@@ -349,7 +384,12 @@ impl OneBotPrivateMessageDto {
 
 impl OneBotGroupMessageDto {
     /// 将 OneBot 群聊消息转换为通用消息。
-    fn into_incoming_message(self, timestamp: i64, self_id: i64) -> IncomingMessage {
+    fn into_incoming_message(
+        self,
+        timestamp: i64,
+        self_id: i64,
+        at_display_names: &HashMap<String, String>,
+    ) -> IncomingMessage {
         let OneBotGroupMessageDto {
             sub_type,
             message_id,
@@ -371,7 +411,7 @@ impl OneBotGroupMessageDto {
             role,
             title,
         } = sender;
-        let text = OneBotMessageSegmentDto::render_message_text(&message, self_id);
+        let text = OneBotMessageSegmentDto::render_message_text(&message, self_id, at_display_names);
         let parts = message
             .into_iter()
             .map(OneBotMessageSegmentDto::into_message_part)
@@ -430,6 +470,24 @@ pub struct OneBotHttpResult {
     pub retcode: i32,
 }
 
+/// OneBot API 通用响应。
+#[derive(Deserialize, Debug)]
+struct OneBotApiResponse<T> {
+    /// 状态码，0 通常表示成功。
+    retcode: i32,
+    /// API 返回数据。
+    data: Option<T>,
+}
+
+/// OneBot 群成员信息响应数据。
+#[derive(Deserialize, Debug)]
+struct OneBotGroupMemberInfoDto {
+    /// QQ 昵称。
+    nickname: String,
+    /// 群名片。
+    card: Option<String>,
+}
+
 const DEFAULT_EVENT_BUFFER_CAPACITY: usize = 128;
 
 /// onebot协议 http服务端
@@ -447,6 +505,8 @@ pub struct OneBotHttpServer {
     message_notify: Arc<Notify>,
     /// OneBot HTTP API 地址。
     onebot_api_url: String,
+    /// 群成员展示名缓存，key 使用 group_id:user_id 或 user_id。
+    member_name_cache: Arc<Mutex<HashMap<String, String>>>,
     /// 校验上报请求使用的服务端 token。
     token: Option<String>,
     /// 发送 OneBot HTTP 请求的客户端。
@@ -464,6 +524,7 @@ impl OneBotHttpServer {
             event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
             message_notify: Arc::new(Notify::new()),
             onebot_api_url: config.server.onebot_api.clone(),
+            member_name_cache: Arc::new(Mutex::new(HashMap::new())),
             client: Client::new(),
             token: if config.server.server_token.is_empty() {
                 None
@@ -516,13 +577,13 @@ impl OneBotHttpServer {
     }
 
     /// 非阻塞地取出缓冲区里最新的一条消息事件。
-    pub fn try_take_latest_message(&self) -> Option<IncomingMessage> {
+    fn try_take_latest_message_event(&self) -> Option<OneBotMessageEnvelopeDto> {
         let mut event_buffer = self.event_buffer.lock();
         let latest_message_index = event_buffer
             .iter()
             .rposition(|event| matches!(event, OneBotEventDto::Message(_)))?;
         match event_buffer.remove(latest_message_index) {
-            Some(OneBotEventDto::Message(message)) => Some(message.into_incoming_message()),
+            Some(OneBotEventDto::Message(message)) => Some(message),
             _ => None,
         }
     }
@@ -530,11 +591,138 @@ impl OneBotHttpServer {
     /// 异步等待下一条可用消息，并从缓冲区中取出它。
     pub async fn recv_latest_message(&self) -> IncomingMessage {
         loop {
-            if let Some(message) = self.try_take_latest_message() {
-                return message;
+            if let Some(message) = self.try_take_latest_message_event() {
+                return message.into_incoming_message(self).await;
             }
             self.message_notify.notified().await;
         }
+    }
+
+    /// 缓存普通用户展示名，作为群内缓存缺失时的兜底。
+    fn cache_user_display_name(&self, user_id: i64, display_name: &str) {
+        let display_name = display_name.trim();
+        if display_name.is_empty() {
+            return;
+        }
+        self.member_name_cache
+            .lock()
+            .insert(Self::user_cache_key(user_id), display_name.to_string());
+    }
+
+    /// 缓存指定群内成员展示名，并同步写入普通用户缓存。
+    fn cache_group_member_display_name(&self, group_id: i64, user_id: i64, display_name: &str) {
+        let display_name = display_name.trim();
+        if display_name.is_empty() {
+            return;
+        }
+
+        let mut cache = self.member_name_cache.lock();
+        cache.insert(Self::group_member_cache_key(group_id, user_id), display_name.to_string());
+        cache.insert(Self::user_cache_key(user_id), display_name.to_string());
+    }
+
+    /// 从缓存或 OneBot API 中解析消息里 @ 目标的展示名。
+    async fn resolve_at_display_names(
+        &self,
+        segments: &[OneBotMessageSegmentDto],
+        bot_id: i64,
+        group_id: i64,
+    ) -> HashMap<String, String> {
+        let mut at_display_names = HashMap::new();
+        for segment in segments {
+            if segment.type_ != "at" {
+                continue;
+            }
+
+            let Some(qq) = segment.data_string("qq") else {
+                continue;
+            };
+            if qq == "all" || qq == bot_id.to_string() || at_display_names.contains_key(&qq) {
+                continue;
+            }
+
+            let Ok(user_id) = qq.parse::<i64>() else {
+                continue;
+            };
+            if let Some(display_name) = self.cached_member_display_name(group_id, user_id) {
+                at_display_names.insert(qq, display_name);
+                continue;
+            }
+
+            if let Some(display_name) = self.fetch_group_member_display_name(group_id, user_id).await {
+                self.cache_group_member_display_name(group_id, user_id, &display_name);
+                at_display_names.insert(qq, display_name);
+            }
+        }
+        at_display_names
+    }
+
+    /// 从缓存中获取群成员展示名，优先群内名片，兜底普通用户昵称。
+    fn cached_member_display_name(&self, group_id: i64, user_id: i64) -> Option<String> {
+        let cache = self.member_name_cache.lock();
+        cache
+            .get(&Self::group_member_cache_key(group_id, user_id))
+            .or_else(|| cache.get(&Self::user_cache_key(user_id)))
+            .cloned()
+    }
+
+    /// 调用 OneBot API 获取单个群成员信息。
+    async fn fetch_group_member_display_name(&self, group_id: i64, user_id: i64) -> Option<String> {
+        let payload = serde_json::json!({
+            "group_id": group_id,
+            "user_id": user_id,
+            "no_cache": false,
+        });
+        let mut request = self.client
+            .post(format!("{}/get_group_member_info", self.onebot_api_url))
+            .json(&payload);
+
+        if let Some(token) = &self.onebot_token {
+            request = request.header(AUTHORIZATION, format!("Bearer {}", token));
+        }
+
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                eprintln!("查询群成员信息失败: group_id={}, user_id={}, err={}", group_id, user_id, err);
+                return None;
+            }
+        };
+        let result = match resp.json::<OneBotApiResponse<OneBotGroupMemberInfoDto>>().await {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("解析群成员信息失败: group_id={}, user_id={}, err={}", group_id, user_id, err);
+                return None;
+            }
+        };
+        if result.retcode != 0 {
+            eprintln!("查询群成员信息返回错误: group_id={}, user_id={}, retcode={}", group_id, user_id, result.retcode);
+            return None;
+        }
+
+        result
+            .data
+            .map(|member| Self::member_display_name(&member.nickname, member.card.as_deref()))
+            .filter(|display_name| !display_name.trim().is_empty())
+    }
+
+    /// 优先使用群名片，群名片为空时使用 QQ 昵称。
+    fn member_display_name(nickname: &str, card: Option<&str>) -> String {
+        card
+            .map(str::trim)
+            .filter(|card| !card.is_empty())
+            .unwrap_or_else(|| nickname.trim())
+            .to_string()
+    }
+
+    /// 群成员缓存 key。
+    fn group_member_cache_key(group_id: i64, user_id: i64) -> String {
+        format!("group:{}:{}", group_id, user_id)
+    }
+
+    /// 普通用户缓存 key。
+    fn user_cache_key(user_id: i64) -> String {
+        format!("user:{}", user_id)
     }
 
     /// 返回当前缓冲区里累计的事件数量。

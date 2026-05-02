@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, sleep_until, timeout, Duration, Instant};
 
 use crate::config::AppConfig;
+use crate::message_enricher::MessageEnricher;
 use crate::pipeline::ai_action::{RespAction, RespActionPlan};
 use crate::repository::db_manager::{ChatMessage, QQChatContextManager};
 use crate::transport::message::{ConversationKind, IncomingMessage};
@@ -22,11 +23,16 @@ const MESSAGE_BATCH_MAX_MESSAGES: usize = 5;
 const FOLLOW_UP_DELAY_MIN_SECS: u64 = 5;
 /// schedule_follow_up 允许的最长等待秒数。
 const FOLLOW_UP_DELAY_MAX_SECS: u64 = 600;
+/// ignore_messages 允许的最短忽略秒数。
+const IGNORE_MESSAGES_MIN_SECS: u64 = 10;
+/// ignore_messages 允许的最长忽略秒数。
+const IGNORE_MESSAGES_MAX_SECS: u64 = 600;
 
 pub struct ChatPipeline {
     pub db_manager: Arc<QQChatContextManager>,
     transport_server: Arc<OneBotHttpServer>,
     app_config: Arc<AppConfig>,
+    message_enricher: MessageEnricher,
     conversation_workers: HashMap<String, mpsc::Sender<IncomingMessage>>,
 }
 
@@ -44,6 +50,7 @@ struct ConversationWorker {
     scene: String,
     last_action_plan: Option<LastActionPlan>,
     pending_follow_up: Option<PendingFollowUp>,
+    ignore_messages_until: Option<Instant>,
 }
 
 /// 等待中的后续跟进任务。
@@ -67,10 +74,12 @@ struct BuiltChatContext {
 impl ChatPipeline {
     /// 创建聊天处理流水线，主循环只负责接收消息并分发给会话 worker。
     pub fn new(db_manager: Arc<QQChatContextManager>, transport_server: Arc<OneBotHttpServer> , app_config: AppConfig) -> Self {
+        let app_config = Arc::new(app_config);
         Self {
-            db_manager,
+            db_manager: db_manager.clone(),
             transport_server,
-            app_config: Arc::new(app_config),
+            message_enricher: MessageEnricher::new(app_config.clone(), db_manager),
+            app_config,
             conversation_workers: HashMap::new(),
         }
     }
@@ -82,6 +91,7 @@ impl ChatPipeline {
             if self.should_skip_message(&incoming_message) {
                 continue;
             }
+            let incoming_message = self.message_enricher.enrich(incoming_message).await;
 
             let conversation_key = Self::conversation_key(&incoming_message);
             let worker_tx = self.get_or_spawn_worker(&conversation_key, &incoming_message);
@@ -180,6 +190,7 @@ impl ConversationWorker {
             scene,
             last_action_plan: None,
             pending_follow_up: None,
+            ignore_messages_until: None,
         }
     }
 
@@ -202,6 +213,30 @@ impl ConversationWorker {
         message_rx: &mut mpsc::Receiver<IncomingMessage>,
     ) -> Option<IncomingMessage> {
         loop {
+            if let Some(ignore_until) = self.ignore_messages_until {
+                if Instant::now() < ignore_until {
+                    tokio::select! {
+                        incoming_message = message_rx.recv() => {
+                            let Some(incoming_message) = incoming_message else {
+                                return None;
+                            };
+                            self.pending_follow_up = None;
+                            if Self::mentions_bot(&incoming_message) {
+                                self.ignore_messages_until = None;
+                                return Some(incoming_message);
+                            }
+                            self.write_ignored_message(&incoming_message);
+                            continue;
+                        }
+                        _ = sleep_until(ignore_until) => {
+                            self.ignore_messages_until = None;
+                            continue;
+                        }
+                    }
+                }
+                self.ignore_messages_until = None;
+            }
+
             let Some(ready_at) = self.pending_follow_up.as_ref().map(|follow_up| follow_up.ready_at) else {
                 return message_rx.recv().await;
             };
@@ -220,6 +255,36 @@ impl ConversationWorker {
                     }
                 }
             }
+        }
+    }
+
+    /// 判断消息是否 @ 了当前机器人账号。
+    fn mentions_bot(incoming_message: &IncomingMessage) -> bool {
+        incoming_message.content.parts.iter().any(|part| {
+            part.kind == "at"
+                && part.data
+                    .get("qq")
+                    .and_then(|value| {
+                        value.as_str()
+                            .map(ToString::to_string)
+                            .or_else(|| value.as_i64().map(|number| number.to_string()))
+                            .or_else(|| value.as_u64().map(|number| number.to_string()))
+                    })
+                    .is_some_and(|qq| qq == incoming_message.bot_id)
+        })
+    }
+
+    /// 忽略期内的新消息只入库，不进入聚合和 AI 请求流程。
+    fn write_ignored_message(&self, incoming_message: &IncomingMessage) {
+        println!(
+            "忽略{}消息，会话 {}，{}: {:?}",
+            self.scene,
+            self.conversation_key,
+            incoming_message.sender.display_name,
+            incoming_message.content.text
+        );
+        if let Err(err) = self.db_manager.write_incoming_message(incoming_message) {
+            eprintln!("写入忽略消息失败: {}", err);
         }
     }
 
@@ -247,7 +312,7 @@ impl ConversationWorker {
         });
         let incoming_message = incoming_messages
             .last()
-            .expect("incoming messages must not be empty")
+            .expect("待处理消息列表不应为空")
             .clone();
         println!(
             "收到{}信息 {} 条，会话 {}，最新 {}: {:?}",
@@ -309,7 +374,7 @@ impl ConversationWorker {
                     .app_config
                     .ai_providers
                     .get(&self.app_config.app.chat_model_name)
-                    .expect("Chat model not found");
+                    .expect("找不到聊天模型配置");
                 chat_provider.chat_completions(messages).await
             };
 
@@ -501,6 +566,9 @@ impl ConversationWorker {
                 RespAction::ScheduleFollowUp { delay_seconds, reason } => {
                     self.execute_schedule_follow_up(incoming_message, delay_seconds, reason);
                 }
+                RespAction::IgnoreMessages { duration_seconds } => {
+                    self.execute_ignore_messages(duration_seconds);
+                }
             }
         }
     }
@@ -529,7 +597,7 @@ impl ConversationWorker {
         self.transport_server
             .send_message(incoming_message.clone(), &text, self.db_manager.clone())
             .await
-            .expect("Failed to send reply");
+            .expect("发送回复失败");
         Utc::now().timestamp_millis() as f64 / 1000.0
     }
 
@@ -562,6 +630,14 @@ impl ConversationWorker {
             reason,
             conversation_snapshot: incoming_message.clone(),
         });
+    }
+
+    /// 执行忽略消息动作：一段时间内新消息只入库，不触发 AI 请求。
+    fn execute_ignore_messages(&mut self, duration_seconds: u64) {
+        let duration_seconds = duration_seconds.clamp(IGNORE_MESSAGES_MIN_SECS, IGNORE_MESSAGES_MAX_SECS);
+        eprintln!("忽略后续消息: duration_seconds={}", duration_seconds);
+        self.pending_follow_up = None;
+        self.ignore_messages_until = Some(Instant::now() + Duration::from_secs(duration_seconds));
     }
 
     /// 将本轮动作列表压缩成动作类型数组字符串，用于下一轮提示词中的上一轮动作。

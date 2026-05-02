@@ -1,6 +1,7 @@
 mod ai_provider;
 mod repository;
 mod config;
+mod message_enricher;
 mod pipeline;
 mod transport;
 
@@ -53,5 +54,4 @@ impl SendMessageInfo {
         }
     }
 }
-
 

@@ -10,6 +10,9 @@ use crate::ai_provider::{
     ContextMessage,
 };
 
+/// 视觉识别只做图片转写，固定使用最低推理强度。
+const VISION_REASONING_EFFORT: &str = "minimal";
+
 // ========== OpenAI Compatible 接口 ==========
 pub struct OpenAICompatibleProvider {
     http_client: Client,
@@ -59,6 +62,37 @@ struct OpenAICompatibleResponseFormat {
 struct OpenAICompatibleChatMessage<'a> {
     role: &'a str, // 这里不存 Role，直接存字符串引用
     content: &'a str,
+}
+
+/// OpenAI Compatible 视觉描述请求结构
+#[derive(Serialize)]
+struct OpenAICompatibleVisionRequest<'a> {
+    model: &'a str,
+    messages: Vec<OpenAICompatibleVisionMessage<'a>>,
+    max_tokens: i32,
+    reasoning_effort: &'a str,
+}
+
+#[derive(Serialize)]
+struct OpenAICompatibleVisionMessage<'a> {
+    role: &'a str,
+    content: Vec<OpenAICompatibleVisionContent<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAICompatibleVisionContent<'a> {
+    Text {
+        text: &'a str,
+    },
+    ImageUrl {
+        image_url: OpenAICompatibleImageUrl<'a>,
+    },
+}
+
+#[derive(Serialize)]
+struct OpenAICompatibleImageUrl<'a> {
+    url: &'a str,
 }
 
 /// OpenAI Compatible 响应结构
@@ -120,14 +154,14 @@ impl AIProvider for OpenAICompatibleProvider {
             let status = resp.status();
             // 尝试把错误 Body 读出来
             let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("OpenAI Compatible API call failed with status {}: {}", status, error_text));
+            return Err(anyhow!("OpenAI Compatible API 调用失败，状态码 {}：{}", status, error_text));
         }
         let response_text = resp.text().await?;
         let raw_response: Value = serde_json::from_str(&response_text)?;
         let parsed: OpenAICompatibleChatResponse = serde_json::from_str(&response_text)
             .map_err(|e| {
                 anyhow!(
-                    "failed to parse OpenAI Compatible response: {}\nraw response:\n{}",
+                    "解析 OpenAI Compatible 响应失败：{}\n原始响应：\n{}",
                     e,
                     response_text
                 )
@@ -136,7 +170,7 @@ impl AIProvider for OpenAICompatibleProvider {
             .choices
             .get(0)
             .and_then(|c| c.message.content.clone())
-            .ok_or_else(|| anyhow!("empty content in OpenAI Compatible response"))?;
+            .ok_or_else(|| anyhow!("OpenAI Compatible 响应内容为空"))?;
 
         let reasoning_content = parsed
             .choices
@@ -162,5 +196,54 @@ impl AIProvider for OpenAICompatibleProvider {
             usage,
             raw_response,
         })
+    }
+
+    async fn describe_image(&self, image_data_url: &str, prompt: &str) -> anyhow::Result<String> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let body = OpenAICompatibleVisionRequest {
+            model: &self.model,
+            messages: vec![OpenAICompatibleVisionMessage {
+                role: "user",
+                content: vec![
+                    OpenAICompatibleVisionContent::Text { text: prompt },
+                    OpenAICompatibleVisionContent::ImageUrl {
+                        image_url: OpenAICompatibleImageUrl {
+                            url: image_data_url,
+                        },
+                    },
+                ],
+            }],
+            max_tokens: self.max_tokens,
+            reasoning_effort: VISION_REASONING_EFFORT,
+        };
+
+        let resp = self
+            .http_client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("OpenAI Compatible 视觉 API 调用失败，状态码 {}：{}", status, error_text));
+        }
+
+        let response_text = resp.text().await?;
+        let parsed: OpenAICompatibleChatResponse = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                anyhow!(
+                    "解析 OpenAI Compatible 视觉响应失败：{}\n原始响应：\n{}",
+                    e,
+                    response_text
+                )
+            })?;
+        parsed
+            .choices
+            .get(0)
+            .and_then(|c| c.message.content.clone())
+            .ok_or_else(|| anyhow!("OpenAI Compatible 视觉响应内容为空"))
     }
 }

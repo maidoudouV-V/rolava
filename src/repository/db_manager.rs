@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, params_from_iter, Row, Transaction};
+use rusqlite::{params, params_from_iter, OptionalExtension, Row, Transaction};
 use serde_json::{json, Value};
 use crate::transport::message::{ConversationKind, IncomingMessage};
 
@@ -101,6 +101,40 @@ pub struct NewChatMessage {
     pub event_timestamp: i64,
 }
 
+/// 已接收图片记录。
+#[derive(Debug, Clone)]
+pub struct ReceivedImageRecord {
+    /// 图片短 ID，用于提示词和后续引用。
+    pub image_id: String,
+    /// 图片内容哈希，用于去重。
+    pub content_hash: String,
+    /// 图片本地保存路径。
+    pub local_path: String,
+    /// 图片内容简短描述。
+    pub description: String,
+}
+
+/// 一条待写入的接收图片记录。
+#[derive(Debug, Clone)]
+pub struct NewReceivedImage {
+    /// 图片短 ID。
+    pub image_id: String,
+    /// 图片内容哈希。
+    pub content_hash: String,
+    /// 图片本地保存路径。
+    pub local_path: String,
+    /// 图片原始下载地址。
+    pub original_url: Option<String>,
+    /// 图片 MIME 类型。
+    pub mime_type: Option<String>,
+    /// 图片文件大小，单位字节。
+    pub file_size: i64,
+    /// 图片内容简短描述。
+    pub description: String,
+    /// 扩展信息 JSON。
+    pub metadata_json: String,
+}
+
 impl ConversationRecord {
     /// 将数据库行转换为会话目录记录。
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
@@ -195,6 +229,23 @@ impl QQChatContextManager {
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_conversation_source_message
             ON messages (conversation_id, source_message_id);
+
+            CREATE TABLE IF NOT EXISTS received_images (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                image_id        TEXT    NOT NULL UNIQUE,
+                content_hash    TEXT    NOT NULL UNIQUE,
+                local_path      TEXT    NOT NULL,
+                original_url    TEXT,
+                mime_type       TEXT,
+                file_size       INTEGER NOT NULL,
+                description     TEXT    NOT NULL,
+                metadata_json   TEXT    NOT NULL DEFAULT '{}',
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_received_images_content_hash
+            ON received_images (content_hash);
             "
         )?;
         Self::ensure_messages_is_read_column(&conn)?;
@@ -475,6 +526,76 @@ impl QQChatContextManager {
         );
         let connection = self.conn_pool.get()?;
         connection.execute(&sql, params_from_iter(message_ids.iter().copied()))?;
+        Ok(())
+    }
+
+    /// 根据图片内容哈希查询已接收图片，用于重复图片复用描述。
+    pub fn get_received_image_by_hash(&self, content_hash: &str) -> Result<Option<ReceivedImageRecord>> {
+        let connection = self.conn_pool.get()?;
+        let record = connection
+            .query_row(
+                "
+                SELECT image_id, content_hash, local_path, description
+                FROM received_images
+                WHERE content_hash = ?1
+                ",
+                params![content_hash],
+                |row| {
+                    Ok(ReceivedImageRecord {
+                        image_id: row.get(0)?,
+                        content_hash: row.get(1)?,
+                        local_path: row.get(2)?,
+                        description: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// 判断图片短 ID 是否已经存在，避免随机 ID 碰撞。
+    pub fn received_image_id_exists(&self, image_id: &str) -> Result<bool> {
+        let connection = self.conn_pool.get()?;
+        let exists: i64 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM received_images WHERE image_id = ?1)",
+            params![image_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    /// 写入一张新接收图片的索引记录。
+    pub fn insert_received_image(&self, image: &NewReceivedImage) -> Result<()> {
+        let now_timestamp = Utc::now().timestamp();
+        let connection = self.conn_pool.get()?;
+        connection.execute(
+            "
+            INSERT INTO received_images (
+                image_id,
+                content_hash,
+                local_path,
+                original_url,
+                mime_type,
+                file_size,
+                description,
+                metadata_json,
+                created_at,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                &image.image_id,
+                &image.content_hash,
+                &image.local_path,
+                Self::normalize_optional_text(image.original_url.as_deref()),
+                Self::normalize_optional_text(image.mime_type.as_deref()),
+                image.file_size,
+                &image.description,
+                &image.metadata_json,
+                now_timestamp,
+                now_timestamp,
+            ],
+        )?;
         Ok(())
     }
 

@@ -29,6 +29,10 @@ pub struct AppSection {
     pub chat_model_name: String,
     /// 默认 Agent 模型名称
     pub agent_model_name: String,
+    /// 默认视觉模型名称，用于图片识别等消息增强流程。
+    pub visual_model_name: String,
+    /// 接收到的图片本地保存目录。
+    pub received_image_dir: String,
     /// 启用的工具列表
     pub tools: Vec<String>,
     /// 私聊白名单 QQ 号，空数组表示放行所有私聊。
@@ -112,7 +116,7 @@ impl AppConfig {
                     provider_config.max_tokens,
                     provider_config.reasoning_effort,
                 )),
-                _ => return Err(anyhow::anyhow!("Unsupported provider type: {}", provider_config.r#type)),
+                _ => return Err(anyhow::anyhow!("不支持的服务商类型：{}", provider_config.r#type)),
             };
             ai_providers.insert(provider_config.name.clone(), provider);
         }

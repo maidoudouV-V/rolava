@@ -24,6 +24,9 @@ pub enum RespAction {
         delay_seconds: u64,
         reason: String,
     },
+    IgnoreMessages {
+        duration_seconds: u64,
+    },
 }
 
 impl RespAction {
@@ -33,6 +36,7 @@ impl RespAction {
             RespAction::CallTool { .. } => "call_tool",
             RespAction::Remember { .. } => "remember",
             RespAction::ScheduleFollowUp { .. } => "schedule_follow_up",
+            RespAction::IgnoreMessages { .. } => "ignore_messages",
         }
     }
 }

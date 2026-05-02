@@ -10,6 +10,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// 视觉识别只做图片转写，固定使用 OpenRouter 支持的最低推理强度。
+const VISION_REASONING_EFFORT: &str = "low";
+
 // ========== OpenRouter 接口 ==========
 pub struct OpenRouterProvider {
     http_client: Client,
@@ -64,6 +67,37 @@ struct OpenRouterResponseFormat {
 struct OpenRouterChatMessage<'a> {
     role: &'a str,
     content: &'a str,
+}
+
+/// OpenRouter 视觉描述请求结构
+#[derive(Serialize)]
+struct OpenRouterVisionRequest<'a> {
+    model: &'a str,
+    messages: Vec<OpenRouterVisionMessage<'a>>,
+    max_completion_tokens: i32,
+    reasoning: OpenRouterReasoning<'a>,
+}
+
+#[derive(Serialize)]
+struct OpenRouterVisionMessage<'a> {
+    role: &'a str,
+    content: Vec<OpenRouterVisionContent<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenRouterVisionContent<'a> {
+    Text {
+        text: &'a str,
+    },
+    ImageUrl {
+        image_url: OpenRouterImageUrl<'a>,
+    },
+}
+
+#[derive(Serialize)]
+struct OpenRouterImageUrl<'a> {
+    url: &'a str,
 }
 
 /// OpenRouter Chat Completions 响应结构
@@ -133,7 +167,7 @@ impl AIProvider for OpenRouterProvider {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
             return Err(anyhow!(
-                "OpenRouter API call failed with status {}: {}",
+                "OpenRouter API 调用失败，状态码 {}：{}",
                 status,
                 error_text
             ));
@@ -144,7 +178,7 @@ impl AIProvider for OpenRouterProvider {
         let parsed: OpenRouterChatResponse = serde_json::from_str(&response_text)
             .map_err(|e| {
                 anyhow!(
-                    "failed to parse OpenRouter response: {}\nraw response:\n{}",
+                    "解析 OpenRouter 响应失败：{}\n原始响应：\n{}",
                     e,
                     response_text
                 )
@@ -153,7 +187,7 @@ impl AIProvider for OpenRouterProvider {
             .choices
             .get(0)
             .and_then(|c| c.message.content.clone())
-            .ok_or_else(|| anyhow!("empty content in OpenRouter response"))?;
+            .ok_or_else(|| anyhow!("OpenRouter 响应内容为空"))?;
 
         let reasoning_content = parsed
             .choices
@@ -196,6 +230,62 @@ impl AIProvider for OpenRouterProvider {
             usage,
             raw_response,
         })
+    }
+
+    async fn describe_image(&self, image_data_url: &str, prompt: &str) -> anyhow::Result<String> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let body = OpenRouterVisionRequest {
+            model: &self.model,
+            messages: vec![OpenRouterVisionMessage {
+                role: "user",
+                content: vec![
+                    OpenRouterVisionContent::Text { text: prompt },
+                    OpenRouterVisionContent::ImageUrl {
+                        image_url: OpenRouterImageUrl {
+                            url: image_data_url,
+                        },
+                    },
+                ],
+            }],
+            max_completion_tokens: self.max_tokens,
+            reasoning: OpenRouterReasoning {
+                effort: VISION_REASONING_EFFORT,
+            },
+        };
+
+        let resp = self
+            .http_client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .header("X-OpenRouter-Title", env!("CARGO_PKG_NAME"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "OpenRouter 视觉 API 调用失败，状态码 {}：{}",
+                status,
+                error_text
+            ));
+        }
+
+        let response_text = resp.text().await?;
+        let parsed: OpenRouterChatResponse = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                anyhow!(
+                    "解析 OpenRouter 视觉响应失败：{}\n原始响应：\n{}",
+                    e,
+                    response_text
+                )
+            })?;
+        parsed
+            .choices
+            .get(0)
+            .and_then(|c| c.message.content.clone())
+            .ok_or_else(|| anyhow!("OpenRouter 视觉响应内容为空"))
     }
 }
 

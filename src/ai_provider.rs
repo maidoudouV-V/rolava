@@ -63,4 +63,8 @@ pub struct ChatResponse {
 #[async_trait]
 pub trait AIProvider{
     async fn chat_completions(&self, request_message: &Vec<ContextMessage>) -> Result<ChatResponse>;
+
+    async fn describe_image(&self, _image_data_url: &str, _prompt: &str) -> Result<String> {
+        anyhow::bail!("当前服务商不支持图片描述")
+    }
 }
