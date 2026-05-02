@@ -262,7 +262,11 @@ impl ConversationWorker {
             self.db_manager.write_incoming_message(message).unwrap();
         }
         let context = self.build_context(&incoming_message, "你收到了一条或多条新的聊天消息。");
-        println!("构建上下文：\n {}", serde_json::to_string_pretty(&context.messages).unwrap());
+        let recent_messages_start = context.messages.len().saturating_sub(5);
+        println!(
+            "构建上下文：\n {}",
+            serde_json::to_string_pretty(&context.messages[recent_messages_start..]).unwrap()
+        );
 
         if let Some(action_plan) = self.request_ai_action_plan(&context.messages).await {
             self.handle_action_plan(
