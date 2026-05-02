@@ -1,0 +1,7 @@
+/target/
+/config/
+/.idea/
+*.db
+*.sqlite
+*.sqlite3
+/prompt/
