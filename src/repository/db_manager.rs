@@ -1,10 +1,10 @@
+use crate::transport::message::{ConversationKind, IncomingMessage};
 use anyhow::Result;
 use chrono::Utc;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, params_from_iter, OptionalExtension, Row, Transaction};
 use serde_json::{json, Value};
-use crate::transport::message::{ConversationKind, IncomingMessage};
 
 /// 一条会话目录记录。
 #[derive(Debug, Clone)]
@@ -246,7 +246,7 @@ impl QQChatContextManager {
 
             CREATE INDEX IF NOT EXISTS idx_received_images_content_hash
             ON received_images (content_hash);
-            "
+            ",
         )?;
         Self::ensure_messages_is_read_column(&conn)?;
 
@@ -272,12 +272,16 @@ impl QQChatContextManager {
 
     /// 将通用入站消息转换为标准写入请求。
     pub fn new_message_from_incoming(message: &IncomingMessage) -> NewChatMessage {
-        let message_type = message.content.parts
+        let message_type = message
+            .content
+            .parts
             .first()
             .map(|part| part.kind.clone())
             .unwrap_or_else(|| "text".to_string());
         let content_parts_json = Value::Array(
-            message.content.parts
+            message
+                .content
+                .parts
                 .iter()
                 .map(|part| {
                     json!({
@@ -285,13 +289,15 @@ impl QQChatContextManager {
                         "data": part.data
                     })
                 })
-                .collect()
-        ).to_string();
+                .collect(),
+        )
+        .to_string();
 
         NewChatMessage {
             source: message.source.clone(),
             source_conversation_id: message.conversation.id.clone(),
-            conversation_kind: Self::conversation_kind_as_str(&message.conversation.kind).to_string(),
+            conversation_kind: Self::conversation_kind_as_str(&message.conversation.kind)
+                .to_string(),
             conversation_title: message.conversation.title.clone(),
             conversation_metadata_json: "{}".to_string(),
             source_message_id: message.message_id.clone(),
@@ -387,7 +393,7 @@ impl QQChatContextManager {
                 last_message_at
             FROM conversations
             WHERE source = ?1 AND source_conversation_id = ?2
-            "
+            ",
         )?;
 
         let mut rows = stmt.query(params![source, source_conversation_id])?;
@@ -410,15 +416,10 @@ impl QQChatContextManager {
         }
 
         let connection = self.conn_pool.get()?;
-        let total_message_count = Self::count_conversation_messages(
-            &connection,
-            source,
-            source_conversation_id,
-        )?;
-        let history_offset = Self::history_block_offset(
-            total_message_count,
-            max_history_messages as i64,
-        );
+        let total_message_count =
+            Self::count_conversation_messages(&connection, source, source_conversation_id)?;
+        let history_offset =
+            Self::history_block_offset(total_message_count, max_history_messages as i64);
 
         let mut stmt = connection.prepare(
             "
@@ -453,7 +454,7 @@ impl QQChatContextManager {
                 m.id ASC
             LIMIT ?3
             OFFSET ?4
-            "
+            ",
         )?;
 
         let messages_iter = stmt.query_map(
@@ -530,7 +531,10 @@ impl QQChatContextManager {
     }
 
     /// 根据图片内容哈希查询已接收图片，用于重复图片复用描述。
-    pub fn get_received_image_by_hash(&self, content_hash: &str) -> Result<Option<ReceivedImageRecord>> {
+    pub fn get_received_image_by_hash(
+        &self,
+        content_hash: &str,
+    ) -> Result<Option<ReceivedImageRecord>> {
         let connection = self.conn_pool.get()?;
         let record = connection
             .query_row(
@@ -540,6 +544,30 @@ impl QQChatContextManager {
                 WHERE content_hash = ?1
                 ",
                 params![content_hash],
+                |row| {
+                    Ok(ReceivedImageRecord {
+                        image_id: row.get(0)?,
+                        content_hash: row.get(1)?,
+                        local_path: row.get(2)?,
+                        description: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// 根据图片短 ID 查询已接收图片，用于后续识图动作找回原图。
+    pub fn get_received_image_by_id(&self, image_id: &str) -> Result<Option<ReceivedImageRecord>> {
+        let connection = self.conn_pool.get()?;
+        let record = connection
+            .query_row(
+                "
+                SELECT image_id, content_hash, local_path, description
+                FROM received_images
+                WHERE image_id = ?1
+                ",
+                params![image_id],
                 |row| {
                     Ok(ReceivedImageRecord {
                         image_id: row.get(0)?,
@@ -669,12 +697,6 @@ impl QQChatContextManager {
 
     /// 过滤掉空字符串，避免把无意义空值写入可选字段。
     fn normalize_optional_text(value: Option<&str>) -> Option<&str> {
-        value.and_then(|text| {
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
-            }
-        })
+        value.and_then(|text| if text.is_empty() { None } else { Some(text) })
     }
 }

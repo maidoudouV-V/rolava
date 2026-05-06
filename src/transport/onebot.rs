@@ -1,25 +1,20 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc};
-use reqwest::header::AUTHORIZATION;
-use serde::{Deserialize, Serialize};
-use axum::{routing::post, Router, Json};
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use chrono::Utc;
-use parking_lot::Mutex;
-use reqwest::Client;
-use serde_json::Value;
-use tokio::sync::Notify;
 use crate::config::AppConfig;
 use crate::repository::db_manager::{NewChatMessage, QQChatContextManager};
 use crate::transport::message::{
-    Conversation,
-    ConversationKind,
-    IncomingMessage,
-    MessageContent,
-    MessagePart,
-    Participant,
+    Conversation, ConversationKind, IncomingMessage, MessageContent, MessagePart, Participant,
 };
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::{routing::post, Json, Router};
+use chrono::Utc;
+use parking_lot::Mutex;
+use reqwest::header::AUTHORIZATION;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// OneBot 原始上报事件 DTO。
 /// 直接对应 OneBot 的 HTTP 上报 JSON，通过 `post_type` 区分事件大类。
@@ -196,7 +191,10 @@ impl OneBotMessageSegmentDto {
         at_display_names: &HashMap<String, String>,
     ) {
         match self.type_.as_str() {
-            "text" => Self::push_text(output, self.data_string("text").as_deref().unwrap_or_default()),
+            "text" => Self::push_text(
+                output,
+                self.data_string("text").as_deref().unwrap_or_default(),
+            ),
             "at" => Self::push_token(output, &self.render_at_text(bot_id, at_display_names)),
             "face" => Self::push_token(output, "[表情]"),
             "image" => Self::push_token(output, "[图片]"),
@@ -210,7 +208,7 @@ impl OneBotMessageSegmentDto {
             "contact" => Self::push_token(output, "[名片]"),
             "location" => Self::push_token(output, &self.render_named_placeholder("位置", "name")),
             "music" => Self::push_token(output, "[音乐]"),
-            "json" => Self::push_token(output, "[JSON消息]"),
+            "json" => Self::push_token(output, &Self::json_context_text(&self.data)),
             "xml" => Self::push_token(output, "[XML消息]"),
             "dice" => Self::push_token(output, "[骰子]"),
             "rps" => Self::push_token(output, "[猜拳]"),
@@ -239,9 +237,142 @@ impl OneBotMessageSegmentDto {
 
     /// 部分富文本段有标题或名称时尽量保留，否则只输出通用占位符。
     fn render_named_placeholder(&self, label: &str, name_key: &str) -> String {
-        match self.data_string(name_key).filter(|name| !name.trim().is_empty()) {
+        match self
+            .data_string(name_key)
+            .filter(|name| !name.trim().is_empty())
+        {
             Some(name) => format!("[{}:{}]", label, name),
             None => format!("[{}]", label),
+        }
+    }
+
+    /// 将 OneBot JSON 卡片转换成主聊天 AI 容易理解的摘要。
+    fn json_context_text(json_data: &Value) -> String {
+        let Some(payload) = Self::parse_json_segment_payload(json_data) else {
+            return "[JSON消息]".to_string();
+        };
+
+        let label = Self::json_card_label(&payload);
+        let prompt = payload
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(Self::strip_card_label)
+            .filter(|text| !text.is_empty());
+        let detail = Self::json_card_detail(&payload);
+
+        let app_title = detail
+            .and_then(|detail| Self::json_string(detail, "title"))
+            .or_else(|| Self::json_string(&payload, "title"));
+        let desc = detail
+            .and_then(|detail| Self::json_string(detail, "desc"))
+            .or_else(|| Self::json_string(&payload, "desc"))
+            .or(prompt)
+            .unwrap_or_else(|| "未提供标题".to_string());
+        let link = detail
+            .and_then(Self::json_card_link)
+            .or_else(|| Self::json_card_link(&payload));
+
+        let mut text = match app_title {
+            Some(app_title) if !app_title.trim().is_empty() => {
+                format!("{} {}：{}", label, app_title.trim(), desc.trim())
+            }
+            _ => format!("{} {}", label, desc.trim()),
+        };
+        if let Some(link) = link {
+            text.push_str(&format!("\n链接：{}", link));
+        }
+        text
+    }
+
+    /// 解析 OneBot json 消息段里嵌套的 JSON 字符串。
+    fn parse_json_segment_payload(json_data: &Value) -> Option<Value> {
+        if let Some(text) = json_data.get("data").and_then(Value::as_str) {
+            serde_json::from_str::<Value>(text).ok()
+        } else if json_data.is_object() {
+            Some(json_data.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 判断卡片类型，默认按 QQ JSON 卡片处理。
+    fn json_card_label(payload: &Value) -> String {
+        let prompt = payload
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if let Some(label) = prompt
+            .strip_prefix('[')
+            .and_then(|text| text.split_once(']').map(|(label, _)| label))
+            .filter(|label| !label.trim().is_empty())
+        {
+            format!("[{}]", label.trim())
+        } else if payload
+            .get("app")
+            .and_then(Value::as_str)
+            .is_some_and(|app| app.contains("miniapp"))
+        {
+            "[QQ小程序]".to_string()
+        } else {
+            "[JSON卡片]".to_string()
+        }
+    }
+
+    /// 去掉 prompt 前缀里的卡片类型，例如 "[QQ小程序]标题" -> "标题"。
+    fn strip_card_label(text: &str) -> String {
+        let text = text.trim();
+        if let Some((_, rest)) = text.strip_prefix('[').and_then(|text| text.split_once(']')) {
+            rest.trim().to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// 从 meta 里取第一个详情对象，优先 detail_1。
+    fn json_card_detail(payload: &Value) -> Option<&Value> {
+        let meta = payload.get("meta")?.as_object()?;
+        if let Some(detail) = meta.get("detail_1") {
+            return Some(detail);
+        }
+        meta.values().find(|value| value.is_object())
+    }
+
+    /// 提取卡片链接，优先使用可直接打开的分享链接。
+    fn json_card_link(value: &Value) -> Option<String> {
+        ["qqdocurl", "url", "jumpUrl", "sourceUrl"]
+            .iter()
+            .find_map(|key| Self::json_string(value, key))
+            .map(Self::normalize_card_url)
+    }
+
+    /// 从 JSON 对象里读取字符串字段，兼容数字字段。
+    fn json_string(value: &Value, key: &str) -> Option<String> {
+        let value = value.get(key)?;
+        let text = if let Some(text) = value.as_str() {
+            text.to_string()
+        } else if let Some(number) = value.as_i64() {
+            number.to_string()
+        } else if let Some(number) = value.as_u64() {
+            number.to_string()
+        } else {
+            return None;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        }
+    }
+
+    /// 补齐常见无协议链接。
+    fn normalize_card_url(url: String) -> String {
+        let url = url.trim();
+        if url.starts_with("http://") || url.starts_with("https://") {
+            url.to_string()
+        } else {
+            format!("https://{}", url.trim_start_matches('/'))
         }
     }
 
@@ -261,7 +392,11 @@ impl OneBotMessageSegmentDto {
 
     /// 追加普通文本，避免和前一个占位符之间出现多余空格。
     fn push_text(output: &mut String, text: &str) {
-        if output.chars().last().is_some_and(|char| char.is_whitespace()) {
+        if output
+            .chars()
+            .last()
+            .is_some_and(|char| char.is_whitespace())
+        {
             output.push_str(text.trim_start());
         } else {
             output.push_str(text);
@@ -271,7 +406,10 @@ impl OneBotMessageSegmentDto {
     /// 追加非文本段占位符，并在前后留出边界，避免粘连到普通文字。
     fn push_token(output: &mut String, token: &str) {
         if !output.is_empty()
-            && !output.chars().last().is_some_and(|char| char.is_whitespace())
+            && !output
+                .chars()
+                .last()
+                .is_some_and(|char| char.is_whitespace())
         {
             output.push(' ');
         }
@@ -281,9 +419,16 @@ impl OneBotMessageSegmentDto {
 
     /// 转换为 transport 层通用消息片段。
     fn into_message_part(self) -> MessagePart {
+        let mut data = self.data;
+        if self.type_ == "json" {
+            let context_text = Self::json_context_text(&data);
+            if let Value::Object(map) = &mut data {
+                map.insert("context_text".to_string(), Value::String(context_text));
+            }
+        }
         MessagePart {
             kind: self.type_,
-            data: self.data,
+            data,
         }
     }
 }
@@ -306,11 +451,9 @@ impl OneBotMessageEnvelopeDto {
                     message.sender.user_id,
                     &sender_display_name,
                 );
-                let at_display_names = server.resolve_at_display_names(
-                    &message.message,
-                    self.self_id,
-                    message.group_id,
-                ).await;
+                let at_display_names = server
+                    .resolve_at_display_names(&message.message, self.self_id, message.group_id)
+                    .await;
                 message.into_incoming_message(self.time, self.self_id, &at_display_names)
             }
         }
@@ -340,7 +483,8 @@ impl OneBotPrivateMessageDto {
             sex,
             age,
         } = sender;
-        let text = OneBotMessageSegmentDto::render_message_text(&message, self_id, at_display_names);
+        let text =
+            OneBotMessageSegmentDto::render_message_text(&message, self_id, at_display_names);
         let parts = message
             .into_iter()
             .map(OneBotMessageSegmentDto::into_message_part)
@@ -360,10 +504,7 @@ impl OneBotPrivateMessageDto {
                 nickname: None,
                 role: None,
             },
-            content: MessageContent {
-                text,
-                parts,
-            },
+            content: MessageContent { text, parts },
             message_id: Some(message_id.to_string()),
             timestamp,
             metadata: serde_json::json!({
@@ -411,7 +552,8 @@ impl OneBotGroupMessageDto {
             role,
             title,
         } = sender;
-        let text = OneBotMessageSegmentDto::render_message_text(&message, self_id, at_display_names);
+        let text =
+            OneBotMessageSegmentDto::render_message_text(&message, self_id, at_display_names);
         let parts = message
             .into_iter()
             .map(OneBotMessageSegmentDto::into_message_part)
@@ -431,10 +573,7 @@ impl OneBotGroupMessageDto {
                 nickname: card.clone(),
                 role: role.clone(),
             },
-            content: MessageContent {
-                text,
-                parts,
-            },
+            content: MessageContent { text, parts },
             message_id: Some(message_id.to_string()),
             timestamp,
             metadata: serde_json::json!({
@@ -459,7 +598,6 @@ impl OneBotGroupMessageDto {
         }
     }
 }
-
 
 /// Http请求返回结果
 #[derive(Serialize, Deserialize, Debug)]
@@ -617,7 +755,10 @@ impl OneBotHttpServer {
         }
 
         let mut cache = self.member_name_cache.lock();
-        cache.insert(Self::group_member_cache_key(group_id, user_id), display_name.to_string());
+        cache.insert(
+            Self::group_member_cache_key(group_id, user_id),
+            display_name.to_string(),
+        );
         cache.insert(Self::user_cache_key(user_id), display_name.to_string());
     }
 
@@ -649,7 +790,10 @@ impl OneBotHttpServer {
                 continue;
             }
 
-            if let Some(display_name) = self.fetch_group_member_display_name(group_id, user_id).await {
+            if let Some(display_name) = self
+                .fetch_group_member_display_name(group_id, user_id)
+                .await
+            {
                 self.cache_group_member_display_name(group_id, user_id, &display_name);
                 at_display_names.insert(qq, display_name);
             }
@@ -673,7 +817,8 @@ impl OneBotHttpServer {
             "user_id": user_id,
             "no_cache": false,
         });
-        let mut request = self.client
+        let mut request = self
+            .client
             .post(format!("{}/get_group_member_info", self.onebot_api_url))
             .json(&payload);
 
@@ -684,19 +829,31 @@ impl OneBotHttpServer {
         let resp = match request.send().await {
             Ok(resp) => resp,
             Err(err) => {
-                eprintln!("查询群成员信息失败: group_id={}, user_id={}, err={}", group_id, user_id, err);
+                eprintln!(
+                    "查询群成员信息失败: group_id={}, user_id={}, err={}",
+                    group_id, user_id, err
+                );
                 return None;
             }
         };
-        let result = match resp.json::<OneBotApiResponse<OneBotGroupMemberInfoDto>>().await {
+        let result = match resp
+            .json::<OneBotApiResponse<OneBotGroupMemberInfoDto>>()
+            .await
+        {
             Ok(result) => result,
             Err(err) => {
-                eprintln!("解析群成员信息失败: group_id={}, user_id={}, err={}", group_id, user_id, err);
+                eprintln!(
+                    "解析群成员信息失败: group_id={}, user_id={}, err={}",
+                    group_id, user_id, err
+                );
                 return None;
             }
         };
         if result.retcode != 0 {
-            eprintln!("查询群成员信息返回错误: group_id={}, user_id={}, retcode={}", group_id, user_id, result.retcode);
+            eprintln!(
+                "查询群成员信息返回错误: group_id={}, user_id={}, retcode={}",
+                group_id, user_id, result.retcode
+            );
             return None;
         }
 
@@ -708,8 +865,7 @@ impl OneBotHttpServer {
 
     /// 优先使用群名片，群名片为空时使用 QQ 昵称。
     fn member_display_name(nickname: &str, card: Option<&str>) -> String {
-        card
-            .map(str::trim)
+        card.map(str::trim)
             .filter(|card| !card.is_empty())
             .unwrap_or_else(|| nickname.trim())
             .to_string()
@@ -727,27 +883,32 @@ impl OneBotHttpServer {
 
     /// 返回当前缓冲区里累计的事件数量。
     pub fn buffered_event_count(&self) -> usize {
-        self.event_buffer
-            .lock()
-            .len()
+        self.event_buffer.lock().len()
     }
 
     /// 启动接收 OneBot 上报的 HTTP 服务。
-    pub async fn run(&self){
+    pub async fn run(&self) {
         let listener_ip = self.listener_ip.clone();
         let listener_port = self.listener_port;
-        let listener = tokio::net::TcpListener::bind(format!("{}:{}", listener_ip, listener_port)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(format!("{}:{}", listener_ip, listener_port))
+            .await
+            .unwrap();
         let log_out = format!("HTTP 服务已启动: http://{}:{}/", listener_ip, listener_port);
         let shared_state = Arc::new(self.clone());
         let app = Router::new()
             .route("/", post(on_event))
             .with_state(shared_state);
-        println!("{}",log_out);
+        println!("{}", log_out);
         axum::serve(listener, app).await.unwrap();
     }
 
     /// 调用 OneBot HTTP API 向当前会话发送一条消息。
-    pub async fn send_message(&self, incoming_message: IncomingMessage, response_msg: &String, db_manager: Arc<QQChatContextManager>) -> reqwest::Result<()> {
+    pub async fn send_message(
+        &self,
+        incoming_message: IncomingMessage,
+        response_msg: &String,
+        db_manager: Arc<QQChatContextManager>,
+    ) -> reqwest::Result<()> {
         let conversation_id = incoming_message.conversation.id.clone();
         let conversation_title = incoming_message.conversation.title.clone();
         let target_id = conversation_id
@@ -776,7 +937,8 @@ impl OneBotHttpServer {
                 return Ok(());
             }
         };
-        let mut request = self.client
+        let mut request = self
+            .client
             .post(format!("{}/{}", self.onebot_api_url, api_path))
             .json(&payload);
 
@@ -807,7 +969,8 @@ impl OneBotHttpServer {
                         "text": response_msg
                     }
                 }
-            ]).to_string(),
+            ])
+            .to_string(),
             metadata_json: "{}".to_string(),
             event_timestamp: Utc::now().timestamp(),
         };

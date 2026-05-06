@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod google_aistudio;
 pub mod openai_compatible;
 pub mod openrouter;
 use anyhow::Result;
@@ -29,7 +30,6 @@ pub struct ContextMessage {
     pub content: String,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct ChatUsage {
     /// 本次请求输入消耗的 token 总数。
@@ -58,13 +58,17 @@ pub struct ChatResponse {
     pub raw_response: Value,
 }
 
-
 // ========== 通用 Provider Trait ==========
 #[async_trait]
-pub trait AIProvider{
-    async fn chat_completions(&self, request_message: &Vec<ContextMessage>) -> Result<ChatResponse>;
+pub trait AIProvider {
+    async fn chat_completions(&self, request_message: &Vec<ContextMessage>)
+        -> Result<ChatResponse>;
 
     async fn describe_image(&self, _image_data_url: &str, _prompt: &str) -> Result<String> {
         anyhow::bail!("当前服务商不支持图片描述")
+    }
+
+    async fn web_search(&self, _query: &str) -> Result<String> {
+        anyhow::bail!("当前服务商不支持联网搜索")
     }
 }

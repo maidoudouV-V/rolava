@@ -1,13 +1,15 @@
+use crate::ai_provider::{
+    anthropic::AnthropicProvider, google_aistudio::GoogleAIStudioProvider,
+    openai_compatible::OpenAICompatibleProvider, openrouter::OpenRouterProvider, AIProvider,
+};
+use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use anyhow::Result;
-use serde::Deserialize;
-use crate::ai_provider::{
-    AIProvider,
-    anthropic::AnthropicProvider,
-    openai_compatible::OpenAICompatibleProvider,
-    openrouter::OpenRouterProvider,
-};
+use std::path::Path;
+
+const DEFAULT_AI_REQUEST_RETRY_COUNT: u32 = 1;
+const DEFAULT_AI_REQUEST_TIMEOUT_SECONDS: u64 = 0;
 
 #[derive(Deserialize, Debug)]
 struct TomlConfig {
@@ -25,16 +27,24 @@ pub struct AppSection {
     pub prompt_dir: String,
     /// 发送给模型的最大历史消息数。
     pub max_history_messages: u32,
+    /// 当前回复决策状态为“更主动”的概率，范围 0-100。
+    pub proactive_reply_percent: f64,
     /// 默认聊天模型名称
     pub chat_model_name: String,
-    /// 默认 Agent 模型名称
-    pub agent_model_name: String,
+    /// 联网搜索模型名称。
+    pub web_search_model_name: String,
     /// 默认视觉模型名称，用于图片识别等消息增强流程。
     pub visual_model_name: String,
+    /// AI 请求失败后的额外重试次数；1 表示最多尝试 2 次。
+    #[serde(default = "default_ai_request_retry_count")]
+    pub ai_request_retry_count: u32,
+    /// AI 单次请求总超时时间，单位秒；0 表示不设置超时。
+    #[serde(default = "default_ai_request_timeout_seconds")]
+    pub ai_request_timeout_seconds: u64,
     /// 接收到的图片本地保存目录。
     pub received_image_dir: String,
-    /// 启用的工具列表
-    pub tools: Vec<String>,
+    /// 启用的可选动作列表，send_message、wait_then_check、ignore_messages 固定启用。
+    pub enabled_actions: Vec<String>,
     /// 私聊白名单 QQ 号，空数组表示放行所有私聊。
     pub direct_whitelist: Vec<String>,
     /// 群聊白名单群号，空数组表示放行所有群聊。
@@ -43,6 +53,20 @@ pub struct AppSection {
     pub reply_delay_per_char_secs: f64,
     /// 模拟回复时额外随机等待的最大秒数。
     pub reply_delay_random_max_secs: f64,
+}
+
+impl AppSection {
+    pub fn ai_request_max_attempts(&self) -> u32 {
+        self.ai_request_retry_count.saturating_add(1).max(1)
+    }
+}
+
+fn default_ai_request_retry_count() -> u32 {
+    DEFAULT_AI_REQUEST_RETRY_COUNT
+}
+
+fn default_ai_request_timeout_seconds() -> u64 {
+    DEFAULT_AI_REQUEST_TIMEOUT_SECONDS
 }
 
 #[derive(Deserialize, Debug)]
@@ -77,7 +101,6 @@ pub struct ProviderConfig {
     pub reasoning_effort: String,
 }
 
-
 pub struct AppConfig {
     /// 应用相关配置
     pub app: AppSection,
@@ -96,7 +119,8 @@ impl AppConfig {
 
         let mut ai_providers = HashMap::<String, Box<dyn AIProvider + Send + Sync>>::new();
         for provider_config in toml_config.providers {
-            let provider: Box<dyn AIProvider + Send + Sync> = match provider_config.r#type.as_str() {
+            let provider: Box<dyn AIProvider + Send + Sync> = match provider_config.r#type.as_str()
+            {
                 "openai_compatible" => Box::new(OpenAICompatibleProvider::new(
                     provider_config.key,
                     provider_config.base_url,
@@ -116,7 +140,18 @@ impl AppConfig {
                     provider_config.max_tokens,
                     provider_config.reasoning_effort,
                 )),
-                _ => return Err(anyhow::anyhow!("不支持的服务商类型：{}", provider_config.r#type)),
+                "google_aistudio" => Box::new(GoogleAIStudioProvider::new(
+                    provider_config.key,
+                    provider_config.base_url,
+                    provider_config.model,
+                    provider_config.max_tokens,
+                )),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "不支持的服务商类型：{}",
+                        provider_config.r#type
+                    ))
+                }
             };
             ai_providers.insert(provider_config.name.clone(), provider);
         }
@@ -125,11 +160,10 @@ impl AppConfig {
             app: toml_config.app,
             server: toml_config.server,
             ai_providers,
-            prompt_config
+            prompt_config,
         })
     }
 }
-
 
 pub struct PromptConfig {
     pub system_prompt: String,
@@ -138,11 +172,43 @@ pub struct PromptConfig {
 }
 impl PromptConfig {
     pub fn new(app: &AppSection) -> Result<Self> {
+        let prompt_dir = Path::new(&app.prompt_dir);
+        let system_template = fs::read_to_string(prompt_dir.join("system.md"))?;
+        let enabled_actions_prompt = Self::load_enabled_action_prompts(app, prompt_dir)?;
         let new_config = Self {
-            system_prompt: fs::read_to_string(format!("{}/system.md", app.prompt_dir))?,
-            character_prompt: fs::read_to_string(format!("{}/character.md", app.prompt_dir))?,
-            instruction_prompt: fs::read_to_string(format!("{}/instruction.md", app.prompt_dir))?,
+            system_prompt: system_template
+                .replace("{{enabled_actions}}", enabled_actions_prompt.trim()),
+            character_prompt: fs::read_to_string(prompt_dir.join("character.md"))?,
+            instruction_prompt: fs::read_to_string(prompt_dir.join("instruction.md"))?,
         };
         Ok(new_config)
+    }
+
+    /// 按配置读取可选动作提示词，文件名必须与动作名一致。
+    fn load_enabled_action_prompts(app: &AppSection, prompt_dir: &Path) -> Result<String> {
+        let mut action_prompts = Vec::new();
+        for action_name in &app.enabled_actions {
+            let action_name = action_name.trim();
+            if action_name.is_empty() {
+                continue;
+            }
+            if action_name.contains('/') || action_name.contains('\\') || action_name.contains("..")
+            {
+                anyhow::bail!("可选动作名称不合法：{}", action_name);
+            }
+
+            let action_prompt_path = prompt_dir
+                .join("actions")
+                .join(format!("{}.md", action_name));
+            let action_prompt = fs::read_to_string(&action_prompt_path).with_context(|| {
+                format!(
+                    "读取可选动作提示词失败：{}",
+                    action_prompt_path.to_string_lossy()
+                )
+            })?;
+            action_prompts.push(action_prompt.trim().to_string());
+        }
+
+        Ok(action_prompts.join("\n\n"))
     }
 }

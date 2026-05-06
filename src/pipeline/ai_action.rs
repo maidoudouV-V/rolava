@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[derive(Deserialize, Serialize)]
 pub struct RespActionPlan {
@@ -13,16 +12,24 @@ pub enum RespAction {
     SendMessage {
         text: String,
     },
-    CallTool {
-        tool: String,
-        args: Value,
+    RecognizeImage {
+        image_id: String,
+        question: String,
+    },
+    WebSearch {
+        query: String,
     },
     Remember {
         content: String,
     },
-    ScheduleFollowUp {
+    WaitThenCheck {
         delay_seconds: u64,
         reason: String,
+    },
+    ScheduleTask {
+        date: String,
+        time: String,
+        task: String,
     },
     IgnoreMessages {
         duration_seconds: u64,
@@ -33,9 +40,11 @@ impl RespAction {
     pub fn action_name(&self) -> &'static str {
         match self {
             RespAction::SendMessage { .. } => "send_message",
-            RespAction::CallTool { .. } => "call_tool",
+            RespAction::RecognizeImage { .. } => "recognize_image",
+            RespAction::WebSearch { .. } => "web_search",
             RespAction::Remember { .. } => "remember",
-            RespAction::ScheduleFollowUp { .. } => "schedule_follow_up",
+            RespAction::WaitThenCheck { .. } => "wait_then_check",
+            RespAction::ScheduleTask { .. } => "schedule_task",
             RespAction::IgnoreMessages { .. } => "ignore_messages",
         }
     }
