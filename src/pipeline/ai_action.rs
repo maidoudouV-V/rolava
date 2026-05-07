@@ -31,6 +31,9 @@ pub enum RespAction {
         time: String,
         task: String,
     },
+    CancelScheduledTask {
+        time: String,
+    },
     IgnoreMessages {
         duration_seconds: u64,
     },
@@ -45,6 +48,7 @@ impl RespAction {
             RespAction::Remember { .. } => "remember",
             RespAction::WaitThenCheck { .. } => "wait_then_check",
             RespAction::ScheduleTask { .. } => "schedule_task",
+            RespAction::CancelScheduledTask { .. } => "cancel_scheduled_task",
             RespAction::IgnoreMessages { .. } => "ignore_messages",
         }
     }

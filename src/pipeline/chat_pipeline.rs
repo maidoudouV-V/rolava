@@ -1,5 +1,5 @@
 use crate::ai_provider::{ContextMessage, MessageRole};
-use chrono::{DateTime, Local, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use rand::Rng;
 use std::collections::HashMap;
 use std::future::Future;
@@ -764,7 +764,13 @@ impl ConversationWorker {
         let mut last_rendered_date: Option<String> = None;
         let mut has_read_user_messages = false;
         let mut unread_divider_inserted = false;
-        for db_msg in history {
+        let history_block_size = Self::history_block_size(self.app_config.app.max_history_messages);
+        let mut next_user_message_starts_new_block = false;
+        for (history_index, db_msg) in history.into_iter().enumerate() {
+            if history_index > 0 && history_index % history_block_size == 0 {
+                next_user_message_starts_new_block = true;
+            }
+
             included_message_ids.push(db_msg.id);
             let is_bot_message = db_msg.sender_id == incoming_message.bot_id.as_str();
             if !is_bot_message && !db_msg.is_read && !unread_divider_inserted {
@@ -792,6 +798,7 @@ impl ConversationWorker {
                 if context
                     .last()
                     .is_some_and(|msg| msg.role == MessageRole::User)
+                    && !next_user_message_starts_new_block
                 {
                     let last_user_message = context.last_mut().unwrap();
                     if should_render_date {
@@ -815,6 +822,7 @@ impl ConversationWorker {
                         content,
                     });
                 }
+                next_user_message_starts_new_block = false;
             }
         }
 
@@ -848,6 +856,11 @@ impl ConversationWorker {
                 content: divider.to_string(),
             });
         }
+    }
+
+    /// 聊天记录按和数据库淘汰逻辑一致的块大小拆分为多个 user 消息。
+    fn history_block_size(max_history_messages: u32) -> usize {
+        ((max_history_messages as usize) / 10).max(1)
     }
 
     /// 渲染当前指令模板，替换时间、场景、回复决策状态和上一轮动作状态等动态占位符。
@@ -888,6 +901,10 @@ impl ConversationWorker {
             .replace("{{last_action}}", &last_action)
             .replace("{{mind_state}}", &mind_state)
             .replace("{{scene}}", &self.scene)
+            .replace(
+                "{{scheduled_tasks}}",
+                &self.render_scheduled_tasks_prompt(),
+            )
             .replace("{{reply_decision_state}}", reply_decision_state)
             .replace(
                 "{{max_history_messages}}",
@@ -935,6 +952,26 @@ impl ConversationWorker {
             .join("\n\n")
     }
 
+    /// 渲染当前仍在等待触发的定时任务。
+    fn render_scheduled_tasks_prompt(&self) -> String {
+        if self.pending_scheduled_tasks.is_empty() {
+            return "- 已计划的定时任务：无".to_string();
+        }
+
+        let mut scheduled_tasks = self.pending_scheduled_tasks.iter().collect::<Vec<_>>();
+        scheduled_tasks.sort_by_key(|task| task.ready_at);
+        scheduled_tasks
+            .iter()
+            .map(|task| {
+                format!(
+                    "- 已计划的定时任务：时间 {} ，任务描述 {}。",
+                    task.scheduled_time_text, task.task
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// 按顺序执行模型返回的动作，每个动作由自己的方法处理副作用。
     async fn execute_actions(
         &mut self,
@@ -967,6 +1004,9 @@ impl ConversationWorker {
                 }
                 RespAction::ScheduleTask { date, time, task } => {
                     self.execute_schedule_task(incoming_message, date, time, task);
+                }
+                RespAction::CancelScheduledTask { time } => {
+                    self.execute_cancel_scheduled_task(time);
                 }
                 RespAction::IgnoreMessages { duration_seconds } => {
                     self.execute_ignore_messages(incoming_message, duration_seconds);
@@ -1160,18 +1200,64 @@ impl ConversationWorker {
             .unwrap_or_else(|_| Duration::from_secs(1));
         let ready_at = Instant::now() + delay;
         let scheduled_time_text = scheduled_at.format("%Y-%m-%d %H:%M:%S").to_string();
+        let is_update = self
+            .pending_scheduled_tasks
+            .iter()
+            .any(|pending_task| pending_task.scheduled_time_text == scheduled_time_text);
         eprintln!(
-            "安排定时任务: time={}，delay_seconds={}，task={}",
+            "{}定时任务: time={}，delay_seconds={}，task={}",
+            if is_update { "更新" } else { "安排" },
             scheduled_time_text,
             delay.as_secs(),
             task
         );
+        self.pending_scheduled_tasks
+            .retain(|pending_task| pending_task.scheduled_time_text != scheduled_time_text);
         self.pending_scheduled_tasks.push(PendingScheduledTask {
             ready_at,
             scheduled_time_text,
             task,
             conversation_snapshot: incoming_message.clone(),
         });
+    }
+
+    /// 执行取消定时任务动作，按当前状态里展示的计划时间匹配待触发任务。
+    fn execute_cancel_scheduled_task(&mut self, time: String) {
+        let scheduled_time_text = match Self::normalize_schedule_time_text(&time) {
+            Ok(scheduled_time_text) => scheduled_time_text,
+            Err(err) => {
+                eprintln!("取消定时任务失败: time={}，错误={}", time, err);
+                return;
+            }
+        };
+
+        let mut removed_tasks = Vec::new();
+        let mut task_index = 0;
+        while task_index < self.pending_scheduled_tasks.len() {
+            let scheduled_task = &self.pending_scheduled_tasks[task_index];
+            if scheduled_task.scheduled_time_text == scheduled_time_text {
+                removed_tasks.push(self.pending_scheduled_tasks.remove(task_index));
+            } else {
+                task_index += 1;
+            }
+        }
+
+        if removed_tasks.is_empty() {
+            eprintln!("取消定时任务失败: time={}，未找到匹配任务", scheduled_time_text);
+            return;
+        }
+
+        let removed_task_text = removed_tasks
+            .iter()
+            .map(|task| task.task.as_str())
+            .collect::<Vec<_>>()
+            .join("；");
+        eprintln!(
+            "取消定时任务: time={}，count={}，task={}",
+            scheduled_time_text,
+            removed_tasks.len(),
+            removed_task_text
+        );
     }
 
     fn parse_schedule_datetime(date: &str, time: &str) -> anyhow::Result<DateTime<Local>> {
@@ -1184,6 +1270,16 @@ impl ConversationWorker {
             .from_local_datetime(&naive_datetime)
             .single()
             .ok_or_else(|| anyhow::anyhow!("本地日期时间不存在或不唯一"))
+    }
+
+    fn normalize_schedule_time_text(time: &str) -> anyhow::Result<String> {
+        let naive_datetime = NaiveDateTime::parse_from_str(time.trim(), "%Y-%m-%d %H:%M:%S")
+            .map_err(|err| anyhow::anyhow!("任务时间格式错误，需要 YYYY-MM-DD HH:MM:SS：{}", err))?;
+        let datetime = Local
+            .from_local_datetime(&naive_datetime)
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("本地日期时间不存在或不唯一"))?;
+        Ok(datetime.format("%Y-%m-%d %H:%M:%S").to_string())
     }
 
     /// 执行忽略消息动作：一段时间内新消息只入库，不触发 AI 请求。
