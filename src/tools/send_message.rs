@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
+use crate::transport::SendOptions;
 
 const DESCRIPTION: &str = r#"向当前聊天窗口发送一条消息。
 当角色需要回复当前会话时调用。每次调用只发送一条消息；需要连续发送多条时可以多次调用。
@@ -44,12 +45,11 @@ impl Tool for SendMessageTool {
     async fn execute(&self, context: &ToolContext, arguments: &str) -> Result<ToolOutput> {
         let SendMessageArgs { text } = parse_arguments(self.name(), arguments)?;
         context
+            .services
             .message_sender
-            .send_text(&context.message_target, &text)
+            .send_text(&context.conversation.target, &text, SendOptions::default())
             .await?;
 
-        Ok(ToolOutput {
-            content: "消息已发送".to_string(),
-        })
+        Ok(ToolOutput::text("消息已发送"))
     }
 }

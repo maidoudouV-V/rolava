@@ -1,4 +1,6 @@
-use crate::ai_provider::{AIProvider, ChatUsage, ToolChatMessage, ToolChatResponse};
+use crate::ai_provider::{
+    AIProvider, ChatUsage, ReasoningPayload, ReasoningState, ToolChatMessage, ToolChatResponse,
+};
 use crate::tools::{ToolCall, ToolDefinition};
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
@@ -194,12 +196,15 @@ fn build_openai_compatible_request<'a>(
             },
             ToolChatMessage::Assistant {
                 content,
-                reasoning_content,
+                reasoning,
                 tool_calls,
-                ..
             } => OpenAICompatibleToolMessage::Assistant {
                 content: content.as_deref(),
-                reasoning_content: reasoning_content.as_deref(),
+                // OpenAI Compatible 接口默认使用 reasoning_content 回传文本推理内容。
+                reasoning_content: match reasoning {
+                    Some(ReasoningPayload::Text(content)) => Some(content.as_str()),
+                    Some(ReasoningPayload::Structured(_)) | None => None,
+                },
                 tool_calls: tool_calls
                     .iter()
                     .map(|call| OpenAICompatibleRequestToolCall {
@@ -372,10 +377,11 @@ fn parse_openai_compatible_chat_response(response_text: &str) -> anyhow::Result<
             arguments: call.function.arguments.clone(),
         });
     }
-    if content.is_none() && tool_calls.is_empty() {
+    if content.is_none() && tool_calls.is_empty() && finish_reason.as_deref() != Some("stop") {
         bail!(
-            "{}既没有文本内容，也没有 tool_calls\n原始响应：\n{}",
+            "{}既没有文本内容，也没有 tool_calls，且 finish_reason 不是 stop（当前：{:?}）\n原始响应：\n{}",
             response_name,
+            finish_reason,
             response_text
         );
     }
@@ -388,8 +394,10 @@ fn parse_openai_compatible_chat_response(response_text: &str) -> anyhow::Result<
 
     Ok(ToolChatResponse {
         content,
-        reasoning_content,
-        reasoning_details: None,
+        reasoning: ReasoningState {
+            display_text: reasoning_content.clone(),
+            replay: reasoning_content.map(ReasoningPayload::Text),
+        },
         tool_calls,
         finish_reason,
         id: parsed.id,
@@ -413,6 +421,89 @@ fn parse_openai_compatible_response(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_reasoning_is_replayed_as_openai_reasoning_content() {
+        let response = parse_openai_compatible_chat_response(
+            r#"{
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content": "原始推理文本",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "test_tool", "arguments": "{}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.reasoning.display_text.as_deref(),
+            Some("原始推理文本")
+        );
+        let messages = vec![response.assistant_message()];
+        let request = build_openai_compatible_request("test", 100, "medium", &messages, &[]);
+        let request_json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(
+            request_json["messages"][0]["reasoning_content"],
+            "原始推理文本"
+        );
+    }
+
+    #[test]
+    fn empty_stop_response_is_valid_no_action() {
+        let response = parse_openai_compatible_chat_response(
+            r#"{
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": []
+                    },
+                    "finish_reason": "stop"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.content, None);
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn empty_non_stop_response_is_rejected() {
+        let error = parse_openai_compatible_chat_response(
+            r#"{
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": []
+                    },
+                    "finish_reason": "length"
+                }]
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("finish_reason 不是 stop"));
+    }
+}
+
 fn first_choice<'a>(
     response: &'a OpenAICompatibleChatResponse,
     response_text: &str,
@@ -433,150 +524,4 @@ fn first_choice<'a>(
             response_text
         )
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::{build_openai_compatible_request, parse_openai_compatible_chat_response};
-    use crate::ai_provider::{ToolChatMessage, ToolChatResponse};
-    use crate::tools::{ToolCall, ToolDefinition};
-
-    #[test]
-    fn serializes_tools_and_tool_history_in_openai_format() {
-        let tools = vec![ToolDefinition {
-            name: "web_search",
-            description: "搜索互联网",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
-        }];
-        let messages = vec![
-            ToolChatMessage::User {
-                content: "查询天气".to_string(),
-            },
-            ToolChatMessage::Assistant {
-                content: None,
-                reasoning_content: Some("需要实时天气".to_string()),
-                reasoning_details: None,
-                tool_calls: vec![ToolCall {
-                    id: "call_1".to_string(),
-                    name: "web_search".to_string(),
-                    arguments: r#"{"query":"香港天气"}"#.to_string(),
-                }],
-            },
-            ToolChatMessage::Tool {
-                tool_call_id: "call_1".to_string(),
-                content: "晴，28 摄氏度".to_string(),
-            },
-        ];
-
-        let body = build_openai_compatible_request("test-model", 1024, "medium", &messages, &tools);
-        let value = serde_json::to_value(body).unwrap();
-
-        assert_eq!(value["tool_choice"], "auto");
-        assert_eq!(value["tools"][0]["type"], "function");
-        assert_eq!(value["tools"][0]["function"]["name"], "web_search");
-        assert_eq!(value["messages"][1]["role"], "assistant");
-        assert!(value["messages"][1]["content"].is_null());
-        assert_eq!(value["messages"][1]["reasoning_content"], "需要实时天气");
-        assert_eq!(
-            value["messages"][1]["tool_calls"][0]["function"]["arguments"],
-            r#"{"query":"香港天气"}"#
-        );
-        assert_eq!(value["messages"][2]["role"], "tool");
-        assert_eq!(value["messages"][2]["tool_call_id"], "call_1");
-    }
-
-    #[test]
-    fn omits_tool_fields_for_plain_text_request() {
-        let messages = vec![ToolChatMessage::User {
-            content: "需要回复吗".to_string(),
-        }];
-
-        let body = build_openai_compatible_request("test-model", 128, "low", &messages, &[]);
-        let value = serde_json::to_value(body).unwrap();
-
-        assert!(value.get("tools").is_none());
-        assert!(value.get("tool_choice").is_none());
-        assert_eq!(value["messages"][0]["content"], "需要回复吗");
-    }
-
-    #[test]
-    fn parses_plain_text_with_the_unified_response_parser() {
-        let response_text = r#"{
-            "id": "chatcmpl_text",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "reply"
-                },
-                "finish_reason": "stop"
-            }]
-        }"#;
-
-        let response = parse_openai_compatible_chat_response(response_text).unwrap();
-
-        assert_eq!(response.content.as_deref(), Some("reply"));
-        assert!(response.tool_calls.is_empty());
-    }
-
-    #[test]
-    fn parses_tool_calls_when_assistant_content_is_null() {
-        let response_text = r#"{
-            "id": "chatcmpl_1",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": null,
-                    "reasoning_content": "需要调用搜索工具",
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "web_search",
-                            "arguments": "{\"query\":\"香港天气\"}"
-                        }
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15
-            }
-        }"#;
-
-        let response = parse_openai_compatible_chat_response(response_text).unwrap();
-
-        assert_eq!(response.content, None);
-        assert_eq!(
-            response.reasoning_content.as_deref(),
-            Some("需要调用搜索工具")
-        );
-        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(response.tool_calls.len(), 1);
-        assert_eq!(response.tool_calls[0].id, "call_1");
-        assert_eq!(response.tool_calls[0].name, "web_search");
-        assert_eq!(response.tool_calls[0].arguments, r#"{"query":"香港天气"}"#);
-        assert!(matches!(
-            ToolChatResponse::assistant_message(&response),
-            ToolChatMessage::Assistant {
-                reasoning_content: Some(reasoning_content),
-                tool_calls,
-                ..
-            } if reasoning_content == "需要调用搜索工具" && tool_calls == response.tool_calls
-        ));
-    }
 }

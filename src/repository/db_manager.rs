@@ -531,6 +531,62 @@ impl QQChatContextManager {
         Ok(messages)
     }
 
+    /// 获取当前会话最新消息的数据库 ID，用作延时检查的起点。
+    pub fn get_latest_conversation_message_id(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+    ) -> Result<i64> {
+        let connection = self.conn_pool.get()?;
+        let message_id = connection.query_row(
+            "
+            SELECT COALESCE(MAX(m.id), 0)
+            FROM messages m
+            INNER JOIN conversations c ON c.id = m.conversation_id
+            WHERE c.source = ?1 AND c.source_conversation_id = ?2
+            ",
+            params![source, source_conversation_id],
+            |row| row.get(0),
+        )?;
+        Ok(message_id)
+    }
+
+    /// 判断指定名称的发送者是否在给定消息之后发过言。
+    pub fn has_sender_named_message_after(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+        sender_name: &str,
+        after_message_id: i64,
+    ) -> Result<bool> {
+        let connection = self.conn_pool.get()?;
+        let exists: i64 = connection.query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM messages m
+                INNER JOIN conversations c ON c.id = m.conversation_id
+                WHERE c.source = ?1
+                  AND c.source_conversation_id = ?2
+                  AND m.id > ?3
+                  AND (
+                      m.sender_display_name = ?4
+                      OR m.sender_nickname = ?4
+                  )
+                LIMIT 1
+            )
+            ",
+            params![
+                source,
+                source_conversation_id,
+                after_message_id,
+                sender_name
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     /// 统计指定会话的消息总数，用于计算按块淘汰的窗口位置。
     fn count_conversation_messages(
         connection: &rusqlite::Connection,

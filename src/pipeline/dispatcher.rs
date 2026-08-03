@@ -4,7 +4,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::config::AppConfig;
+use crate::conversation_control::ConversationControl;
+use crate::conversation_trigger::{ConversationTrigger, ConversationTriggerSender};
 use crate::repository::db_manager::QQChatContextManager;
+use crate::tools::ToolServices;
 use crate::transport::message::{ConversationKind, IncomingMessage, MessageTarget};
 use crate::transport::MessageSender;
 
@@ -12,11 +15,21 @@ use super::chat_processor::ChatProcessor;
 use super::conversation_actor::{ConversationActor, ConversationEvent};
 use super::filter::ConversationFilter;
 
+struct ActorConversationTriggerSender {
+    actor_tx: mpsc::UnboundedSender<ConversationEvent>,
+}
+
+impl ConversationTriggerSender for ActorConversationTriggerSender {
+    fn send_trigger(&self, trigger: ConversationTrigger) -> anyhow::Result<()> {
+        self.actor_tx
+            .send(ConversationEvent::InternalTrigger(trigger))
+            .map_err(|_| anyhow::anyhow!("会话 Actor 已关闭，内部触发发送失败"))
+    }
+}
+
 /// 根据会话 key 把平台消息投递给对应会话 Actor。
 pub struct ConversationDispatcher {
-    app_config: Arc<AppConfig>,
-    db_manager: Arc<QQChatContextManager>,
-    message_sender: Arc<dyn MessageSender>,
+    tool_services: Arc<ToolServices>,
     message_rx: mpsc::Receiver<IncomingMessage>,
     actors: HashMap<String, mpsc::UnboundedSender<ConversationEvent>>,
 }
@@ -29,9 +42,7 @@ impl ConversationDispatcher {
         message_rx: mpsc::Receiver<IncomingMessage>,
     ) -> Self {
         Self {
-            app_config,
-            db_manager,
-            message_sender,
+            tool_services: Arc::new(ToolServices::new(app_config, db_manager, message_sender)),
             message_rx,
             actors: HashMap::new(),
         }
@@ -62,14 +73,23 @@ impl ConversationDispatcher {
 
         // 忙会话只积压自己的事件，不能阻塞其他会话的分发。
         let (actor_tx, actor_rx) = mpsc::unbounded_channel();
-        let filter = ConversationFilter::new(self.app_config.clone(), self.db_manager.clone());
+        let trigger_sender: Arc<dyn ConversationTriggerSender> =
+            Arc::new(ActorConversationTriggerSender {
+                actor_tx: actor_tx.clone(),
+            });
+        let conversation_control = Arc::new(ConversationControl::default());
+        let filter = ConversationFilter::new(
+            self.tool_services.app_config.clone(),
+            self.tool_services.db_manager.clone(),
+            conversation_control.clone(),
+        );
         let processor = ChatProcessor::new(
-            self.db_manager.clone(),
-            self.app_config.clone(),
+            self.tool_services.clone(),
             conversation_key.to_string(),
             Self::scene_name(&incoming_message.conversation.kind).to_string(),
-            self.message_sender.clone(),
             MessageTarget::from(incoming_message),
+            conversation_control,
+            trigger_sender,
         );
         let actor = ConversationActor::new(actor_rx, filter, processor);
         tokio::spawn(actor.run());

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -249,11 +249,7 @@ impl MessageEnricher {
             vision_image.bytes.len() / 1024,
             vision_image.mime_type
         );
-        let image_data_url = format!(
-            "data:{};base64,{}",
-            vision_image.mime_type,
-            general_purpose::STANDARD.encode(&vision_image.bytes),
-        );
+        let image_data_url = Self::vision_image_data_url(&vision_image);
         let visual_provider = self
             .app_config
             .ai_models
@@ -289,68 +285,6 @@ impl MessageEnricher {
         Err(last_error.expect("视觉识别重试循环至少应执行一次"))
     }
 
-    /// 根据已入库图片 ID 和自然语言问题，再次调用视觉模型回答图片相关问题。
-    pub async fn answer_received_image_question(
-        app_config: Arc<AppConfig>,
-        db_manager: Arc<QQChatContextManager>,
-        image_id: &str,
-        question: &str,
-    ) -> Result<String> {
-        let image = db_manager
-            .get_received_image_by_id(image_id)?
-            .with_context(|| format!("找不到图片 ID: {}", image_id))?;
-        let bytes = fs::read(&image.local_path)
-            .await
-            .with_context(|| format!("读取图片文件失败: {}", image.local_path))?;
-        if bytes.is_empty() {
-            anyhow::bail!("图片文件为空: {}", image.local_path);
-        }
-
-        let mime_type = Self::mime_type_from_path(&image.local_path);
-        let vision_image = Self::prepare_image_for_vision(&bytes, mime_type.as_deref())?;
-        println!(
-            "准备调用视觉模型回答图片问题: model={}，image_id={}，请求图片大小={}KB，类型={}",
-            app_config.app.visual_model_name,
-            image_id,
-            vision_image.bytes.len() / 1024,
-            vision_image.mime_type
-        );
-
-        let image_data_url = format!(
-            "data:{};base64,{}",
-            vision_image.mime_type,
-            general_purpose::STANDARD.encode(&vision_image.bytes),
-        );
-        let prompt = Self::image_question_prompt(&image.description, question);
-        let visual_provider = app_config
-            .ai_models
-            .get(&app_config.app.visual_model_name)
-            .with_context(|| format!("找不到视觉模型配置: {}", app_config.app.visual_model_name))?;
-
-        let max_attempts = app_config.app.ai_request_max_attempts();
-        let mut last_error = None;
-        for attempt in 1..=max_attempts {
-            match Self::run_ai_request_with_timeout(
-                &app_config,
-                "图片问题识别 API 请求",
-                visual_provider.describe_image(&image_data_url, &prompt),
-            )
-            .await
-            {
-                Ok(answer) => return Ok(Self::sanitize_description(&answer)),
-                Err(err) => {
-                    eprintln!(
-                        "图片问题识别 API 请求失败，第 {}/{} 次: {}",
-                        attempt, max_attempts, err
-                    );
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        Err(last_error.expect("视觉识别重试循环至少应执行一次"))
-    }
-
     async fn run_ai_request_with_timeout<T, F>(
         app_config: &AppConfig,
         request_name: &str,
@@ -372,39 +306,6 @@ impl MessageEnricher {
                 timeout_seconds
             )),
         }
-    }
-
-    /// 给视觉模型的图片追问提示词。
-    fn image_question_prompt(initial_description: &str, question: &str) -> String {
-        format!(
-            "你是QQ群聊天机器人中的图片识别模块。另一个AI角色需要你根据图片回答一个具体问题。\n\
-要求：\n\
-1. 只根据图片中能直接看到的内容回答，不要编造图片外的信息。\n\
-2. 如果无法确定，直接说明无法确定，并给出能看出的依据。\n\
-3. 回答要短，优先一两句话，不要输出Markdown，不要解释内部推理过程。\n\
-4. 如果问题是识别品种、型号、地点等细分类别，请在不确定时保守表达。\n\n\
-图片初步描述：{}\n\
-问题：{}\n\n\
-现在直接回答问题。",
-            initial_description, question
-        )
-    }
-
-    /// 根据本地图片路径推断 MIME 类型，无法判断时使用 JPEG 作为默认类型。
-    fn mime_type_from_path(path: &str) -> Option<String> {
-        let extension = Path::new(path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase);
-        let mime_type = match extension.as_deref() {
-            Some("jpg") | Some("jpeg") => "image/jpeg",
-            Some("png") => "image/png",
-            Some("gif") => "image/gif",
-            Some("webp") => "image/webp",
-            Some("bmp") => "image/bmp",
-            _ => "image/jpeg",
-        };
-        Some(mime_type.to_string())
     }
 
     /// 为视觉模型准备图片：小图不动，大图等比例压缩并降低 JPEG 质量。
@@ -496,6 +397,23 @@ impl MessageEnricher {
         Ok(Self::jpeg_vision_payload(compressed))
     }
 
+    /// 为工具等调用方准备可直接提交给视觉模型的图片 data URL。
+    pub(crate) fn prepare_vision_image_data_url(
+        bytes: &[u8],
+        mime_type: Option<&str>,
+    ) -> Result<String> {
+        let vision_image = Self::prepare_image_for_vision(bytes, mime_type)?;
+        Ok(Self::vision_image_data_url(&vision_image))
+    }
+
+    fn vision_image_data_url(image: &VisionImagePayload) -> String {
+        format!(
+            "data:{};base64,{}",
+            image.mime_type,
+            general_purpose::STANDARD.encode(&image.bytes),
+        )
+    }
+
     /// 等比例缩放到指定最大边长，并编码为 JPEG。
     fn resize_and_encode_jpeg(image: &DynamicImage, max_side: u32, quality: u8) -> Result<Vec<u8>> {
         let resized_image = Self::resize_to_max_side(image, max_side);
@@ -528,13 +446,13 @@ impl MessageEnricher {
         }
     }
 
-    /// 生成短图片 ID，格式如 img_7Kf3aQ。
+    /// 生成短图片 ID，格式如 img_7Kf3aQ9B。
     fn generate_image_id(&self) -> Result<String> {
         let mut rng = rand::thread_rng();
         for _ in 0..20 {
             let suffix: String = (&mut rng)
                 .sample_iter(Alphanumeric)
-                .take(6)
+                .take(8)
                 .map(char::from)
                 .collect();
             let image_id = format!("img_{}", suffix);
@@ -636,12 +554,14 @@ impl MessageEnricher {
 }
 
 impl EnrichedImage {
-    /// 渲染给主聊天 AI 看的图片文本。
+    /// 渲染给主聊天 AI 看的 Markdown 附件引用。
     fn context_text(&self) -> String {
-        format!(
-            "[图片消息 图片ID={} 内容={}]",
-            self.image_id, self.description,
-        )
+        let description = self
+            .description
+            .replace('\\', "\\\\")
+            .replace('[', "\\[")
+            .replace(']', "\\]");
+        format!("![{}](attachment://{})", description, self.image_id)
     }
 }
 
@@ -653,5 +573,40 @@ impl From<ReceivedImageRecord> for EnrichedImage {
             local_path: record.local_path,
             description: record.description,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EnrichedImage;
+
+    #[test]
+    fn image_context_uses_markdown_attachment_reference() {
+        let image = EnrichedImage {
+            image_id: "img_7Kf3aQ9B".to_string(),
+            content_hash: String::new(),
+            local_path: String::new(),
+            description: "一只白猫趴在窗台上".to_string(),
+        };
+
+        assert_eq!(
+            image.context_text(),
+            "![一只白猫趴在窗台上](attachment://img_7Kf3aQ9B)"
+        );
+    }
+
+    #[test]
+    fn image_context_escapes_markdown_alt_text() {
+        let image = EnrichedImage {
+            image_id: "img_A1b2C3d4".to_string(),
+            content_hash: String::new(),
+            local_path: String::new(),
+            description: r"截图包含 [确定] 和 C:\temp".to_string(),
+        };
+
+        assert_eq!(
+            image.context_text(),
+            r"![截图包含 \[确定\] 和 C:\\temp](attachment://img_A1b2C3d4)"
+        );
     }
 }

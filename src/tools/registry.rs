@@ -4,9 +4,9 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 
 use super::{
-    CancelScheduledTaskTool, IgnoreMessagesTool, RecognizeImageTool, RememberTool,
-    ScheduleTaskTool, Tool, ToolCall, ToolContext, ToolDefinition, ToolResult, WaitThenCheckTool,
-    WebSearchTool,
+    CancelScheduledTaskTool, ContinueConversationTool, EndConversationTool, RecognizeImageTool,
+    RememberTool, ScheduleTaskTool, Tool, ToolCall, ToolContext, ToolDefinition, ToolResult,
+    WaitForReplyTool, WebSearchTool,
 };
 
 /// 已注册工具的稳定有序集合。
@@ -27,10 +27,11 @@ impl ToolRegistry {
         registry.register(RecognizeImageTool).unwrap();
         registry.register(WebSearchTool).unwrap();
         registry.register(RememberTool).unwrap();
-        registry.register(WaitThenCheckTool).unwrap();
+        registry.register(WaitForReplyTool::new()).unwrap();
         registry.register(ScheduleTaskTool).unwrap();
         registry.register(CancelScheduledTaskTool).unwrap();
-        registry.register(IgnoreMessagesTool).unwrap();
+        registry.register(ContinueConversationTool).unwrap();
+        registry.register(EndConversationTool).unwrap();
         registry
     }
 
@@ -54,7 +55,7 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
-    /// 根据调用名称路由到对应工具。当前各工具只校验参数并返回未实现错误。
+    /// 根据调用名称执行对应工具，并把成功或错误统一转换为工具结果。
     pub async fn execute(&self, context: &ToolContext, call: ToolCall) -> ToolResult {
         let output = match self.get(&call.name) {
             Some(tool) => tool.execute(context, &call.arguments).await,
@@ -66,12 +67,14 @@ impl ToolRegistry {
                 tool_call_id: call.id,
                 tool_name: call.name,
                 content: output.content,
+                requires_ai_response: output.requires_ai_response,
                 is_error: false,
             },
             Err(error) => ToolResult {
                 tool_call_id: call.id,
                 tool_name: call.name,
                 content: error.to_string(),
+                requires_ai_response: true,
                 is_error: true,
             },
         }
@@ -94,11 +97,12 @@ mod tests {
             names,
             vec![
                 "cancel_scheduled_task",
-                "ignore_messages",
+                "continue_conversation",
+                "end_conversation",
                 "recognize_image",
                 "remember",
                 "schedule_task",
-                "wait_then_check",
+                "wait_for_reply",
                 "web_search",
             ]
         );

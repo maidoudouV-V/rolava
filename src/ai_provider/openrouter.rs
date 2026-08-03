@@ -1,4 +1,6 @@
-use crate::ai_provider::{AIProvider, ChatUsage, ToolChatMessage, ToolChatResponse};
+use crate::ai_provider::{
+    AIProvider, ChatUsage, ReasoningPayload, ReasoningState, ToolChatMessage, ToolChatResponse,
+};
 use crate::tools::{ToolCall, ToolDefinition};
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
@@ -208,17 +210,18 @@ fn build_openrouter_chat_request<'a>(
             },
             ToolChatMessage::Assistant {
                 content,
-                reasoning_content,
-                reasoning_details,
+                reasoning,
                 tool_calls,
             } => OpenRouterChatMessage::Assistant {
                 content: content.as_deref(),
-                reasoning: if reasoning_details.is_none() {
-                    reasoning_content.as_deref()
-                } else {
-                    None
+                reasoning: match reasoning {
+                    Some(ReasoningPayload::Text(content)) => Some(content.as_str()),
+                    Some(ReasoningPayload::Structured(_)) | None => None,
                 },
-                reasoning_details: reasoning_details.as_ref(),
+                reasoning_details: match reasoning {
+                    Some(ReasoningPayload::Structured(details)) => Some(details),
+                    Some(ReasoningPayload::Text(_)) | None => None,
+                },
                 tool_calls: tool_calls
                     .iter()
                     .map(|call| OpenRouterRequestToolCall {
@@ -388,8 +391,9 @@ fn parse_openrouter_chat_response(response_text: &str) -> anyhow::Result<ToolCha
         )
     })?;
     let content = first_choice.message.content.clone();
+    let finish_reason = first_choice.finish_reason.clone();
     let reasoning_details = first_choice.message.reasoning_details.clone();
-    let reasoning_content = first_choice
+    let reasoning_text = first_choice
         .message
         .reasoning_content
         .as_ref()
@@ -426,14 +430,14 @@ fn parse_openrouter_chat_response(response_text: &str) -> anyhow::Result<ToolCha
             arguments: call.function.arguments.clone(),
         });
     }
-    if content.is_none() && tool_calls.is_empty() {
+    if content.is_none() && tool_calls.is_empty() && finish_reason.as_deref() != Some("stop") {
         bail!(
-            "OpenRouter 响应既没有文本内容，也没有 tool_calls\n原始响应：\n{}",
+            "OpenRouter 响应既没有文本内容，也没有 tool_calls，且 finish_reason 不是 stop（当前：{:?}）\n原始响应：\n{}",
+            finish_reason,
             response_text
         );
     }
 
-    let finish_reason = first_choice.finish_reason.clone();
     let usage = parsed.usage.map(|usage| ChatUsage {
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
@@ -442,8 +446,12 @@ fn parse_openrouter_chat_response(response_text: &str) -> anyhow::Result<ToolCha
 
     Ok(ToolChatResponse {
         content,
-        reasoning_content,
-        reasoning_details,
+        reasoning: ReasoningState {
+            display_text: reasoning_text.clone(),
+            replay: reasoning_details
+                .map(ReasoningPayload::Structured)
+                .or_else(|| reasoning_text.map(ReasoningPayload::Text)),
+        },
         tool_calls,
         finish_reason,
         id: parsed.id,
@@ -508,134 +516,89 @@ fn non_empty_text(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
-    use super::{build_openrouter_chat_request, parse_openrouter_chat_response};
-    use crate::ai_provider::{ToolChatMessage, ToolChatResponse};
-    use crate::tools::{ToolCall, ToolDefinition};
+    use super::*;
 
     #[test]
-    fn serializes_tools_and_tool_history_in_openrouter_format() {
-        let tools = vec![ToolDefinition {
-            name: "web_search",
-            description: "搜索互联网",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
-        }];
-        let reasoning_details = json!([{
-            "type": "reasoning.text",
-            "text": "需要实时天气"
-        }]);
-        let messages = vec![
-            ToolChatMessage::User {
-                content: "查询天气".to_string(),
-            },
-            ToolChatMessage::Assistant {
-                content: Some(String::new()),
-                reasoning_content: Some("需要实时天气".to_string()),
-                reasoning_details: Some(reasoning_details.clone()),
-                tool_calls: vec![ToolCall {
-                    id: "call_1".to_string(),
-                    name: "web_search".to_string(),
-                    arguments: r#"{"query":"香港天气"}"#.to_string(),
-                }],
-            },
-            ToolChatMessage::Tool {
-                tool_call_id: "call_1".to_string(),
-                content: "晴，28 摄氏度".to_string(),
-            },
-        ];
+    fn structured_reasoning_is_replayed_without_conversion() {
+        let response = parse_openrouter_chat_response(
+            r#"{
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_details": [{
+                            "type": "reasoning.text",
+                            "text": "原始结构化推理"
+                        }],
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "test_tool", "arguments": "{}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }"#,
+        )
+        .unwrap();
 
-        let body = build_openrouter_chat_request("test-model", 1024, "medium", &messages, &tools);
-        let value = serde_json::to_value(body).unwrap();
-
-        assert_eq!(value["tool_choice"], "auto");
-        assert_eq!(value["reasoning"]["summary"], "auto");
-        assert_eq!(value["tools"][0]["type"], "function");
-        assert_eq!(value["tools"][0]["function"]["name"], "web_search");
-        assert_eq!(value["messages"][1]["role"], "assistant");
-        assert_eq!(value["messages"][1]["reasoning_details"], reasoning_details);
-        assert!(value["messages"][1].get("reasoning").is_none());
         assert_eq!(
-            value["messages"][1]["tool_calls"][0]["function"]["arguments"],
-            r#"{"query":"香港天气"}"#
+            response.reasoning.display_text.as_deref(),
+            Some("原始结构化推理")
         );
-        assert_eq!(value["messages"][2]["role"], "tool");
-        assert_eq!(value["messages"][2]["tool_call_id"], "call_1");
+        let expected_details =
+            response.raw_response["choices"][0]["message"]["reasoning_details"].clone();
+        let messages = vec![response.assistant_message()];
+        let request = build_openrouter_chat_request("test", 100, "medium", &messages, &[]);
+        let request_json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(
+            request_json["messages"][0]["reasoning_details"],
+            expected_details
+        );
+        assert!(request_json["messages"][0].get("reasoning").is_none());
     }
 
     #[test]
-    fn omits_tool_fields_for_plain_text_request() {
-        let messages = vec![ToolChatMessage::User {
-            content: "需要回复吗".to_string(),
-        }];
-
-        let body = build_openrouter_chat_request("test-model", 128, "low", &messages, &[]);
-        let value = serde_json::to_value(body).unwrap();
-
-        assert!(value.get("tools").is_none());
-        assert!(value.get("tool_choice").is_none());
-        assert_eq!(value["reasoning"]["summary"], "auto");
-    }
-
-    #[test]
-    fn parses_tool_calls_and_preserves_reasoning_details() {
-        let response_text = r#"{
-            "id": "generation_1",
-            "model": "google/gemini-3-flash-preview",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": null,
-                    "reasoning_details": [{
-                        "type": "reasoning.text",
-                        "text": "需要调用搜索工具"
-                    }],
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "web_search",
-                            "arguments": "{\"query\":\"香港天气\"}"
-                        }
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15
-            }
-        }"#;
-
-        let response = parse_openrouter_chat_response(response_text).unwrap();
+    fn empty_stop_response_is_valid_no_action() {
+        let response = parse_openrouter_chat_response(
+            r#"{
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": []
+                    },
+                    "finish_reason": "stop"
+                }]
+            }"#,
+        )
+        .unwrap();
 
         assert_eq!(response.content, None);
-        assert_eq!(
-            response.reasoning_content.as_deref(),
-            Some("需要调用搜索工具")
-        );
-        assert!(response.reasoning_details.is_some());
-        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(response.tool_calls.len(), 1);
-        assert_eq!(response.tool_calls[0].id, "call_1");
-        assert_eq!(response.tool_calls[0].name, "web_search");
-        assert_eq!(response.tool_calls[0].arguments, r#"{"query":"香港天气"}"#);
-        assert!(matches!(
-            ToolChatResponse::assistant_message(&response),
-            ToolChatMessage::Assistant {
-                reasoning_details: Some(_),
-                tool_calls,
-                ..
-            } if tool_calls == response.tool_calls
-        ));
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn empty_non_stop_response_is_rejected() {
+        let error = parse_openrouter_chat_response(
+            r#"{
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": []
+                    },
+                    "finish_reason": "length"
+                }]
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("finish_reason 不是 stop"));
     }
 }

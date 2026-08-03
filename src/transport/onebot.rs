@@ -4,7 +4,7 @@ use crate::transport::message::{
     Conversation, ConversationKind, IncomingMessage, MessageContent, MessagePart, MessageTarget,
     Participant,
 };
-use crate::transport::MessageSender;
+use crate::transport::{MessageSender, SendOptions};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use axum::extract::State;
@@ -646,7 +646,7 @@ pub struct OneBotMessageSender {
     onebot_api_url: String,
     onebot_token: Option<String>,
     db_manager: Arc<QQChatContextManager>,
-    reply_delay_per_char_secs: f64,
+    split_reply_on_newlines: bool,
     reply_delay_random_max_secs: f64,
 }
 
@@ -661,20 +661,25 @@ impl OneBotMessageSender {
                 Some(config.server.onebot_token.clone())
             },
             db_manager,
-            reply_delay_per_char_secs: config.app.reply_delay_per_char_secs,
+            split_reply_on_newlines: config.app.split_reply_on_newlines,
             reply_delay_random_max_secs: config.app.reply_delay_random_max_secs,
         }
     }
 
-    fn reply_delay(&self, text: &str) -> Duration {
-        let base_secs = text.chars().count() as f64 * self.reply_delay_per_char_secs.max(0.0);
+    fn reply_delay(&self, options: SendOptions) -> Duration {
         let random_max_secs = self.reply_delay_random_max_secs.max(0.0);
-        let random_secs = if random_max_secs > 0.0 {
+        let total_delay_secs = if random_max_secs > 0.0 {
             rand::thread_rng().gen_range(0.0..=random_max_secs)
         } else {
             0.0
         };
-        Duration::from_secs_f64(base_secs + random_secs)
+        let total_delay = Duration::from_secs_f64(total_delay_secs);
+        let elapsed = options
+            .delay_started_at
+            .map(|started_at| started_at.elapsed())
+            .unwrap_or_default();
+
+        total_delay.saturating_sub(elapsed)
     }
 
     fn request_parts(target: &MessageTarget, text: &str) -> (&'static str, &'static str, Value) {
@@ -713,23 +718,22 @@ impl OneBotMessageSender {
             .unwrap_or("未提供错误详情")
             .to_string()
     }
-}
 
-#[async_trait]
-impl MessageSender for OneBotMessageSender {
-    async fn send_text(&self, target: &MessageTarget, text: &str) -> Result<()> {
-        if target.source != "onebot" {
-            bail!("OneBot 发送器不支持消息来源：{}", target.source);
-        }
-        if text.trim().is_empty() {
-            bail!("不能发送空消息");
+    fn text_segments(text: &str, split_on_newlines: bool) -> Vec<&str> {
+        if !split_on_newlines {
+            return (!text.trim().is_empty())
+                .then_some(text)
+                .into_iter()
+                .collect();
         }
 
-        let delay = self.reply_delay(text);
-        if !delay.is_zero() {
-            sleep(delay).await;
-        }
+        text.lines()
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect()
+    }
 
+    async fn send_text_segment(&self, target: &MessageTarget, text: &str) -> Result<()> {
         let (api_path, conversation_kind, payload) = Self::request_parts(target, text);
         let mut request = self
             .client
@@ -802,6 +806,35 @@ impl MessageSender for OneBotMessageSender {
         self.db_manager
             .write_message(&outgoing_message)
             .context("消息已发送，但写入聊天记录失败")?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MessageSender for OneBotMessageSender {
+    async fn send_text(
+        &self,
+        target: &MessageTarget,
+        text: &str,
+        options: SendOptions,
+    ) -> Result<()> {
+        if target.source != "onebot" {
+            bail!("OneBot 发送器不支持消息来源：{}", target.source);
+        }
+        let segments = Self::text_segments(text, self.split_reply_on_newlines);
+        if segments.is_empty() {
+            bail!("不能发送空消息");
+        }
+
+        let delay = self.reply_delay(options);
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+
+        for segment in segments {
+            self.send_text_segment(target, segment).await?;
+        }
 
         Ok(())
     }
@@ -1074,5 +1107,26 @@ async fn on_event(
             eprintln!("OneBot 原始消息进入转换队列失败: {}", err);
             StatusCode::SERVICE_UNAVAILABLE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OneBotMessageSender;
+
+    #[test]
+    fn text_segments_skip_consecutive_and_blank_lines() {
+        let segments =
+            OneBotMessageSender::text_segments("  第一段  \n\n  \r\n第二段\r\n\r\n第三段  ", true);
+
+        assert_eq!(segments, vec!["第一段", "第二段", "第三段"]);
+    }
+
+    #[test]
+    fn text_segments_preserve_original_text_when_disabled() {
+        let text = "第一段\n\n第二段";
+
+        assert_eq!(OneBotMessageSender::text_segments(text, false), vec![text]);
+        assert!(OneBotMessageSender::text_segments(" \n\r\n ", false).is_empty());
     }
 }

@@ -1,21 +1,23 @@
 mod cancel_scheduled_task;
-mod ignore_messages;
+mod continue_conversation;
+mod end_conversation;
 mod recognize_image;
 mod registry;
 mod remember;
 mod schedule_task;
 mod send_message;
-mod wait_then_check;
+mod wait_for_reply;
 mod web_search;
 
 pub use cancel_scheduled_task::{CancelScheduledTaskArgs, CancelScheduledTaskTool};
-pub use ignore_messages::IgnoreMessagesTool;
+pub use continue_conversation::ContinueConversationTool;
+pub use end_conversation::EndConversationTool;
 pub use recognize_image::{RecognizeImageArgs, RecognizeImageTool};
 pub use registry::ToolRegistry;
 pub use remember::{RememberArgs, RememberTool};
 pub use schedule_task::{ScheduleTaskArgs, ScheduleTaskTool};
 pub use send_message::{SendMessageArgs, SendMessageTool};
-pub use wait_then_check::{WaitThenCheckArgs, WaitThenCheckTool};
+pub use wait_for_reply::{WaitForReplyArgs, WaitForReplyTool};
 pub use web_search::{WebSearchArgs, WebSearchTool};
 
 use anyhow::{bail, Context, Result};
@@ -25,7 +27,11 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::transport::message::MessageTarget;
+use crate::config::AppConfig;
+use crate::conversation_control::ConversationControl;
+use crate::conversation_trigger::ConversationTriggerSender;
+use crate::repository::db_manager::QQChatContextManager;
+use crate::transport::message::{IncomingMessage, MessageTarget};
 use crate::transport::MessageSender;
 
 /// Provider 无关的 function tool 定义，由各 AI Provider 转换成自己的请求格式。
@@ -45,18 +51,70 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// 当前会话工具共享的运行时依赖。
+/// 当前这次工具调用所属的会话信息。
+#[derive(Clone)]
+pub struct ConversationToolContext {
+    pub key: String,
+    pub target: MessageTarget,
+    pub current_messages: Vec<IncomingMessage>,
+    pub control: Arc<ConversationControl>,
+    pub trigger_sender: Arc<dyn ConversationTriggerSender>,
+}
+
+/// 所有工具共享的应用服务。新增系统能力时统一从这里注入。
+#[derive(Clone)]
+pub struct ToolServices {
+    pub app_config: Arc<AppConfig>,
+    pub db_manager: Arc<QQChatContextManager>,
+    pub message_sender: Arc<dyn MessageSender>,
+}
+
+impl ToolServices {
+    pub fn new(
+        app_config: Arc<AppConfig>,
+        db_manager: Arc<QQChatContextManager>,
+        message_sender: Arc<dyn MessageSender>,
+    ) -> Self {
+        Self {
+            app_config,
+            db_manager,
+            message_sender,
+        }
+    }
+}
+
+/// 单次工具调用可使用的完整上下文。
 #[derive(Clone)]
 pub struct ToolContext {
-    pub conversation_key: String,
-    pub message_sender: Arc<dyn MessageSender>,
-    pub message_target: MessageTarget,
+    pub conversation: ConversationToolContext,
+    pub services: Arc<ToolServices>,
 }
 
 /// 单个工具处理器的成功输出。
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
+    /// 工具产生的结果内容，与是否继续请求 AI 相互独立。
     pub content: String,
+    pub requires_ai_response: bool,
+}
+
+impl ToolOutput {
+    pub fn new(content: impl Into<String>, requires_ai_response: bool) -> Self {
+        Self {
+            content: content.into(),
+            requires_ai_response,
+        }
+    }
+
+    /// 返回内容并要求模型根据结果继续处理。
+    pub fn text(content: impl Into<String>) -> Self {
+        Self::new(content, true)
+    }
+
+    /// 不返回内容，也不再触发后续模型请求；仅用于结束或继续查看对话。
+    pub fn none() -> Self {
+        Self::new(String::new(), false)
+    }
 }
 
 /// 发送回模型的工具调用结果。
@@ -65,6 +123,7 @@ pub struct ToolResult {
     pub tool_call_id: String,
     pub tool_name: String,
     pub content: String,
+    pub requires_ai_response: bool,
     pub is_error: bool,
 }
 

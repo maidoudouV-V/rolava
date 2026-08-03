@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::ai_provider::{ContextMessage, MessageRole, ToolChatMessage, ToolChatResponse};
 use crate::config::AppConfig;
+use crate::conversation_control::ConversationControl;
 use crate::message_enricher::MessageEnricher;
 use crate::repository::db_manager::{ChatMessage, QQChatContextManager};
 use crate::transport::message::{ConversationKind, IncomingMessage};
@@ -21,16 +22,22 @@ pub struct ConversationFilter {
     app_config: Arc<AppConfig>,
     db_manager: Arc<QQChatContextManager>,
     message_enricher: MessageEnricher,
+    conversation_control: Arc<ConversationControl>,
     filter_context: Vec<ContextMessage>,
     filter_context_initialized: bool,
 }
 
 impl ConversationFilter {
-    pub fn new(app_config: Arc<AppConfig>, db_manager: Arc<QQChatContextManager>) -> Self {
+    pub fn new(
+        app_config: Arc<AppConfig>,
+        db_manager: Arc<QQChatContextManager>,
+        conversation_control: Arc<ConversationControl>,
+    ) -> Self {
         Self {
             app_config: app_config.clone(),
             db_manager: db_manager.clone(),
             message_enricher: MessageEnricher::new(app_config, db_manager),
+            conversation_control,
             filter_context: Vec::new(),
             filter_context_initialized: false,
         }
@@ -40,7 +47,6 @@ impl ConversationFilter {
     pub async fn process_messages(
         &mut self,
         incoming_messages: Vec<IncomingMessage>,
-        bypass_ai_filter: bool,
     ) -> Vec<IncomingMessage> {
         let mut accepted_messages = Vec::with_capacity(incoming_messages.len());
 
@@ -70,7 +76,9 @@ impl ConversationFilter {
             return accepted_messages;
         }
 
-        if bypass_ai_filter || accepted_messages.iter().any(Self::mentions_bot) {
+        if self.conversation_control.ai_filter_bypassed()
+            || accepted_messages.iter().any(Self::mentions_bot)
+        {
             return accepted_messages;
         }
 
@@ -89,7 +97,10 @@ impl ConversationFilter {
                     .as_deref()
                     .and_then(Self::parse_filter_action)
                 {
-                    Some(FilterAction::Reply) => accepted_messages,
+                    Some(FilterAction::Reply) => {
+                        self.conversation_control.set_ai_filter_bypassed(true);
+                        accepted_messages
+                    }
                     Some(FilterAction::Ignore) => Vec::new(),
                     None => {
                         eprintln!("无法识别消息过滤结果，继续后续处理: {:?}", response.content);

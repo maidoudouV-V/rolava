@@ -31,12 +31,26 @@ pub struct ChatUsage {
     pub total_tokens: Option<u64>,
 }
 
+/// 工具调用下一轮需要原样回传的推理载荷。
+#[derive(Debug, Clone)]
+pub enum ReasoningPayload {
+    Text(String),
+    Structured(Value),
+}
+
+/// 推理信息分为日志展示文本和协议回传载荷，避免展示转换破坏原始数据。
+#[derive(Debug, Clone, Default)]
+pub struct ReasoningState {
+    pub display_text: Option<String>,
+    pub replay: Option<ReasoningPayload>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     /// 模型最终返回给用户的主回复文本。
     pub content: String,
-    /// 模型的思考内容，部分支持推理输出的服务商会返回。
-    pub reasoning_content: Option<String>,
+    /// 模型返回的推理信息。
+    pub reasoning: ReasoningState,
     /// 本次生成结束的原因，例如正常停止或长度截断。
     pub finish_reason: Option<String>,
     /// 服务端为本次响应分配的唯一 ID。
@@ -60,10 +74,7 @@ pub enum ToolChatMessage {
     },
     Assistant {
         content: Option<String>,
-        /// DeepSeek 等兼容接口要求在工具调用后完整回传推理内容。
-        reasoning_content: Option<String>,
-        /// OpenRouter reasoning 模型要求在工具调用后原样回传的结构化推理块。
-        reasoning_details: Option<Value>,
+        reasoning: Option<ReasoningPayload>,
         tool_calls: Vec<ToolCall>,
     },
     Tool {
@@ -83,8 +94,7 @@ impl From<&ContextMessage> for ToolChatMessage {
             },
             MessageRole::Assistant => Self::Assistant {
                 content: Some(message.content.clone()),
-                reasoning_content: None,
-                reasoning_details: None,
+                reasoning: None,
                 tool_calls: Vec::new(),
             },
         }
@@ -104,8 +114,7 @@ impl From<&ToolResult> for ToolChatMessage {
 #[derive(Debug, Clone)]
 pub struct ToolChatResponse {
     pub content: Option<String>,
-    pub reasoning_content: Option<String>,
-    pub reasoning_details: Option<Value>,
+    pub reasoning: ReasoningState,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
     pub id: Option<String>,
@@ -119,8 +128,7 @@ impl ToolChatResponse {
     pub fn assistant_message(&self) -> ToolChatMessage {
         ToolChatMessage::Assistant {
             content: self.content.clone(),
-            reasoning_content: self.reasoning_content.clone(),
-            reasoning_details: self.reasoning_details.clone(),
+            reasoning: self.reasoning.replay.clone(),
             tool_calls: self.tool_calls.clone(),
         }
     }

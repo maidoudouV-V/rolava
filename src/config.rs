@@ -50,15 +50,15 @@ pub struct AppSection {
     pub ai_request_timeout_seconds: u64,
     /// 接收到的图片本地保存目录。
     pub received_image_dir: String,
-    /// 启用的可选动作列表，send_message、wait_then_check、ignore_messages 固定启用。
+    /// 启用的可选动作列表；会话控制工具固定启用。
     pub enabled_actions: Vec<String>,
     /// 私聊白名单 QQ 号，空数组表示放行所有私聊。
     pub direct_whitelist: Vec<String>,
     /// 群聊白名单群号，空数组表示放行所有群聊。
     pub group_whitelist: Vec<String>,
-    /// 模拟回复时每个字符对应的最少等待秒数。
-    pub reply_delay_per_char_secs: f64,
-    /// 模拟回复时额外随机等待的最大秒数。
+    /// 是否按换行符拆分并逐段发送回复文本。
+    pub split_reply_on_newlines: bool,
+    /// 模拟回复时总随机等待的最大秒数。
     pub reply_delay_random_max_secs: f64,
 }
 

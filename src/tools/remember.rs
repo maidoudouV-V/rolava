@@ -46,9 +46,7 @@ impl Tool for RememberTool {
         /* 旧动作目前没有真实存储实现，仅暂存原有行为。
         let RememberArgs { content } = _arguments;
         eprintln!("暂未实现记忆写入: content={}", content);
-        return Ok(ToolOutput {
-            content: "记忆写入尚未实现".to_string(),
-        });
+        return Ok(ToolOutput::text("记忆写入尚未实现"));
         */
 
         execution_not_implemented(self.name())

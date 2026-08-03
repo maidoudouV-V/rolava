@@ -1,6 +1,7 @@
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
+use crate::conversation_trigger::ConversationTrigger;
 use crate::tools::ToolRegistry;
 use crate::transport::message::IncomingMessage;
 
@@ -10,15 +11,10 @@ use super::filter::ConversationFilter;
 const MESSAGE_BATCH_WAIT: Duration = Duration::from_secs(2);
 const MESSAGE_BATCH_MAX_MESSAGES: usize = 5;
 
-/// 延时工具到期后，用于重新唤醒当前会话 Actor 的内部触发。
-pub struct InternalTrigger {
-    pub conversation_messages: Vec<IncomingMessage>,
-}
-
 /// 单个会话 mailbox 接收的全部事件类型。
 pub enum ConversationEvent {
     IncomingMessage(IncomingMessage),
-    InternalTrigger(InternalTrigger),
+    InternalTrigger(ConversationTrigger),
 }
 
 /// 单个会话的 Actor；mailbox 保证该会话的所有事件严格串行处理。
@@ -27,8 +23,6 @@ pub struct ConversationActor {
     filter: ConversationFilter,
     processor: ChatProcessor,
     tools: ToolRegistry,
-    /// 后续由聊天工具修改；为 true 时当前会话跳过 AI 前置过滤。
-    bypass_ai_filter: bool,
 }
 
 impl ConversationActor {
@@ -42,7 +36,6 @@ impl ConversationActor {
             filter,
             processor,
             tools: ToolRegistry::built_in(),
-            bypass_ai_filter: false,
         }
     }
 
@@ -63,10 +56,7 @@ impl ConversationActor {
                         Self::collect_message_batch(&mut self.event_rx, incoming_message).await;
                     pending_event = next_event;
 
-                    let incoming_messages = self
-                        .filter
-                        .process_messages(incoming_messages, self.bypass_ai_filter)
-                        .await;
+                    let incoming_messages = self.filter.process_messages(incoming_messages).await;
                     if incoming_messages.is_empty() {
                         continue;
                     }
@@ -76,7 +66,7 @@ impl ConversationActor {
                 }
                 ConversationEvent::InternalTrigger(trigger) => {
                     self.processor
-                        .process_internal_trigger(trigger.conversation_messages, &self.tools)
+                        .process_internal_trigger(trigger, &self.tools)
                         .await;
                 }
             }

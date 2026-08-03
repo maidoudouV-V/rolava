@@ -1,5 +1,7 @@
 mod ai_provider;
 mod config;
+pub mod conversation_control;
+pub mod conversation_trigger;
 mod message_enricher;
 mod pipeline;
 mod repository;

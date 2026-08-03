@@ -1,6 +1,6 @@
 use crate::ai_provider::{
     context_messages_without_tools, AIProvider, ChatUsage, ContextMessage, MessageRole,
-    ToolChatMessage, ToolChatResponse,
+    ReasoningState, ToolChatMessage, ToolChatResponse,
 };
 use crate::tools::ToolDefinition;
 use anyhow::{anyhow, bail};
@@ -201,8 +201,7 @@ impl AIProvider for GoogleAIStudioProvider {
 
         Ok(ToolChatResponse {
             content: Some(content),
-            reasoning_content: None,
-            reasoning_details: None,
+            reasoning: ReasoningState::default(),
             tool_calls: Vec::new(),
             finish_reason,
             id: None,
@@ -268,10 +267,16 @@ impl AIProvider for GoogleAIStudioProvider {
                     inline_data: None,
                 }],
             }],
-            tools: Some(vec![GeminiTool {
-                google_search: Some(GeminiGoogleSearch {}),
-                url_context: Some(GeminiUrlContext {}),
-            }]),
+            tools: Some(vec![
+                GeminiTool {
+                    google_search: Some(GeminiGoogleSearch {}),
+                    url_context: None,
+                },
+                GeminiTool {
+                    google_search: None,
+                    url_context: Some(GeminiUrlContext {}),
+                },
+            ]),
             generation_config: GeminiGenerationConfig {
                 max_output_tokens: self.max_tokens,
                 response_mime_type: None,
