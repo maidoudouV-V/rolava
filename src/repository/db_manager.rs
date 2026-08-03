@@ -15,7 +15,7 @@ pub struct ConversationRecord {
     pub source: String,
     /// 来源平台上的会话 ID。
     pub source_conversation_id: String,
-    /// 会话类型，例如 `direct` / `group` / `channel`。
+    /// 会话类型，例如 `direct` / `group`。
     pub kind: String,
     /// 会话展示名称。
     pub title: Option<String>,
@@ -475,6 +475,62 @@ impl QQChatContextManager {
         Ok(messages)
     }
 
+    /// 获取会话中时间最新的指定数量消息，并按时间正序返回。
+    pub fn get_latest_conversation_history(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChatMessage>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let connection = self.conn_pool.get()?;
+        let mut stmt = connection.prepare(
+            "
+            SELECT
+                m.id,
+                m.conversation_id,
+                c.source,
+                c.source_conversation_id,
+                c.kind,
+                m.source_message_id,
+                m.sender_id,
+                m.sender_display_name,
+                m.sender_nickname,
+                m.sender_role,
+                m.content_text,
+                m.message_type,
+                m.content_parts_json,
+                m.metadata_json,
+                m.is_read,
+                m.event_timestamp,
+                m.created_at
+            FROM
+                messages m
+            INNER JOIN
+                conversations c
+                ON c.id = m.conversation_id
+            WHERE
+                c.source = ?1
+                AND c.source_conversation_id = ?2
+            ORDER BY
+                m.event_timestamp DESC,
+                m.id DESC
+            LIMIT ?3
+            ",
+        )?;
+
+        let messages_iter = stmt.query_map(
+            params![source, source_conversation_id, limit],
+            ChatMessage::from_row,
+        )?;
+        let mut messages = messages_iter.collect::<rusqlite::Result<Vec<_>>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// 统计指定会话的消息总数，用于计算按块淘汰的窗口位置。
     fn count_conversation_messages(
         connection: &rusqlite::Connection,
@@ -499,13 +555,13 @@ impl QQChatContextManager {
         Ok(total_message_count)
     }
 
-    /// 计算历史窗口需要跳过的旧消息数量；块大小为最大历史消息数的十分之一。
+    /// 计算历史窗口需要跳过的旧消息数量；块大小为最大历史消息数的五分之一。
     fn history_block_offset(total_message_count: i64, max_history_messages: i64) -> i64 {
         if total_message_count <= max_history_messages {
             return 0;
         }
 
-        let block_size = (max_history_messages / 10).max(1);
+        let block_size = (max_history_messages / 5).max(1);
         let overflow = total_message_count - max_history_messages;
         let dropped_blocks = ((overflow - 1) / block_size) + 1;
         dropped_blocks * block_size
@@ -691,7 +747,6 @@ impl QQChatContextManager {
         match kind {
             ConversationKind::Direct => "direct",
             ConversationKind::Group => "group",
-            ConversationKind::Channel => "channel",
         }
     }
 

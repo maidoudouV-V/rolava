@@ -1,5 +1,9 @@
-use crate::ai_provider::{AIProvider, ChatResponse, ChatUsage, ContextMessage, MessageRole};
-use anyhow::anyhow;
+use crate::ai_provider::{
+    context_messages_without_tools, AIProvider, ChatUsage, ContextMessage, MessageRole,
+    ToolChatMessage, ToolChatResponse,
+};
+use crate::tools::ToolDefinition;
+use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -155,19 +159,23 @@ struct GeminiUsageMetadata {
 impl AIProvider for GoogleAIStudioProvider {
     async fn chat_completions(
         &self,
-        request_messages: &Vec<ContextMessage>,
-    ) -> anyhow::Result<ChatResponse> {
-        let (system_instruction, contents) = build_gemini_chat_contents(request_messages);
+        messages: &[ToolChatMessage],
+        tools: &[ToolDefinition],
+    ) -> anyhow::Result<ToolChatResponse> {
+        if !tools.is_empty() {
+            bail!("Google AI Studio Provider 尚未接入 function tools");
+        }
+        let request_messages = context_messages_without_tools(messages)?;
+        let (system_instruction, contents) = build_gemini_chat_contents(&request_messages);
         let body = GeminiGenerateContentRequest {
             system_instruction,
             contents,
             tools: None,
             generation_config: GeminiGenerationConfig {
                 max_output_tokens: self.max_tokens,
-                response_mime_type: Some("application/json"),
+                response_mime_type: Some("text/plain"),
             },
         };
-
         let response_text = self.send_generate_content(&body).await?;
         let raw_response: Value = serde_json::from_str(&response_text)?;
         let parsed: GeminiGenerateContentResponse =
@@ -191,9 +199,11 @@ impl AIProvider for GoogleAIStudioProvider {
             total_tokens: usage.total_token_count,
         });
 
-        Ok(ChatResponse {
-            content,
+        Ok(ToolChatResponse {
+            content: Some(content),
             reasoning_content: None,
+            reasoning_details: None,
+            tool_calls: Vec::new(),
             finish_reason,
             id: None,
             model: Some(self.model.clone()),

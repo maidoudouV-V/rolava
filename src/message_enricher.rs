@@ -256,7 +256,7 @@ impl MessageEnricher {
         );
         let visual_provider = self
             .app_config
-            .ai_providers
+            .ai_models
             .get(&self.app_config.app.visual_model_name)
             .with_context(|| {
                 format!(
@@ -323,7 +323,7 @@ impl MessageEnricher {
         );
         let prompt = Self::image_question_prompt(&image.description, question);
         let visual_provider = app_config
-            .ai_providers
+            .ai_models
             .get(&app_config.app.visual_model_name)
             .with_context(|| format!("找不到视觉模型配置: {}", app_config.app.visual_model_name))?;
 

@@ -31,11 +31,30 @@ pub struct IncomingMessage {
     pub metadata: Value,
 }
 
+/// 工具发送消息时使用的稳定会话目标，不依赖某一条具体的入站消息。
+#[derive(Debug, Clone)]
+pub struct MessageTarget {
+    /// 消息平台，例如 `onebot`。
+    pub source: String,
+    /// 当前机器人在平台上的账号 ID。
+    pub bot_id: String,
+    /// 平台会话信息。
+    pub conversation: Conversation,
+}
+
+impl From<&IncomingMessage> for MessageTarget {
+    fn from(message: &IncomingMessage) -> Self {
+        Self {
+            source: message.source.clone(),
+            bot_id: message.bot_id.clone(),
+            conversation: message.conversation.clone(),
+        }
+    }
+}
+
 /// 通用系统事件。
 #[derive(Debug, Clone)]
-pub struct IncomingSystemEvent {
-
-}
+pub struct IncomingSystemEvent {}
 
 /// 消息所属会话。
 #[derive(Debug, Clone)]
@@ -56,8 +75,6 @@ pub enum ConversationKind {
     Direct,
     /// 群聊会话。
     Group,
-    /// 频道、话题或其它公开会话。
-    Channel,
 }
 
 /// 会话参与者。

@@ -19,6 +19,8 @@ struct TomlConfig {
     server: ServerSection,
     /// AI 服务商配置列表
     providers: Vec<ProviderConfig>,
+    /// AI 模型配置列表
+    models: Vec<ModelConfig>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -27,10 +29,15 @@ pub struct AppSection {
     pub prompt_dir: String,
     /// 发送给模型的最大历史消息数。
     pub max_history_messages: u32,
-    /// 当前回复决策状态为“更主动”的概率，范围 0-100。
+    /// 更主动回复的概率，范围 0-100；保留供后续流程使用。
     pub proactive_reply_percent: f64,
     /// 默认聊天模型名称
     pub chat_model_name: String,
+    /// 消息过滤模型名称。
+    pub filter_model_name: String,
+    /// 是否启用 AI 前置消息过滤。
+    #[serde(default = "default_enable_ai_filter")]
+    pub enable_ai_filter: bool,
     /// 联网搜索模型名称。
     pub web_search_model_name: String,
     /// 默认视觉模型名称，用于图片识别等消息增强流程。
@@ -69,6 +76,10 @@ fn default_ai_request_timeout_seconds() -> u64 {
     DEFAULT_AI_REQUEST_TIMEOUT_SECONDS
 }
 
+fn default_enable_ai_filter() -> bool {
+    true
+}
+
 #[derive(Deserialize, Debug)]
 pub struct ServerSection {
     /// 本服务监听地址
@@ -93,7 +104,15 @@ pub struct ProviderConfig {
     pub key: String,
     /// 服务商接口基础地址
     pub base_url: String,
-    /// 服务商默认模型名称
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ModelConfig {
+    /// 模型配置名称，用作应用内唯一标识
+    pub name: String,
+    /// 模型使用的服务商配置名称
+    pub provider: String,
+    /// 远端 API 接受的模型 ID
     pub model: String,
     /// 最大输出 token 数。
     pub max_tokens: i32,
@@ -106,8 +125,8 @@ pub struct AppConfig {
     pub app: AppSection,
     /// 服务监听与 OneBot 通信配置
     pub server: ServerSection,
-    /// 已初始化的 AI 服务商实例列表
-    pub ai_providers: HashMap<String, Box<dyn AIProvider + Send + Sync>>,
+    /// 按模型配置名称索引的 AI 模型实例
+    pub ai_models: HashMap<String, Box<dyn AIProvider + Send + Sync>>,
     /// 提示词配置
     pub prompt_config: PromptConfig,
 }
@@ -115,36 +134,62 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn new(config_path: &str) -> Result<Self> {
         let toml_str = std::fs::read_to_string(config_path)?;
-        let toml_config: TomlConfig = toml::from_str(&toml_str)?;
+        let TomlConfig {
+            app,
+            server,
+            providers,
+            models,
+        } = toml::from_str(&toml_str)?;
 
-        let mut ai_providers = HashMap::<String, Box<dyn AIProvider + Send + Sync>>::new();
-        for provider_config in toml_config.providers {
-            let provider: Box<dyn AIProvider + Send + Sync> = match provider_config.r#type.as_str()
+        let mut provider_configs = HashMap::new();
+        for provider_config in providers {
+            let provider_name = provider_config.name.clone();
+            if provider_configs
+                .insert(provider_name.clone(), provider_config)
+                .is_some()
             {
+                anyhow::bail!("服务商配置名称重复：{}", provider_name);
+            }
+        }
+
+        let mut ai_models = HashMap::<String, Box<dyn AIProvider + Send + Sync>>::new();
+        for model_config in models {
+            let provider_config =
+                provider_configs
+                    .get(&model_config.provider)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "模型配置 {} 引用了不存在的服务商：{}",
+                            model_config.name,
+                            model_config.provider
+                        )
+                    })?;
+            let model: Box<dyn AIProvider + Send + Sync> = match provider_config.r#type.as_str() {
                 "openai_compatible" => Box::new(OpenAICompatibleProvider::new(
-                    provider_config.key,
-                    provider_config.base_url,
-                    provider_config.model,
-                    provider_config.max_tokens,
-                    provider_config.reasoning_effort,
+                    provider_config.key.clone(),
+                    provider_config.base_url.clone(),
+                    model_config.model,
+                    model_config.max_tokens,
+                    model_config.reasoning_effort,
                 )),
                 "anthropic" => Box::new(AnthropicProvider::new(
-                    provider_config.key,
-                    provider_config.base_url,
-                    provider_config.model,
+                    provider_config.key.clone(),
+                    provider_config.base_url.clone(),
+                    model_config.model,
+                    model_config.max_tokens,
                 )),
                 "openrouter" => Box::new(OpenRouterProvider::new(
-                    provider_config.key,
-                    provider_config.base_url,
-                    provider_config.model,
-                    provider_config.max_tokens,
-                    provider_config.reasoning_effort,
+                    provider_config.key.clone(),
+                    provider_config.base_url.clone(),
+                    model_config.model,
+                    model_config.max_tokens,
+                    model_config.reasoning_effort,
                 )),
                 "google_aistudio" => Box::new(GoogleAIStudioProvider::new(
-                    provider_config.key,
-                    provider_config.base_url,
-                    provider_config.model,
-                    provider_config.max_tokens,
+                    provider_config.key.clone(),
+                    provider_config.base_url.clone(),
+                    model_config.model,
+                    model_config.max_tokens,
                 )),
                 _ => {
                     return Err(anyhow::anyhow!(
@@ -153,13 +198,28 @@ impl AppConfig {
                     ))
                 }
             };
-            ai_providers.insert(provider_config.name.clone(), provider);
+            let model_name = model_config.name;
+            if ai_models.insert(model_name.clone(), model).is_some() {
+                anyhow::bail!("模型配置名称重复：{}", model_name);
+            }
         }
-        let prompt_config = PromptConfig::new(&toml_config.app)?;
+
+        for (purpose, model_name) in [
+            ("聊天", &app.chat_model_name),
+            ("消息过滤", &app.filter_model_name),
+            ("联网搜索", &app.web_search_model_name),
+            ("图像识别", &app.visual_model_name),
+        ] {
+            if !ai_models.contains_key(model_name) {
+                anyhow::bail!("{}模型配置不存在：{}", purpose, model_name);
+            }
+        }
+
+        let prompt_config = PromptConfig::new(&app)?;
         Ok(AppConfig {
-            app: toml_config.app,
-            server: toml_config.server,
-            ai_providers,
+            app,
+            server,
+            ai_models,
             prompt_config,
         })
     }
@@ -169,17 +229,21 @@ pub struct PromptConfig {
     pub system_prompt: String,
     pub character_prompt: String,
     pub instruction_prompt: String,
+    pub filter_prompt: String,
 }
 impl PromptConfig {
     pub fn new(app: &AppSection) -> Result<Self> {
         let prompt_dir = Path::new(&app.prompt_dir);
         let system_template = fs::read_to_string(prompt_dir.join("system.md"))?;
         let enabled_actions_prompt = Self::load_enabled_action_prompts(app, prompt_dir)?;
+        let character_prompt = fs::read_to_string(prompt_dir.join("character.md"))?;
+        let filter_template = fs::read_to_string(prompt_dir.join("filter.md"))?;
         let new_config = Self {
             system_prompt: system_template
                 .replace("{{enabled_actions}}", enabled_actions_prompt.trim()),
-            character_prompt: fs::read_to_string(prompt_dir.join("character.md"))?,
+            character_prompt: character_prompt.clone(),
             instruction_prompt: fs::read_to_string(prompt_dir.join("instruction.md"))?,
+            filter_prompt: filter_template.replace("{{character_prompt}}", character_prompt.trim()),
         };
         Ok(new_config)
     }

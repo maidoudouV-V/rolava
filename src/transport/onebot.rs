@@ -1,20 +1,28 @@
 use crate::config::AppConfig;
 use crate::repository::db_manager::{NewChatMessage, QQChatContextManager};
 use crate::transport::message::{
-    Conversation, ConversationKind, IncomingMessage, MessageContent, MessagePart, Participant,
+    Conversation, ConversationKind, IncomingMessage, MessageContent, MessagePart, MessageTarget,
+    Participant,
 };
+use crate::transport::MessageSender;
+use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::{routing::post, Json, Router};
 use chrono::Utc;
 use parking_lot::Mutex;
+use rand::Rng;
 use reqwest::header::AUTHORIZATION;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Notify;
+use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration};
+
+const RAW_MESSAGE_CHANNEL_CAPACITY: usize = 128;
 
 /// OneBot 原始上报事件 DTO。
 /// 直接对应 OneBot 的 HTTP 上报 JSON，通过 `post_type` 区分事件大类。
@@ -599,13 +607,19 @@ impl OneBotGroupMessageDto {
     }
 }
 
-/// Http请求返回结果
-#[derive(Serialize, Deserialize, Debug)]
-pub struct OneBotHttpResult {
-    /// 结果
-    pub status: String,
-    /// 状态码
-    pub retcode: i32,
+/// OneBot 发送消息响应。
+#[derive(Deserialize, Debug)]
+struct OneBotSendMessageResponse {
+    status: String,
+    retcode: i32,
+    data: Option<OneBotSendMessageData>,
+    message: Option<String>,
+    wording: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OneBotSendMessageData {
+    message_id: Option<Value>,
 }
 
 /// OneBot API 通用响应。
@@ -626,7 +640,172 @@ struct OneBotGroupMemberInfoDto {
     card: Option<String>,
 }
 
-const DEFAULT_EVENT_BUFFER_CAPACITY: usize = 128;
+/// OneBot 出站消息发送器。平台确认发送成功后，负责写入统一聊天记录。
+pub struct OneBotMessageSender {
+    client: Client,
+    onebot_api_url: String,
+    onebot_token: Option<String>,
+    db_manager: Arc<QQChatContextManager>,
+    reply_delay_per_char_secs: f64,
+    reply_delay_random_max_secs: f64,
+}
+
+impl OneBotMessageSender {
+    pub fn new(config: &AppConfig, db_manager: Arc<QQChatContextManager>) -> Self {
+        Self {
+            client: Client::new(),
+            onebot_api_url: config.server.onebot_api.clone(),
+            onebot_token: if config.server.onebot_token.is_empty() {
+                None
+            } else {
+                Some(config.server.onebot_token.clone())
+            },
+            db_manager,
+            reply_delay_per_char_secs: config.app.reply_delay_per_char_secs,
+            reply_delay_random_max_secs: config.app.reply_delay_random_max_secs,
+        }
+    }
+
+    fn reply_delay(&self, text: &str) -> Duration {
+        let base_secs = text.chars().count() as f64 * self.reply_delay_per_char_secs.max(0.0);
+        let random_max_secs = self.reply_delay_random_max_secs.max(0.0);
+        let random_secs = if random_max_secs > 0.0 {
+            rand::thread_rng().gen_range(0.0..=random_max_secs)
+        } else {
+            0.0
+        };
+        Duration::from_secs_f64(base_secs + random_secs)
+    }
+
+    fn request_parts(target: &MessageTarget, text: &str) -> (&'static str, &'static str, Value) {
+        let target_id = target
+            .conversation
+            .id
+            .parse::<i64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(target.conversation.id.clone()));
+
+        match target.conversation.kind {
+            ConversationKind::Direct => (
+                "send_private_msg",
+                "direct",
+                serde_json::json!({
+                    "user_id": target_id,
+                    "message": text,
+                }),
+            ),
+            ConversationKind::Group => (
+                "send_group_msg",
+                "group",
+                serde_json::json!({
+                    "group_id": target_id,
+                    "message": text,
+                }),
+            ),
+        }
+    }
+
+    fn response_error(response: &OneBotSendMessageResponse) -> String {
+        response
+            .wording
+            .as_deref()
+            .or(response.message.as_deref())
+            .unwrap_or("未提供错误详情")
+            .to_string()
+    }
+}
+
+#[async_trait]
+impl MessageSender for OneBotMessageSender {
+    async fn send_text(&self, target: &MessageTarget, text: &str) -> Result<()> {
+        if target.source != "onebot" {
+            bail!("OneBot 发送器不支持消息来源：{}", target.source);
+        }
+        if text.trim().is_empty() {
+            bail!("不能发送空消息");
+        }
+
+        let delay = self.reply_delay(text);
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+
+        let (api_path, conversation_kind, payload) = Self::request_parts(target, text);
+        let mut request = self
+            .client
+            .post(format!("{}/{}", self.onebot_api_url, api_path))
+            .json(&payload);
+        if let Some(token) = &self.onebot_token {
+            request = request.header(AUTHORIZATION, format!("Bearer {}", token));
+        }
+
+        let response = request
+            .send()
+            .await
+            .context("调用 OneBot 发送消息接口失败")?;
+        let http_status = response.status();
+        let response_text = response.text().await.context("读取 OneBot 发送响应失败")?;
+        if !http_status.is_success() {
+            bail!(
+                "OneBot 发送消息接口返回 HTTP {}：{}",
+                http_status,
+                response_text
+            );
+        }
+
+        let response: OneBotSendMessageResponse = serde_json::from_str(&response_text)
+            .with_context(|| format!("解析 OneBot 发送响应失败：{}", response_text))?;
+        if response.status != "ok" || response.retcode != 0 {
+            bail!(
+                "OneBot 发送消息失败，status={}，retcode={}：{}",
+                response.status,
+                response.retcode,
+                Self::response_error(&response)
+            );
+        }
+
+        let source_message_id = response
+            .data
+            .as_ref()
+            .and_then(|data| data.message_id.as_ref())
+            .map(|id| match id {
+                Value::String(id) => id.clone(),
+                other => other.to_string(),
+            });
+        let outgoing_message = NewChatMessage {
+            source: target.source.clone(),
+            source_conversation_id: target.conversation.id.clone(),
+            conversation_kind: conversation_kind.to_string(),
+            conversation_title: target.conversation.title.clone(),
+            conversation_metadata_json: "{}".to_string(),
+            source_message_id,
+            sender_id: target.bot_id.clone(),
+            sender_display_name: target.bot_id.clone(),
+            sender_nickname: None,
+            sender_role: None,
+            content_text: text.to_string(),
+            message_type: "text".to_string(),
+            content_parts_json: serde_json::json!([{
+                "kind": "text",
+                "data": { "text": text }
+            }])
+            .to_string(),
+            metadata_json: serde_json::json!({
+                "onebot": {
+                    "status": response.status,
+                    "retcode": response.retcode
+                }
+            })
+            .to_string(),
+            event_timestamp: Utc::now().timestamp(),
+        };
+        self.db_manager
+            .write_message(&outgoing_message)
+            .context("消息已发送，但写入聊天记录失败")?;
+
+        Ok(())
+    }
+}
 
 /// onebot协议 http服务端
 #[derive(Clone)]
@@ -635,12 +814,8 @@ pub struct OneBotHttpServer {
     listener_ip: String,
     /// 本地 HTTP 服务监听端口。
     listener_port: u16,
-    /// 接收到的 OneBot 事件缓冲区。
-    event_buffer: Arc<Mutex<VecDeque<OneBotEventDto>>>,
-    /// 事件缓冲区最大容量。
-    event_buffer_capacity: usize,
-    /// 有新消息事件到达时用于唤醒等待方。
-    message_notify: Arc<Notify>,
+    /// 标准化后的平台消息输出通道。
+    message_tx: mpsc::Sender<IncomingMessage>,
     /// OneBot HTTP API 地址。
     onebot_api_url: String,
     /// 群成员展示名缓存，key 使用 group_id:user_id 或 user_id。
@@ -652,15 +827,19 @@ pub struct OneBotHttpServer {
     /// 调用 OneBot HTTP API 使用的对端 token。
     onebot_token: Option<String>,
 }
+
+#[derive(Clone)]
+struct OneBotHttpState {
+    message_tx: mpsc::Sender<OneBotMessageEnvelopeDto>,
+}
+
 impl OneBotHttpServer {
     /// 根据应用配置创建一个 OneBot HTTP 服务实例。
-    pub fn new(config: &AppConfig) -> Self {
+    pub fn new(config: &AppConfig, message_tx: mpsc::Sender<IncomingMessage>) -> Self {
         Self {
             listener_ip: config.server.server_host.clone(),
             listener_port: config.server.server_port,
-            event_buffer: Arc::new(Mutex::new(VecDeque::new())),
-            event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
-            message_notify: Arc::new(Notify::new()),
+            message_tx,
             onebot_api_url: config.server.onebot_api.clone(),
             member_name_cache: Arc::new(Mutex::new(HashMap::new())),
             client: Client::new(),
@@ -674,20 +853,6 @@ impl OneBotHttpServer {
             } else {
                 Some(config.server.onebot_token.clone())
             },
-        }
-    }
-
-    /// 将新事件写入缓冲区，并在有新消息时通知等待方。
-    fn push_event(&self, event: OneBotEventDto) {
-        let is_message = matches!(&event, OneBotEventDto::Message(_));
-        let mut event_buffer = self.event_buffer.lock();
-        if event_buffer.len() >= self.event_buffer_capacity {
-            event_buffer.pop_front();
-        }
-        event_buffer.push_back(event);
-        drop(event_buffer);
-        if is_message {
-            self.message_notify.notify_one();
         }
     }
 
@@ -712,28 +877,6 @@ impl OneBotHttpServer {
         scheme.eq_ignore_ascii_case("Bearer")
             && token == expected_token
             && auth_parts.next().is_none()
-    }
-
-    /// 非阻塞地取出缓冲区里最新的一条消息事件。
-    fn try_take_latest_message_event(&self) -> Option<OneBotMessageEnvelopeDto> {
-        let mut event_buffer = self.event_buffer.lock();
-        let latest_message_index = event_buffer
-            .iter()
-            .rposition(|event| matches!(event, OneBotEventDto::Message(_)))?;
-        match event_buffer.remove(latest_message_index) {
-            Some(OneBotEventDto::Message(message)) => Some(message),
-            _ => None,
-        }
-    }
-
-    /// 异步等待下一条可用消息，并从缓冲区中取出它。
-    pub async fn recv_latest_message(&self) -> IncomingMessage {
-        loop {
-            if let Some(message) = self.try_take_latest_message_event() {
-                return message.into_incoming_message(self).await;
-            }
-            self.message_notify.notified().await;
-        }
     }
 
     /// 缓存普通用户展示名，作为群内缓存缺失时的兜底。
@@ -881,11 +1024,6 @@ impl OneBotHttpServer {
         format!("user:{}", user_id)
     }
 
-    /// 返回当前缓冲区里累计的事件数量。
-    pub fn buffered_event_count(&self) -> usize {
-        self.event_buffer.lock().len()
-    }
-
     /// 启动接收 OneBot 上报的 HTTP 服务。
     pub async fn run(&self) {
         let listener_ip = self.listener_ip.clone();
@@ -894,97 +1032,47 @@ impl OneBotHttpServer {
             .await
             .unwrap();
         let log_out = format!("HTTP 服务已启动: http://{}:{}/", listener_ip, listener_port);
-        let shared_state = Arc::new(self.clone());
+        let (raw_message_tx, mut raw_message_rx) =
+            mpsc::channel::<OneBotMessageEnvelopeDto>(RAW_MESSAGE_CHANNEL_CAPACITY);
+        let server = Arc::new(self.clone());
+        let shared_state = Arc::new(OneBotHttpState {
+            message_tx: raw_message_tx,
+        });
         let app = Router::new()
             .route("/", post(on_event))
             .with_state(shared_state);
         println!("{}", log_out);
-        axum::serve(listener, app).await.unwrap();
-    }
 
-    /// 调用 OneBot HTTP API 向当前会话发送一条消息。
-    pub async fn send_message(
-        &self,
-        incoming_message: IncomingMessage,
-        response_msg: &String,
-        db_manager: Arc<QQChatContextManager>,
-    ) -> reqwest::Result<()> {
-        let conversation_id = incoming_message.conversation.id.clone();
-        let conversation_title = incoming_message.conversation.title.clone();
-        let target_id = conversation_id
-            .parse::<i64>()
-            .map(Value::from)
-            .unwrap_or_else(|_| Value::String(conversation_id.clone()));
-        let (api_path, conversation_kind, payload) = match &incoming_message.conversation.kind {
-            ConversationKind::Direct => (
-                "send_private_msg",
-                "direct",
-                serde_json::json!({
-                    "user_id": target_id,
-                    "message": response_msg,
-                }),
-            ),
-            ConversationKind::Group => (
-                "send_group_msg",
-                "group",
-                serde_json::json!({
-                    "group_id": target_id,
-                    "message": response_msg,
-                }),
-            ),
-            ConversationKind::Channel => {
-                eprintln!("暂不支持向频道会话发送消息: {}", conversation_id);
-                return Ok(());
+        let forward_messages = async move {
+            while let Some(message) = raw_message_rx.recv().await {
+                let incoming_message = message.into_incoming_message(&server).await;
+                if let Err(err) = server.message_tx.send(incoming_message).await {
+                    eprintln!("OneBot 消息发送到平台通道失败: {}", err);
+                    break;
+                }
             }
         };
-        let mut request = self
-            .client
-            .post(format!("{}/{}", self.onebot_api_url, api_path))
-            .json(&payload);
 
-        if let Some(token) = &self.onebot_token {
-            request = request.header(AUTHORIZATION, format!("Bearer {}", token));
+        tokio::select! {
+            result = axum::serve(listener, app) => result.unwrap(),
+            _ = forward_messages => eprintln!("OneBot 消息转发任务已停止"),
         }
-
-        let resp = request.send().await?;
-        let _resp = resp.json::<OneBotHttpResult>().await?;
-
-        let outgoing_message = NewChatMessage {
-            source: "onebot".to_string(),
-            source_conversation_id: conversation_id,
-            conversation_kind: conversation_kind.to_string(),
-            conversation_title,
-            conversation_metadata_json: "{}".to_string(),
-            source_message_id: None,
-            sender_id: incoming_message.bot_id.to_string(),
-            sender_display_name: incoming_message.bot_id.to_string(),
-            sender_nickname: None,
-            sender_role: None,
-            content_text: response_msg.clone(),
-            message_type: "text".to_string(),
-            content_parts_json: serde_json::json!([
-                {
-                    "kind": "text",
-                    "data": {
-                        "text": response_msg
-                    }
-                }
-            ])
-            .to_string(),
-            metadata_json: "{}".to_string(),
-            event_timestamp: Utc::now().timestamp(),
-        };
-        db_manager.write_message(&outgoing_message).unwrap();
-
-        Ok(())
     }
 }
 
 async fn on_event(
-    State(state): State<Arc<OneBotHttpServer>>,
+    State(state): State<Arc<OneBotHttpState>>,
     _headers: HeaderMap,
     Json(event): Json<OneBotEventDto>,
 ) -> StatusCode {
-    state.push_event(event);
-    StatusCode::OK
+    let OneBotEventDto::Message(message) = event else {
+        return StatusCode::OK;
+    };
+    match state.message_tx.send(message).await {
+        Ok(()) => StatusCode::OK,
+        Err(err) => {
+            eprintln!("OneBot 原始消息进入转换队列失败: {}", err);
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
 }

@@ -1,8 +1,9 @@
+use crate::ai_provider::{AIProvider, ToolChatMessage, ToolChatResponse};
+use crate::tools::ToolDefinition;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use crate::ai_provider::{AIProvider, ChatResponse, ContextMessage};
 
 // ========== Anthropic 接口骨架 ==========
 pub struct AnthropicProvider {
@@ -14,13 +15,18 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        max_tokens: i32,
+    ) -> Self {
         Self {
             http_client: Client::new(),
             api_key: api_key.into(),
             base_url: base_url.into(),
             model: model.into(),
-            max_tokens: 10240,
+            max_tokens,
         }
     }
 }
@@ -54,7 +60,11 @@ struct AnthropicContentBlock {
 
 #[async_trait]
 impl AIProvider for AnthropicProvider {
-    async fn chat_completions(&self, _request_messages: &Vec<ContextMessage>) -> anyhow::Result<ChatResponse> {
+    async fn chat_completions(
+        &self,
+        _messages: &[ToolChatMessage],
+        _tools: &[ToolDefinition],
+    ) -> anyhow::Result<ToolChatResponse> {
         Err(anyhow!("Anthropic provider is not implemented yet"))
     }
 }

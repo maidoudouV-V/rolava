@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod google_aistudio;
 pub mod openai_compatible;
 pub mod openrouter;
+use crate::tools::{ToolCall, ToolDefinition, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
@@ -12,16 +13,6 @@ pub enum MessageRole {
     System,
     User,
     Assistant,
-}
-
-impl MessageRole {
-    fn as_openai_compatible_str(&self) -> &'static str {
-        match self {
-            MessageRole::System => "system",
-            MessageRole::User => "user",
-            MessageRole::Assistant => "assistant",
-        }
-    }
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -58,11 +49,92 @@ pub struct ChatResponse {
     pub raw_response: Value,
 }
 
+/// 支持 function tools 的通用对话消息。
+#[derive(Debug, Clone)]
+pub enum ToolChatMessage {
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        content: Option<String>,
+        /// DeepSeek 等兼容接口要求在工具调用后完整回传推理内容。
+        reasoning_content: Option<String>,
+        /// OpenRouter reasoning 模型要求在工具调用后原样回传的结构化推理块。
+        reasoning_details: Option<Value>,
+        tool_calls: Vec<ToolCall>,
+    },
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
+}
+
+impl From<&ContextMessage> for ToolChatMessage {
+    fn from(message: &ContextMessage) -> Self {
+        match &message.role {
+            MessageRole::System => Self::System {
+                content: message.content.clone(),
+            },
+            MessageRole::User => Self::User {
+                content: message.content.clone(),
+            },
+            MessageRole::Assistant => Self::Assistant {
+                content: Some(message.content.clone()),
+                reasoning_content: None,
+                reasoning_details: None,
+                tool_calls: Vec::new(),
+            },
+        }
+    }
+}
+
+impl From<&ToolResult> for ToolChatMessage {
+    fn from(result: &ToolResult) -> Self {
+        Self::Tool {
+            tool_call_id: result.tool_call_id.clone(),
+            content: result.content.clone(),
+        }
+    }
+}
+
+/// 一次支持 tools 的模型响应。
+#[derive(Debug, Clone)]
+pub struct ToolChatResponse {
+    pub content: Option<String>,
+    pub reasoning_content: Option<String>,
+    pub reasoning_details: Option<Value>,
+    pub tool_calls: Vec<ToolCall>,
+    pub finish_reason: Option<String>,
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub usage: Option<ChatUsage>,
+    pub raw_response: Value,
+}
+
+impl ToolChatResponse {
+    /// 构造下一次请求需要原样回传的 assistant 消息。
+    pub fn assistant_message(&self) -> ToolChatMessage {
+        ToolChatMessage::Assistant {
+            content: self.content.clone(),
+            reasoning_content: self.reasoning_content.clone(),
+            reasoning_details: self.reasoning_details.clone(),
+            tool_calls: self.tool_calls.clone(),
+        }
+    }
+}
+
 // ========== 通用 Provider Trait ==========
 #[async_trait]
 pub trait AIProvider {
-    async fn chat_completions(&self, request_message: &Vec<ContextMessage>)
-        -> Result<ChatResponse>;
+    /// 统一的聊天请求。tools 为空时是普通文本请求，非空时允许模型返回工具调用。
+    async fn chat_completions(
+        &self,
+        messages: &[ToolChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<ToolChatResponse>;
 
     async fn describe_image(&self, _image_data_url: &str, _prompt: &str) -> Result<String> {
         anyhow::bail!("当前服务商不支持图片描述")
@@ -71,4 +143,36 @@ pub trait AIProvider {
     async fn web_search(&self, _query: &str) -> Result<String> {
         anyhow::bail!("当前服务商不支持联网搜索")
     }
+}
+
+/// 将不含工具历史的统一消息转换给尚未实现 tools 的 Provider 使用。
+pub(crate) fn context_messages_without_tools(
+    messages: &[ToolChatMessage],
+) -> Result<Vec<ContextMessage>> {
+    messages
+        .iter()
+        .map(|message| match message {
+            ToolChatMessage::System { content } => Ok(ContextMessage {
+                role: MessageRole::System,
+                content: content.clone(),
+            }),
+            ToolChatMessage::User { content } => Ok(ContextMessage {
+                role: MessageRole::User,
+                content: content.clone(),
+            }),
+            ToolChatMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } if tool_calls.is_empty() => Ok(ContextMessage {
+                role: MessageRole::Assistant,
+                content: content
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("普通 assistant 消息缺少 content"))?,
+            }),
+            ToolChatMessage::Assistant { .. } | ToolChatMessage::Tool { .. } => {
+                anyhow::bail!("当前服务商尚未支持工具调用历史")
+            }
+        })
+        .collect()
 }
