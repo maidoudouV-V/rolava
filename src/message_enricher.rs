@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::time::{timeout, Duration};
+use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 use crate::repository::db_manager::{NewReceivedImage, QQChatContextManager, ReceivedImageRecord};
@@ -36,18 +37,10 @@ const IMAGE_DESCRIPTION_PROMPT: &str = r#"你是QQ群聊天机器人中的图片
 现在直接描述图片内容"#;
 
 const IMAGE_READ_FAILED_TEXT: &str = "[图片消息 读取失败]";
-/// 视觉模型请求图片的目标最大边长。
-const VISION_IMAGE_TARGET_MAX_SIDE: u32 = 1280;
-/// 视觉模型请求图片超过大小限制后进一步压缩到的最大边长。
-const VISION_IMAGE_FALLBACK_MAX_SIDE: u32 = 1024;
-/// 视觉模型请求图片的目标最大体积。
-const VISION_IMAGE_MAX_BYTES: usize = 800 * 1024;
-/// 首次压缩使用的 JPEG 质量。
-const VISION_IMAGE_INITIAL_JPEG_QUALITY: u8 = 82;
-/// 超过大小限制后使用的 JPEG 质量。
-const VISION_IMAGE_FALLBACK_JPEG_QUALITY: u8 = 74;
-/// 再次超过大小限制后使用的最低 JPEG 质量。
-const VISION_IMAGE_LOW_JPEG_QUALITY: u8 = 66;
+/// 模型请求图片只按像素缩小，最长边不超过 1920px。
+const VISION_IMAGE_MAX_SIDE: u32 = 1920;
+/// 图片发生缩放时使用固定 JPEG 质量，不再按体积逐级降质。
+const VISION_IMAGE_JPEG_QUALITY: u8 = 82;
 
 /// 消息增强器：先处理图片等富内容，再让消息进入聊天流程。
 pub struct MessageEnricher {
@@ -75,7 +68,7 @@ struct VisionImagePayload {
 }
 
 impl MessageEnricher {
-    /// 创建消息增强器，图片会按配置保存到本地并交给视觉模型转写。
+    /// 创建消息增强器，图片会按配置保存到本地，必要时交给视觉模型转写。
     pub fn new(app_config: Arc<AppConfig>, db_manager: Arc<QQChatContextManager>) -> Self {
         Self {
             app_config,
@@ -84,8 +77,9 @@ impl MessageEnricher {
         }
     }
 
-    /// 增强单条消息；图片会被替换成带图片 ID 和描述的文本。
+    /// 增强单条消息；图片会按主模型能力生成 Markdown 描述并保留图片 ID。
     pub async fn enrich(&self, mut message: IncomingMessage) -> IncomingMessage {
+        let include_description = !self.app_config.chat_model_supports_vision();
         let image_indexes: Vec<usize> = message
             .content
             .parts
@@ -107,11 +101,11 @@ impl MessageEnricher {
                     if let Some(part) = message.content.parts.get_mut(image_index) {
                         Self::attach_image_info(&mut part.data, &image);
                     }
-                    image.context_text()
+                    image.context_text(include_description)
                 }
                 Ok(None) => IMAGE_READ_FAILED_TEXT.to_string(),
                 Err(err) => {
-                    eprintln!("图片增强失败: {}", err);
+                    warn!(error = %err, "图片增强失败");
                     IMAGE_READ_FAILED_TEXT.to_string()
                 }
             };
@@ -126,34 +120,40 @@ impl MessageEnricher {
     /// 处理单个图片片段，优先用图片哈希复用数据库中已有描述。
     async fn enrich_image_part(&self, image_data: &Value) -> Result<Option<EnrichedImage>> {
         let Some(image_url) = Self::image_download_url(image_data) else {
-            eprintln!("图片消息缺少可下载 URL: {}", image_data);
+            warn!("图片消息缺少可下载 URL");
+            debug!(image_data = %image_data, "无法下载的图片消息数据");
             return Ok(None);
         };
-        println!("检测到图片消息，开始下载图片: {}", image_url);
+        info!("检测到图片消息，开始下载");
+        debug!(image_url = %image_url, "图片下载地址");
 
         let downloaded_image = self.download_image(&image_url).await?;
-        println!(
-            "图片下载完成，大小={}KB，类型={}",
-            downloaded_image.bytes.len() / 1024,
-            downloaded_image.mime_type.as_deref().unwrap_or("未知")
+        debug!(
+            size_kb = downloaded_image.bytes.len() / 1024,
+            mime_type = downloaded_image.mime_type.as_deref().unwrap_or("未知"),
+            "图片下载完成"
         );
         let content_hash = Self::sha256_hex(&downloaded_image.bytes);
         if let Some(record) = self.db_manager.get_received_image_by_hash(&content_hash)? {
-            println!(
-                "图片已存在，复用识别结果: image_id={}，内容={}",
-                record.image_id, record.description
-            );
+            info!(image_id = %record.image_id, "图片已存在，复用识别结果");
+            debug!(image_id = %record.image_id, description = %record.description, "复用的图片描述");
             return Ok(Some(EnrichedImage::from(record)));
         }
 
-        let description = self
-            .describe_image(
+        let description = if self.app_config.chat_model_supports_vision() {
+            String::new()
+        } else {
+            self.describe_image(
                 &downloaded_image.bytes,
                 downloaded_image.mime_type.as_deref(),
             )
-            .await?;
+            .await?
+        };
         let image_id = self.generate_image_id()?;
-        println!("图片识别成功: image_id={}，内容={}", image_id, description);
+        info!(image_id = %image_id, "图片处理成功");
+        if !description.is_empty() {
+            debug!(image_id = %image_id, description = %description, "图片识别内容");
+        }
         let local_path = self
             .save_image_file(
                 &image_id,
@@ -177,11 +177,12 @@ impl MessageEnricher {
         };
         if let Err(err) = self.db_manager.insert_received_image(&image) {
             if let Err(remove_err) = fs::remove_file(&local_path).await {
-                eprintln!("清理未入库图片文件失败 path={}: {}", local_path, remove_err);
+                warn!(path = %local_path, error = %remove_err, "清理未入库图片文件失败");
             }
             return Err(err);
         }
-        println!("图片已入库: image_id={}，path={}", image_id, local_path);
+        info!(image_id = %image_id, "图片已入库");
+        debug!(image_id = %image_id, path = %local_path, "图片本地文件");
 
         Ok(Some(EnrichedImage {
             image_id,
@@ -243,11 +244,11 @@ impl MessageEnricher {
     /// 调用配置中的视觉模型，把图片转成一行短描述。
     async fn describe_image(&self, bytes: &[u8], mime_type: Option<&str>) -> Result<String> {
         let vision_image = Self::prepare_image_for_vision(bytes, mime_type)?;
-        println!(
-            "准备调用视觉模型: model={}，请求图片大小={}KB，类型={}",
-            self.app_config.app.visual_model_name,
-            vision_image.bytes.len() / 1024,
-            vision_image.mime_type
+        info!(
+            model = %self.app_config.app.visual_model_name,
+            image_size_kb = vision_image.bytes.len() / 1024,
+            mime_type = %vision_image.mime_type,
+            "准备调用视觉模型"
         );
         let image_data_url = Self::vision_image_data_url(&vision_image);
         let visual_provider = self
@@ -273,10 +274,7 @@ impl MessageEnricher {
             {
                 Ok(description) => return Ok(Self::sanitize_description(&description)),
                 Err(err) => {
-                    eprintln!(
-                        "图片识别 API 请求失败，第 {}/{} 次: {}",
-                        attempt, max_attempts, err
-                    );
+                    warn!(attempt, max_attempts, error = %err, "图片识别 API 请求失败");
                     last_error = Some(err);
                 }
             }
@@ -308,91 +306,42 @@ impl MessageEnricher {
         }
     }
 
-    /// 为视觉模型准备图片：小图不动，大图等比例压缩并降低 JPEG 质量。
+    /// 为模型准备图片：小图保持原样，大图只按最长边等比例缩小。
     fn prepare_image_for_vision(
         bytes: &[u8],
         mime_type: Option<&str>,
     ) -> Result<VisionImagePayload> {
         let original_mime_type = mime_type.unwrap_or("image/jpeg").to_string();
-        let decoded_image = match image::load_from_memory(bytes) {
-            Ok(image) => image,
-            Err(err) if bytes.len() <= VISION_IMAGE_MAX_BYTES => {
-                eprintln!(
-                    "解析待压缩图片失败，图片体积未超过限制，使用原图发送视觉模型: {}",
-                    err
-                );
-                return Ok(VisionImagePayload {
-                    bytes: bytes.to_vec(),
-                    mime_type: original_mime_type,
-                });
-            }
-            Err(err) => {
-                anyhow::bail!("解析待压缩图片失败：{}", err);
-            }
-        };
+        let decoded_image = image::load_from_memory(bytes)
+            .map_err(|err| anyhow::anyhow!("解析待缩放图片失败：{}", err))?;
 
         let max_side = decoded_image.width().max(decoded_image.height());
-        if max_side <= VISION_IMAGE_TARGET_MAX_SIDE && bytes.len() <= VISION_IMAGE_MAX_BYTES {
-            println!(
-                "图片无需压缩: 尺寸={}x{}，大小={}KB",
-                decoded_image.width(),
-                decoded_image.height(),
-                bytes.len() / 1024
+        if max_side <= VISION_IMAGE_MAX_SIDE {
+            debug!(
+                width = decoded_image.width(),
+                height = decoded_image.height(),
+                "图片无需缩放"
             );
             return Ok(VisionImagePayload {
                 bytes: bytes.to_vec(),
                 mime_type: original_mime_type,
             });
         }
-        println!(
-            "图片需要压缩: 原尺寸={}x{}，原大小={}KB",
-            decoded_image.width(),
-            decoded_image.height(),
-            bytes.len() / 1024
+        debug!(
+            width = decoded_image.width(),
+            height = decoded_image.height(),
+            "图片需要缩放"
         );
 
-        let first_target_side = max_side.min(VISION_IMAGE_TARGET_MAX_SIDE);
         let compressed = Self::resize_and_encode_jpeg(
             &decoded_image,
-            first_target_side,
-            VISION_IMAGE_INITIAL_JPEG_QUALITY,
+            VISION_IMAGE_MAX_SIDE,
+            VISION_IMAGE_JPEG_QUALITY,
         )?;
-        if compressed.len() <= VISION_IMAGE_MAX_BYTES {
-            println!(
-                "图片压缩完成: 最大边={}，质量={}，大小={}KB",
-                first_target_side,
-                VISION_IMAGE_INITIAL_JPEG_QUALITY,
-                compressed.len() / 1024
-            );
-            return Ok(Self::jpeg_vision_payload(compressed));
-        }
-
-        let fallback_target_side = first_target_side.min(VISION_IMAGE_FALLBACK_MAX_SIDE);
-        let compressed = Self::resize_and_encode_jpeg(
-            &decoded_image,
-            fallback_target_side,
-            VISION_IMAGE_FALLBACK_JPEG_QUALITY,
-        )?;
-        if compressed.len() <= VISION_IMAGE_MAX_BYTES {
-            println!(
-                "图片二次压缩完成: 最大边={}，质量={}，大小={}KB",
-                fallback_target_side,
-                VISION_IMAGE_FALLBACK_JPEG_QUALITY,
-                compressed.len() / 1024
-            );
-            return Ok(Self::jpeg_vision_payload(compressed));
-        }
-
-        let compressed = Self::resize_and_encode_jpeg(
-            &decoded_image,
-            fallback_target_side,
-            VISION_IMAGE_LOW_JPEG_QUALITY,
-        )?;
-        println!(
-            "图片低质量压缩完成: 最大边={}，质量={}，大小={}KB",
-            fallback_target_side,
-            VISION_IMAGE_LOW_JPEG_QUALITY,
-            compressed.len() / 1024
+        debug!(
+            max_side = VISION_IMAGE_MAX_SIDE,
+            quality = VISION_IMAGE_JPEG_QUALITY,
+            "图片缩放完成"
         );
         Ok(Self::jpeg_vision_payload(compressed))
     }
@@ -502,7 +451,7 @@ impl MessageEnricher {
         }
     }
 
-    /// 替换下一处图片占位符；异常情况下把图片描述追加到消息末尾。
+    /// 替换下一处图片占位符；异常情况下把图片引用追加到消息末尾。
     fn replace_next_image_placeholder(text: &str, replacement: &str) -> String {
         if let Some(index) = text.find("[图片]") {
             let placeholder_len = "[图片]".len();
@@ -554,14 +503,18 @@ impl MessageEnricher {
 }
 
 impl EnrichedImage {
-    /// 渲染给主聊天 AI 看的 Markdown 附件引用。
-    fn context_text(&self) -> String {
-        let description = self
-            .description
+    /// 非视觉模型读取预识别描述；视觉模型只需固定说明，图片会作为原图块提交。
+    fn context_text(&self, include_description: bool) -> String {
+        let alt_text = if include_description && !self.description.trim().is_empty() {
+            self.description.as_str()
+        } else {
+            "图片"
+        };
+        let alt_text = alt_text
             .replace('\\', "\\\\")
             .replace('[', "\\[")
             .replace(']', "\\]");
-        format!("![{}](attachment://{})", description, self.image_id)
+        format!("![{}](attachment://{})", alt_text, self.image_id)
     }
 }
 
@@ -578,7 +531,8 @@ impl From<ReceivedImageRecord> for EnrichedImage {
 
 #[cfg(test)]
 mod tests {
-    use super::EnrichedImage;
+    use super::{EnrichedImage, MessageEnricher, VISION_IMAGE_MAX_SIDE};
+    use image::{DynamicImage, GenericImageView, RgbImage};
 
     #[test]
     fn image_context_uses_markdown_attachment_reference() {
@@ -590,13 +544,17 @@ mod tests {
         };
 
         assert_eq!(
-            image.context_text(),
+            image.context_text(true),
             "![一只白猫趴在窗台上](attachment://img_7Kf3aQ9B)"
+        );
+        assert_eq!(
+            image.context_text(false),
+            "![图片](attachment://img_7Kf3aQ9B)"
         );
     }
 
     #[test]
-    fn image_context_escapes_markdown_alt_text() {
+    fn image_context_escapes_description_for_non_vision_model() {
         let image = EnrichedImage {
             image_id: "img_A1b2C3d4".to_string(),
             content_hash: String::new(),
@@ -605,8 +563,25 @@ mod tests {
         };
 
         assert_eq!(
-            image.context_text(),
+            image.context_text(true),
             r"![截图包含 \[确定\] 和 C:\\temp](attachment://img_A1b2C3d4)"
         );
+    }
+
+    #[test]
+    fn image_request_resizes_only_when_longest_side_exceeds_1920() {
+        let image = DynamicImage::ImageRgb8(RgbImage::new(2400, 1200));
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        let payload = MessageEnricher::prepare_image_for_vision(&bytes, Some("image/png")).unwrap();
+        let resized = image::load_from_memory(&payload.bytes).unwrap();
+
+        assert_eq!(resized.dimensions(), (VISION_IMAGE_MAX_SIDE, 960));
     }
 }

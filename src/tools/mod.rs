@@ -1,29 +1,33 @@
-mod cancel_scheduled_task;
+mod agent_web_search;
 mod continue_conversation;
+mod create_scheduled_task;
+mod delete_scheduled_task;
 mod end_conversation;
+mod get_scheduled_task;
 mod recognize_image;
 mod registry;
 mod remember;
-mod schedule_task;
 mod send_message;
+mod update_scheduled_task;
 mod wait_for_reply;
-mod web_search;
 
-pub use cancel_scheduled_task::{CancelScheduledTaskArgs, CancelScheduledTaskTool};
+pub use agent_web_search::{AgentWebSearchArgs, AgentWebSearchTool};
 pub use continue_conversation::ContinueConversationTool;
+pub use create_scheduled_task::{CreateScheduledTaskArgs, CreateScheduledTaskTool};
+pub use delete_scheduled_task::{DeleteScheduledTaskArgs, DeleteScheduledTaskTool};
 pub use end_conversation::EndConversationTool;
+pub use get_scheduled_task::{GetScheduledTaskArgs, GetScheduledTaskTool};
 pub use recognize_image::{RecognizeImageArgs, RecognizeImageTool};
 pub use registry::ToolRegistry;
 pub use remember::{RememberArgs, RememberTool};
-pub use schedule_task::{ScheduleTaskArgs, ScheduleTaskTool};
 pub use send_message::{SendMessageArgs, SendMessageTool};
+pub use update_scheduled_task::{UpdateScheduledTaskArgs, UpdateScheduledTaskTool};
 pub use wait_for_reply::{WaitForReplyArgs, WaitForReplyTool};
-pub use web_search::{WebSearchArgs, WebSearchTool};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -31,6 +35,7 @@ use crate::config::AppConfig;
 use crate::conversation_control::ConversationControl;
 use crate::conversation_trigger::ConversationTriggerSender;
 use crate::repository::db_manager::QQChatContextManager;
+use crate::scheduler::SchedulerService;
 use crate::transport::message::{IncomingMessage, MessageTarget};
 use crate::transport::MessageSender;
 
@@ -43,7 +48,7 @@ pub struct ToolDefinition {
 }
 
 /// 模型返回的一次工具调用。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -67,6 +72,7 @@ pub struct ToolServices {
     pub app_config: Arc<AppConfig>,
     pub db_manager: Arc<QQChatContextManager>,
     pub message_sender: Arc<dyn MessageSender>,
+    pub scheduler: Arc<SchedulerService>,
 }
 
 impl ToolServices {
@@ -74,11 +80,13 @@ impl ToolServices {
         app_config: Arc<AppConfig>,
         db_manager: Arc<QQChatContextManager>,
         message_sender: Arc<dyn MessageSender>,
+        scheduler: Arc<SchedulerService>,
     ) -> Self {
         Self {
             app_config,
             db_manager,
             message_sender,
+            scheduler,
         }
     }
 }
@@ -142,6 +150,9 @@ pub trait Tool: Send + Sync {
             parameters: self.parameters(),
         }
     }
+
+    /// 清除仅属于当前会话生命周期的内存状态；无状态工具无需实现。
+    fn reset_conversation_state(&self) {}
 
     async fn execute(&self, context: &ToolContext, arguments: &str) -> Result<ToolOutput>;
 }

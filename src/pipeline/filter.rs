@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
 use crate::ai_provider::{ContextMessage, MessageRole, ToolChatMessage, ToolChatResponse};
 use crate::config::AppConfig;
@@ -15,6 +16,14 @@ const FILTER_CONTEXT_DROP_MESSAGES: usize = 50;
 enum FilterAction {
     Reply,
     Ignore,
+}
+
+/// 已经完成增强、入库和基础过滤的平台消息。
+pub struct FilteredMessage {
+    /// 增强后的标准平台消息。
+    pub message: IncomingMessage,
+    /// 对应 messages 表的数据库主键。
+    pub database_id: i64,
 }
 
 /// 单个会话 Actor 独立持有的消息过滤器。
@@ -43,11 +52,17 @@ impl ConversationFilter {
         }
     }
 
+    /// 清除过滤模型的当前会话缓存；下一条普通消息会从数据库重新初始化。
+    pub fn reset_conversation_state(&mut self) {
+        self.filter_context.clear();
+        self.filter_context_initialized = false;
+    }
+
     /// 批量完成基础过滤、消息增强和入库，只返回可以进入后续处理的消息。
     pub async fn process_messages(
         &mut self,
         incoming_messages: Vec<IncomingMessage>,
-    ) -> Vec<IncomingMessage> {
+    ) -> Vec<FilteredMessage> {
         let mut accepted_messages = Vec::with_capacity(incoming_messages.len());
 
         for incoming_message in incoming_messages {
@@ -56,11 +71,16 @@ impl ConversationFilter {
             }
 
             let incoming_message = self.message_enricher.enrich(incoming_message).await;
-            if let Err(err) = self.db_manager.write_incoming_message(&incoming_message) {
-                eprintln!("写入聊天消息失败，不进入后续处理: {}", err);
-                continue;
+            match self.db_manager.write_incoming_message(&incoming_message) {
+                Ok(stored_message) => accepted_messages.push(FilteredMessage {
+                    message: incoming_message,
+                    database_id: stored_message.id,
+                }),
+                Err(err) => {
+                    error!(error = %err, "写入聊天消息失败，不进入后续处理");
+                    continue;
+                }
             }
-            accepted_messages.push(incoming_message);
         }
 
         if accepted_messages.is_empty() {
@@ -72,44 +92,47 @@ impl ConversationFilter {
         }
 
         if let Err(err) = self.update_filter_context(&accepted_messages) {
-            eprintln!("构造消息过滤上下文失败: {}", err);
+            warn!(error = %err, "构造消息过滤上下文失败，继续主处理");
             return accepted_messages;
         }
 
         if self.conversation_control.ai_filter_bypassed()
-            || accepted_messages.iter().any(Self::mentions_bot)
+            || accepted_messages
+                .iter()
+                .any(|message| Self::mentions_bot(&message.message))
         {
             return accepted_messages;
         }
 
-        println!(
-            "AI 前置过滤当前消息：\n{}",
-            Self::render_current_messages_log(&accepted_messages)
+        debug!(
+            messages = %Self::render_current_messages_log(&accepted_messages),
+            "AI 前置过滤当前消息"
         );
         match self.request_filter_model().await {
             Ok(response) => {
-                println!(
-                    "AI 前置过滤结果：{}",
-                    response.content.as_deref().unwrap_or("<无文本结果>")
-                );
+                debug!(response = ?response.content, "AI 前置过滤原始结果");
                 match response
                     .content
                     .as_deref()
                     .and_then(Self::parse_filter_action)
                 {
                     Some(FilterAction::Reply) => {
+                        info!(filter_action = "reply", "AI 前置过滤完成");
                         self.conversation_control.set_ai_filter_bypassed(true);
                         accepted_messages
                     }
-                    Some(FilterAction::Ignore) => Vec::new(),
+                    Some(FilterAction::Ignore) => {
+                        info!(filter_action = "ignore", "AI 前置过滤完成");
+                        Vec::new()
+                    }
                     None => {
-                        eprintln!("无法识别消息过滤结果，继续后续处理: {:?}", response.content);
+                        warn!("无法识别消息过滤结果，继续后续处理");
                         accepted_messages
                     }
                 }
             }
             Err(err) => {
-                eprintln!("消息过滤模型请求失败，继续后续处理: {}", err);
+                warn!(error = %err, "消息过滤模型请求失败，继续后续处理");
                 accepted_messages
             }
         }
@@ -118,12 +141,14 @@ impl ConversationFilter {
     /// 首次加载最近 50 条历史，后续只追加新消息；达到 100 条时淘汰最老 50 条。
     fn update_filter_context(
         &mut self,
-        incoming_messages: &[IncomingMessage],
+        incoming_messages: &[FilteredMessage],
     ) -> anyhow::Result<()> {
         if !self.filter_context_initialized {
             let conversation = incoming_messages
                 .last()
-                .expect("非空消息批次必须包含最后一条消息");
+                .expect("非空消息批次必须包含最后一条消息")
+                .message
+                .clone();
             let history = self.db_manager.get_latest_conversation_history(
                 &conversation.source,
                 &conversation.conversation.id,
@@ -135,8 +160,11 @@ impl ConversationFilter {
                 .collect();
             self.filter_context_initialized = true;
         } else {
-            self.filter_context
-                .extend(incoming_messages.iter().map(Self::incoming_context_message));
+            self.filter_context.extend(
+                incoming_messages
+                    .iter()
+                    .map(|message| Self::incoming_context_message(&message.message)),
+            );
         }
 
         Self::trim_filter_context(&mut self.filter_context);
@@ -184,19 +212,24 @@ impl ConversationFilter {
         }
     }
 
-    fn render_current_messages_log(messages: &[IncomingMessage]) -> String {
+    fn render_current_messages_log(messages: &[FilteredMessage]) -> String {
         messages
             .iter()
-            .map(|message| format!("{}: {}", message.sender.display_name, message.content.text))
+            .map(|message| {
+                format!(
+                    "{}: {}",
+                    message.message.sender.display_name, message.message.content.text
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    fn ai_filter_enabled_for(&self, messages: &[IncomingMessage]) -> bool {
+    fn ai_filter_enabled_for(&self, messages: &[FilteredMessage]) -> bool {
         self.app_config.app.enable_ai_filter
-            && messages
-                .first()
-                .is_some_and(|message| matches!(message.conversation.kind, ConversationKind::Group))
+            && messages.first().is_some_and(|message| {
+                matches!(message.message.conversation.kind, ConversationKind::Group)
+            })
     }
 
     fn mentions_bot(message: &IncomingMessage) -> bool {
@@ -248,11 +281,11 @@ impl ConversationFilter {
             return false;
         }
         if !self.is_message_allowed(incoming_message) {
-            println!(
-                "跳过非白名单消息 {}:{} sender={}",
-                incoming_message.source,
-                incoming_message.conversation.id,
-                incoming_message.sender.id
+            debug!(
+                source = %incoming_message.source,
+                conversation_id = %incoming_message.conversation.id,
+                sender_id = %incoming_message.sender.id,
+                "跳过非白名单消息"
             );
             return false;
         }

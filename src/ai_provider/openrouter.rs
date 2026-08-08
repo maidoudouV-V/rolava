@@ -1,5 +1,6 @@
 use crate::ai_provider::{
-    AIProvider, ChatUsage, ReasoningPayload, ReasoningState, ToolChatMessage, ToolChatResponse,
+    AIProvider, ChatUsage, ReasoningPayload, ReasoningState, ToolChatContentPart, ToolChatMessage,
+    ToolChatResponse, ToolChatUserContent,
 };
 use crate::tools::{ToolCall, ToolDefinition};
 use anyhow::{anyhow, bail};
@@ -7,6 +8,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::debug;
 
 /// 视觉识别只做图片转写，固定使用 OpenRouter 支持的最低推理强度。
 const VISION_REASONING_EFFORT: &str = "low";
@@ -73,7 +75,7 @@ enum OpenRouterChatMessage<'a> {
         content: &'a str,
     },
     User {
-        content: &'a str,
+        content: OpenRouterUserContent<'a>,
     },
     Assistant {
         content: Option<&'a str>,
@@ -88,6 +90,20 @@ enum OpenRouterChatMessage<'a> {
         tool_call_id: &'a str,
         content: &'a str,
     },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum OpenRouterUserContent<'a> {
+    Text(&'a str),
+    Parts(Vec<OpenRouterUserContentPart<'a>>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenRouterUserContentPart<'a> {
+    Text { text: &'a str },
+    ImageUrl { image_url: OpenRouterImageUrl<'a> },
 }
 
 #[derive(Serialize)]
@@ -143,6 +159,7 @@ enum OpenRouterVisionContent<'a> {
 #[derive(Serialize)]
 struct OpenRouterImageUrl<'a> {
     url: &'a str,
+    detail: &'static str,
 }
 
 /// OpenRouter Chat Completions 响应结构
@@ -206,7 +223,7 @@ fn build_openrouter_chat_request<'a>(
                 content: content.as_str(),
             },
             ToolChatMessage::User { content } => OpenRouterChatMessage::User {
-                content: content.as_str(),
+                content: openrouter_user_content(content),
             },
             ToolChatMessage::Assistant {
                 content,
@@ -274,6 +291,30 @@ fn build_openrouter_chat_request<'a>(
     }
 }
 
+fn openrouter_user_content(content: &ToolChatUserContent) -> OpenRouterUserContent<'_> {
+    if let Some(text) = content.as_text() {
+        OpenRouterUserContent::Text(text)
+    } else {
+        OpenRouterUserContent::Parts(
+            content
+                .parts()
+                .iter()
+                .map(|part| match part {
+                    ToolChatContentPart::Text { text } => OpenRouterUserContentPart::Text { text },
+                    ToolChatContentPart::Image { data_url } => {
+                        OpenRouterUserContentPart::ImageUrl {
+                            image_url: OpenRouterImageUrl {
+                                url: data_url,
+                                detail: "high",
+                            },
+                        }
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
 #[async_trait]
 impl AIProvider for OpenRouterProvider {
     async fn chat_completions(
@@ -289,6 +330,13 @@ impl AIProvider for OpenRouterProvider {
             messages,
             tools,
         );
+        debug!(
+            provider = "openrouter",
+            model = %self.model,
+            request = %serde_json::to_string_pretty(&body)
+                .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
+            "AI Provider 完整请求"
+        );
         let resp = self
             .http_client
             .post(url)
@@ -301,14 +349,12 @@ impl AIProvider for OpenRouterProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "OpenRouter API 调用失败，状态码 {}：{}",
-                status,
-                error_text
-            ));
+            debug!(provider = "openrouter", status = %status, response = %error_text, "AI Provider 原始错误响应");
+            return Err(anyhow!("OpenRouter API 调用失败，状态码 {}", status));
         }
 
         let response_text = resp.text().await?;
+        debug!(provider = "openrouter", response = %response_text, "AI Provider 原始响应");
         parse_openrouter_chat_response(&response_text)
     }
 
@@ -323,6 +369,7 @@ impl AIProvider for OpenRouterProvider {
                     OpenRouterVisionContent::ImageUrl {
                         image_url: OpenRouterImageUrl {
                             url: image_data_url,
+                            detail: "high",
                         },
                     },
                 ],
@@ -333,6 +380,13 @@ impl AIProvider for OpenRouterProvider {
                 summary: "auto",
             },
         };
+        debug!(
+            provider = "openrouter",
+            model = %self.model,
+            prompt,
+            image_data_url_bytes = image_data_url.len(),
+            "视觉 Provider 请求"
+        );
 
         let resp = self
             .http_client
@@ -346,21 +400,14 @@ impl AIProvider for OpenRouterProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "OpenRouter 视觉 API 调用失败，状态码 {}：{}",
-                status,
-                error_text
-            ));
+            debug!(provider = "openrouter", status = %status, response = %error_text, "视觉 Provider 原始错误响应");
+            return Err(anyhow!("OpenRouter 视觉 API 调用失败，状态码 {}", status));
         }
 
         let response_text = resp.text().await?;
-        let parsed: OpenRouterChatResponse = serde_json::from_str(&response_text).map_err(|e| {
-            anyhow!(
-                "解析 OpenRouter 视觉响应失败：{}\n原始响应：\n{}",
-                e,
-                response_text
-            )
-        })?;
+        debug!(provider = "openrouter", response = %response_text, "视觉 Provider 原始响应");
+        let parsed: OpenRouterChatResponse = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow!("解析 OpenRouter 视觉响应失败：{}", e))?;
         parsed
             .choices
             .get(0)
@@ -370,26 +417,14 @@ impl AIProvider for OpenRouterProvider {
 }
 
 fn parse_openrouter_chat_response(response_text: &str) -> anyhow::Result<ToolChatResponse> {
-    let raw_response: Value = serde_json::from_str(response_text).map_err(|error| {
-        anyhow!(
-            "解析 OpenRouter 原始 JSON 失败：{}\n原始响应：\n{}",
-            error,
-            response_text
-        )
-    })?;
-    let parsed: OpenRouterChatResponse = serde_json::from_str(response_text).map_err(|error| {
-        anyhow!(
-            "解析 OpenRouter 响应失败：{}\n原始响应：\n{}",
-            error,
-            response_text
-        )
-    })?;
-    let first_choice = parsed.choices.first().ok_or_else(|| {
-        anyhow!(
-            "OpenRouter 响应 choices 为空\n原始响应：\n{}",
-            response_text
-        )
-    })?;
+    let raw_response: Value = serde_json::from_str(response_text)
+        .map_err(|error| anyhow!("解析 OpenRouter 原始 JSON 失败：{}", error))?;
+    let parsed: OpenRouterChatResponse = serde_json::from_str(response_text)
+        .map_err(|error| anyhow!("解析 OpenRouter 响应失败：{}", error))?;
+    let first_choice = parsed
+        .choices
+        .first()
+        .ok_or_else(|| anyhow!("OpenRouter 响应 choices 为空"))?;
     let content = first_choice.message.content.clone();
     let finish_reason = first_choice.finish_reason.clone();
     let reasoning_details = first_choice.message.reasoning_details.clone();
@@ -418,11 +453,7 @@ fn parse_openrouter_chat_response(response_text: &str) -> anyhow::Result<ToolCha
         .unwrap_or_default()
     {
         if call.call_type != "function" {
-            bail!(
-                "OpenRouter 响应包含不支持的工具类型：{}\n原始响应：\n{}",
-                call.call_type,
-                response_text
-            );
+            bail!("OpenRouter 响应包含不支持的工具类型：{}", call.call_type);
         }
         tool_calls.push(ToolCall {
             id: call.id.clone(),
@@ -432,9 +463,8 @@ fn parse_openrouter_chat_response(response_text: &str) -> anyhow::Result<ToolCha
     }
     if content.is_none() && tool_calls.is_empty() && finish_reason.as_deref() != Some("stop") {
         bail!(
-            "OpenRouter 响应既没有文本内容，也没有 tool_calls，且 finish_reason 不是 stop（当前：{:?}）\n原始响应：\n{}",
-            finish_reason,
-            response_text
+            "OpenRouter 响应既没有文本内容，也没有 tool_calls，且 finish_reason 不是 stop（当前：{:?}）",
+            finish_reason
         );
     }
 
@@ -600,5 +630,44 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("finish_reason 不是 stop"));
+    }
+
+    #[test]
+    fn plain_text_user_message_stays_string() {
+        let messages = vec![ToolChatMessage::User {
+            content: ToolChatUserContent::text("纯文本"),
+        }];
+
+        let request = build_openrouter_chat_request("test", 100, "medium", &messages, &[]);
+        let request_json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(request_json["messages"][0]["content"], "纯文本");
+    }
+
+    #[test]
+    fn multimodal_user_message_uses_high_detail_image_url() {
+        let messages = vec![ToolChatMessage::User {
+            content: ToolChatUserContent::from_parts(vec![
+                ToolChatContentPart::Text {
+                    text: "看看这张图".to_string(),
+                },
+                ToolChatContentPart::Image {
+                    data_url: "data:image/png;base64,abc".to_string(),
+                },
+            ]),
+        }];
+
+        let request = build_openrouter_chat_request("test", 100, "medium", &messages, &[]);
+        let request_json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(request_json["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(
+            request_json["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,abc"
+        );
+        assert_eq!(
+            request_json["messages"][0]["content"][1]["image_url"]["detail"],
+            "high"
+        );
     }
 }

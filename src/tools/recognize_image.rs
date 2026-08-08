@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::fs;
 use tokio::time::{timeout, Duration};
+use tracing::{debug, info, warn};
 
 use crate::message_enricher::MessageEnricher;
 
@@ -13,7 +14,7 @@ use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
 const DESCRIPTION: &str = r#"调用视觉识别模型进一步查看一张已经收到的图片，并把识别结果返回给当前工具调用。
 
-仅当聊天记录中的简短图片描述不足以完成判断时调用。必须使用聊天记录中真实存在的图片 ID，并提出具体、简短的问题。"#;
+必须使用聊天记录中真实存在的图片 ID，并提出具体、简短的问题。"#;
 
 #[derive(Debug, Deserialize)]
 pub struct RecognizeImageArgs {
@@ -160,10 +161,8 @@ impl Tool for RecognizeImageTool {
             .get(model_name)
             .with_context(|| format!("找不到视觉模型配置: {}", model_name))?;
 
-        println!(
-            "调用视觉模型识别图片细节: model={}，image_id={}，question={}",
-            model_name, image_id, question
-        );
+        info!(model = %model_name, image_id = %image_id, "调用视觉模型识别图片细节");
+        debug!(image_id = %image_id, question = %question, "图片识别问题");
         let max_attempts = app_config.app.ai_request_max_attempts();
         let timeout_seconds = app_config.app.ai_request_timeout_seconds;
         let mut last_error = None;
@@ -190,10 +189,7 @@ impl Tool for RecognizeImageTool {
             match result {
                 Ok(answer) => return Ok(ToolOutput::text(Self::normalize_answer(&answer)?)),
                 Err(error) => {
-                    eprintln!(
-                        "图片识别 API 请求失败，第 {}/{} 次: {}",
-                        attempt, max_attempts, error
-                    );
+                    warn!(attempt, max_attempts, error = %error, "图片识别 API 请求失败");
                     last_error = Some(error);
                 }
             }

@@ -5,6 +5,50 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, params_from_iter, OptionalExtension, Row, Transaction};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+
+use crate::conversation_context::AiTurnBlock;
+use crate::scheduler::ScheduledTask;
+
+const CONTEXT_BLOCK_INPUT_MESSAGE: &str = "input_message";
+const CONTEXT_BLOCK_AI_TURN: &str = "ai_turn";
+
+/// 一条已经写入数据库的消息标识。
+#[derive(Debug, Clone, Copy)]
+pub struct StoredMessage {
+    /// messages 表主键。
+    pub id: i64,
+}
+
+/// 清空单个会话聊天历史后的删除统计。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResetConversationResult {
+    pub deleted_messages: usize,
+    pub deleted_context_blocks: usize,
+}
+
+/// 主模型上下文中按实际发生顺序排列的一项。
+#[derive(Debug, Clone)]
+pub enum ContextTimelineItem {
+    /// 一条从 messages 表读取的人类输入消息。
+    InputMessage {
+        history_index: usize,
+        message: ChatMessage,
+    },
+    /// 一次完整的 assistant 与工具调用循环。
+    AiTurn(AiTurnBlock),
+}
+
+/// 已完成窗口计算和过期清理的主模型上下文时间线。
+#[derive(Debug, Clone)]
+pub struct ConversationContextWindow {
+    /// 按 block 自增主键排列的上下文项。
+    pub items: Vec<ContextTimelineItem>,
+    /// 当前正文窗口内全部平台消息 ID，供视觉窗口等附加规则使用。
+    pub message_ids: Vec<i64>,
+    /// 本次读取时清理的过期上下文块数量。
+    pub pruned_block_count: usize,
+}
 
 /// 一条会话目录记录。
 #[derive(Debug, Clone)]
@@ -224,11 +268,107 @@ impl QQChatContextManager {
             CREATE INDEX IF NOT EXISTS idx_conversations_last_message_at
             ON conversations (last_message_at DESC);
 
-            CREATE INDEX IF NOT EXISTS idx_messages_conversation_timestamp
-            ON messages (conversation_id, event_timestamp DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
+            ON messages (conversation_id, id DESC);
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_conversation_source_message
             ON messages (conversation_id, source_message_id);
+
+            CREATE TABLE IF NOT EXISTS conversation_context_blocks (
+                -- 上下文块主键。
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- 所属会话，对应 conversations.id。
+                conversation_id             INTEGER NOT NULL,
+                -- input_message 表示人类输入引用，ai_turn 表示完整 AI 工具循环。
+                block_type                  TEXT    NOT NULL,
+                -- input_message 引用的 messages.id；ai_turn 为空。
+                message_id                  INTEGER,
+                -- 最早依赖的正文消息；该消息滚出窗口时删除整个块。
+                retention_message_id        INTEGER NOT NULL,
+                -- ai_turn 保存完整模型轮次；input_message 为空并通过 message_id 读取正文。
+                payload_json                TEXT,
+                -- 上下文块写入数据库时的 Unix 时间戳。
+                created_at                  INTEGER NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+                FOREIGN KEY (message_id) REFERENCES messages(id),
+                FOREIGN KEY (retention_message_id) REFERENCES messages(id),
+                CHECK(block_type IN ('input_message', 'ai_turn')),
+                CHECK(
+                    (
+                        block_type = 'input_message'
+                        AND message_id IS NOT NULL
+                        AND retention_message_id = message_id
+                        AND payload_json IS NULL
+                    )
+                    OR (
+                        block_type = 'ai_turn'
+                        AND message_id IS NULL
+                        AND payload_json IS NOT NULL
+                    )
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_context_blocks_conversation_id
+            ON conversation_context_blocks (conversation_id, id ASC);
+
+            CREATE INDEX IF NOT EXISTS idx_context_blocks_retention
+            ON conversation_context_blocks (conversation_id, retention_message_id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_context_blocks_input_message
+            ON conversation_context_blocks (message_id)
+            WHERE message_id IS NOT NULL;
+
+            -- 只读视图负责联表查看人类消息，避免在上下文块中复制消息 JSON。
+            CREATE VIEW IF NOT EXISTS conversation_context_timeline AS
+            SELECT
+                b.id AS block_id,
+                b.conversation_id,
+                b.block_type,
+                b.message_id,
+                b.retention_message_id,
+                CASE
+                    WHEN b.block_type = 'input_message' THEN json_object(
+                        'role', 'user',
+                        'message_id', m.id,
+                        'source_message_id', m.source_message_id,
+                        'sender_id', m.sender_id,
+                        'sender_display_name', m.sender_display_name,
+                        'sender_nickname', m.sender_nickname,
+                        'content_text', m.content_text,
+                        'content_parts', json(m.content_parts_json),
+                        'metadata', json(m.metadata_json),
+                        'event_timestamp', m.event_timestamp
+                    )
+                    ELSE json(b.payload_json)
+                END AS payload_json,
+                b.created_at
+            FROM conversation_context_blocks b
+            LEFT JOIN messages m ON m.id = b.message_id;
+
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                -- 稳定任务 ID；修改时间或内容时保持不变。
+                id                  TEXT    PRIMARY KEY,
+                -- 任务所属会话，只允许当前会话查询和修改。
+                conversation_id     INTEGER NOT NULL,
+                -- 投递内部触发时使用的机器人账号 ID。
+                bot_id              TEXT    NOT NULL,
+                -- 注入提示词的简短单行标题，最多 50 个字符。
+                title               TEXT    NOT NULL,
+                -- 原始时间表达式，格式为 at:... 或 cron:...。
+                schedule            TEXT    NOT NULL,
+                -- 到期时临时交给主模型的完整任务说明，最多 1000 个字符。
+                instruction         TEXT    NOT NULL,
+                -- 下一次执行的 Unix 时间戳；调度查询统一按绝对时间比较。
+                next_run_at         INTEGER NOT NULL,
+                -- 最近一次成功认领的计划执行时间。
+                last_triggered_at   INTEGER,
+                created_at          INTEGER NOT NULL,
+                updated_at          INTEGER NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_next_run_at
+            ON scheduled_tasks (next_run_at ASC);
 
             CREATE TABLE IF NOT EXISTS received_images (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -248,26 +388,7 @@ impl QQChatContextManager {
             ON received_images (content_hash);
             ",
         )?;
-        Self::ensure_messages_is_read_column(&conn)?;
-
         Ok(Self { conn_pool })
-    }
-
-    /// 兼容旧数据库：如果 messages 表还没有 is_read 字段，则追加字段并给旧数据默认未读。
-    fn ensure_messages_is_read_column(conn: &rusqlite::Connection) -> Result<()> {
-        let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
-        let column_names = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for column_name in column_names {
-            if column_name? == "is_read" {
-                return Ok(());
-            }
-        }
-
-        conn.execute(
-            "ALTER TABLE messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        Ok(())
     }
 
     /// 将通用入站消息转换为标准写入请求。
@@ -313,14 +434,22 @@ impl QQChatContextManager {
         }
     }
 
-    /// 将一条通用入站消息写入数据库。
-    pub fn write_incoming_message(&self, message: &IncomingMessage) -> Result<()> {
+    /// 将一条通用入站消息及其上下文位置写入数据库。
+    pub fn write_incoming_message(&self, message: &IncomingMessage) -> Result<StoredMessage> {
         let new_message = Self::new_message_from_incoming(message);
-        self.write_message(&new_message)
+        self.write_message_internal(&new_message, true)
     }
 
     /// 写入一条标准化后的聊天记录。
-    pub fn write_message(&self, message: &NewChatMessage) -> Result<()> {
+    pub fn write_message(&self, message: &NewChatMessage) -> Result<StoredMessage> {
+        self.write_message_internal(message, false)
+    }
+
+    fn write_message_internal(
+        &self,
+        message: &NewChatMessage,
+        add_input_context_block: bool,
+    ) -> Result<StoredMessage> {
         let now_timestamp = Utc::now().timestamp();
         let mut connection = self.conn_pool.get()?;
         let tx = connection.transaction()?;
@@ -369,7 +498,182 @@ impl QQChatContextManager {
             ],
         )?;
 
+        let stored_message = StoredMessage {
+            id: tx.last_insert_rowid(),
+        };
+        if add_input_context_block {
+            Self::insert_input_message_context_block(
+                &tx,
+                conversation_id,
+                stored_message.id,
+                now_timestamp,
+            )?;
+        }
+
         tx.commit()?;
+        Ok(stored_message)
+    }
+
+    /// 持久化一次完整 AI 处理原子块；最早依赖的正文消息负责整个块的淘汰。
+    pub fn insert_ai_turn_context_block(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+        payload_json: &str,
+        retention_message_id: i64,
+    ) -> Result<i64> {
+        let now_timestamp = Utc::now().timestamp();
+        let mut connection = self.conn_pool.get()?;
+        let tx = connection.transaction()?;
+        let conversation_id = tx.query_row(
+            "
+            SELECT id
+            FROM conversations
+            WHERE source = ?1 AND source_conversation_id = ?2
+            ",
+            params![source, source_conversation_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        tx.execute(
+            "
+            INSERT INTO conversation_context_blocks (
+                conversation_id,
+                block_type,
+                message_id,
+                retention_message_id,
+                payload_json,
+                created_at
+            ) VALUES (?1, 'ai_turn', NULL, ?2, ?3, ?4)
+            ",
+            params![
+                conversation_id,
+                retention_message_id,
+                payload_json,
+                now_timestamp,
+            ],
+        )?;
+        let block_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(block_id)
+    }
+
+    /// 返回已按消息窗口筛选并清理过期块的类型化上下文时间线。
+    pub fn get_conversation_context_window(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+        max_history_messages: u32,
+    ) -> Result<ConversationContextWindow> {
+        let history =
+            self.get_conversation_history(source, source_conversation_id, max_history_messages)?;
+        let connection = self.conn_pool.get()?;
+        if history.is_empty() {
+            let pruned_block_count = connection.execute(
+                "
+                DELETE FROM conversation_context_blocks
+                WHERE conversation_id = (
+                    SELECT id FROM conversations
+                    WHERE source = ?1 AND source_conversation_id = ?2
+                )
+                ",
+                params![source, source_conversation_id],
+            )?;
+            return Ok(ConversationContextWindow {
+                items: Vec::new(),
+                message_ids: Vec::new(),
+                pruned_block_count,
+            });
+        }
+
+        let conversation_id = history[0].conversation_id;
+        let oldest_visible_message_id = history[0].id;
+        let message_ids = history.iter().map(|message| message.id).collect();
+        let mut history_by_id = history
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| (message.id, (index, message)))
+            .collect::<HashMap<_, _>>();
+
+        // 上下文窗口按 messages.id 连续滚动，最早依赖消息滚出后整个原子块即可删除。
+        let pruned_block_count = connection.execute(
+            "
+            DELETE FROM conversation_context_blocks
+            WHERE conversation_id = ?1 AND retention_message_id < ?2
+            ",
+            params![conversation_id, oldest_visible_message_id],
+        )?;
+
+        let mut stmt = connection.prepare(
+            "
+            SELECT
+                b.id,
+                b.block_type,
+                b.message_id,
+                b.payload_json
+            FROM conversation_context_blocks b
+            WHERE b.conversation_id = ?1
+              AND b.retention_message_id >= ?2
+            ORDER BY b.id ASC
+            ",
+        )?;
+        let mut rows = stmt.query(params![conversation_id, oldest_visible_message_id])?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next()? {
+            let block_id: i64 = row.get(0)?;
+            let block_type: String = row.get(1)?;
+            match block_type.as_str() {
+                CONTEXT_BLOCK_INPUT_MESSAGE => {
+                    let message_id: i64 = row.get(2)?;
+                    let (history_index, message) =
+                        history_by_id.remove(&message_id).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "上下文块 {} 引用的消息 {} 不在当前正文窗口中",
+                                block_id,
+                                message_id
+                            )
+                        })?;
+                    items.push(ContextTimelineItem::InputMessage {
+                        history_index,
+                        message,
+                    });
+                }
+                CONTEXT_BLOCK_AI_TURN => {
+                    let payload_json: String = row.get(3)?;
+                    let ai_turn = serde_json::from_str(&payload_json).map_err(|error| {
+                        anyhow::anyhow!("解析会话上下文块 {} 失败: {}", block_id, error)
+                    })?;
+                    items.push(ContextTimelineItem::AiTurn(ai_turn));
+                }
+                _ => unreachable!("数据库约束保证上下文块类型有效"),
+            }
+        }
+
+        Ok(ConversationContextWindow {
+            items,
+            message_ids,
+            pruned_block_count,
+        })
+    }
+
+    fn insert_input_message_context_block(
+        tx: &Transaction<'_>,
+        conversation_id: i64,
+        message_id: i64,
+        now_timestamp: i64,
+    ) -> Result<()> {
+        tx.execute(
+            "
+            INSERT INTO conversation_context_blocks (
+                conversation_id,
+                block_type,
+                message_id,
+                retention_message_id,
+                payload_json,
+                created_at
+            ) VALUES (?1, 'input_message', ?2, ?2, NULL, ?3)
+            ",
+            params![conversation_id, message_id, now_timestamp],
+        )?;
         Ok(())
     }
 
@@ -404,7 +708,52 @@ impl QQChatContextManager {
         }
     }
 
-    /// 获取指定来源会话的聊天记录；超过最大数量后按块淘汰旧消息，避免每条新消息都移动窗口。
+    /// 原子清空单个会话的聊天记录和模型上下文，保留会话目录及其定时任务。
+    pub fn reset_conversation_history(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+    ) -> Result<ResetConversationResult> {
+        let mut connection = self.conn_pool.get()?;
+        let tx = connection.transaction()?;
+        let conversation_id = tx
+            .query_row(
+                "
+                SELECT id
+                FROM conversations
+                WHERE source = ?1 AND source_conversation_id = ?2
+                ",
+                params![source, source_conversation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(conversation_id) = conversation_id else {
+            tx.commit()?;
+            return Ok(ResetConversationResult::default());
+        };
+
+        // 上下文块引用消息主键，必须先删上下文块再删正文消息。
+        let deleted_context_blocks = tx.execute(
+            "DELETE FROM conversation_context_blocks WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        let deleted_messages = tx.execute(
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        tx.execute(
+            "UPDATE conversations SET last_message_at = created_at WHERE id = ?1",
+            params![conversation_id],
+        )?;
+        tx.commit()?;
+
+        Ok(ResetConversationResult {
+            deleted_messages,
+            deleted_context_blocks,
+        })
+    }
+
+    /// 获取指定来源会话的聊天记录；按入库顺序分块滚动，平台时间只用于内容展示。
     pub fn get_conversation_history(
         &self,
         source: &str,
@@ -450,7 +799,6 @@ impl QQChatContextManager {
                 c.source = ?1
                 AND c.source_conversation_id = ?2
             ORDER BY
-                m.event_timestamp ASC,
                 m.id ASC
             LIMIT ?3
             OFFSET ?4
@@ -475,7 +823,7 @@ impl QQChatContextManager {
         Ok(messages)
     }
 
-    /// 获取会话中时间最新的指定数量消息，并按时间正序返回。
+    /// 获取会话中最后入库的指定数量消息，并按入库顺序返回。
     pub fn get_latest_conversation_history(
         &self,
         source: &str,
@@ -516,7 +864,6 @@ impl QQChatContextManager {
                 c.source = ?1
                 AND c.source_conversation_id = ?2
             ORDER BY
-                m.event_timestamp DESC,
                 m.id DESC
             LIMIT ?3
             ",
@@ -585,6 +932,253 @@ impl QQChatContextManager {
             |row| row.get(0),
         )?;
         Ok(exists != 0)
+    }
+
+    /// 创建一条属于指定会话的运行中定时任务。
+    pub fn insert_scheduled_task(
+        &self,
+        task_id: &str,
+        source: &str,
+        source_conversation_id: &str,
+        bot_id: &str,
+        title: &str,
+        schedule: &str,
+        instruction: &str,
+        next_run_at: i64,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let connection = self.conn_pool.get()?;
+        connection.execute(
+            "
+            INSERT INTO scheduled_tasks (
+                id, conversation_id, bot_id, title, schedule, instruction,
+                next_run_at, last_triggered_at, created_at, updated_at
+            )
+            SELECT ?1, c.id, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9
+            FROM conversations c
+            WHERE c.source = ?2 AND c.source_conversation_id = ?3
+            ",
+            params![
+                task_id,
+                source,
+                source_conversation_id,
+                bot_id,
+                title,
+                schedule,
+                instruction,
+                next_run_at,
+                now,
+            ],
+        )?;
+        if connection.changes() == 0 {
+            anyhow::bail!("当前会话尚未写入数据库，无法创建定时任务");
+        }
+        Ok(())
+    }
+
+    pub fn scheduled_task_id_exists(&self, task_id: &str) -> Result<bool> {
+        let connection = self.conn_pool.get()?;
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduled_tasks WHERE id = ?1)",
+            params![task_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    /// 返回当前会话的所有运行中任务，顺序与实际触发顺序一致。
+    pub fn get_running_scheduled_tasks(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+    ) -> Result<Vec<ScheduledTask>> {
+        let connection = self.conn_pool.get()?;
+        let mut statement = connection.prepare(&format!(
+            "{} WHERE c.source = ?1 AND c.source_conversation_id = ?2 ORDER BY st.next_run_at ASC, st.id ASC",
+            Self::scheduled_task_select_sql()
+        ))?;
+        let tasks = statement
+            .query_map(
+                params![source, source_conversation_id],
+                Self::scheduled_task_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tasks)
+    }
+
+    pub fn get_scheduled_task(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+        task_id: &str,
+    ) -> Result<Option<ScheduledTask>> {
+        let connection = self.conn_pool.get()?;
+        connection
+            .query_row(
+                &format!(
+                    "{} WHERE c.source = ?1 AND c.source_conversation_id = ?2 AND st.id = ?3",
+                    Self::scheduled_task_select_sql()
+                ),
+                params![source, source_conversation_id, task_id],
+                Self::scheduled_task_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// 更新时同时替换规范化后的下一次执行时间，避免调度器继续使用旧时间。
+    pub fn update_scheduled_task(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+        task_id: &str,
+        title: &str,
+        schedule: &str,
+        instruction: &str,
+        next_run_at: i64,
+    ) -> Result<bool> {
+        let connection = self.conn_pool.get()?;
+        let changed = connection.execute(
+            "
+            UPDATE scheduled_tasks
+            SET title = ?4,
+                schedule = ?5,
+                instruction = ?6,
+                next_run_at = ?7,
+                updated_at = ?8
+            WHERE id = ?3
+              AND conversation_id = (
+                  SELECT id FROM conversations
+                  WHERE source = ?1 AND source_conversation_id = ?2
+              )
+            ",
+            params![
+                source,
+                source_conversation_id,
+                task_id,
+                title,
+                schedule,
+                instruction,
+                next_run_at,
+                Utc::now().timestamp(),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn delete_scheduled_task(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+        task_id: &str,
+    ) -> Result<bool> {
+        let connection = self.conn_pool.get()?;
+        let changed = connection.execute(
+            "
+            DELETE FROM scheduled_tasks
+            WHERE id = ?3
+              AND conversation_id = (
+                  SELECT id FROM conversations
+                  WHERE source = ?1 AND source_conversation_id = ?2
+              )
+            ",
+            params![source, source_conversation_id, task_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn next_scheduled_task_timestamp(&self) -> Result<Option<i64>> {
+        let connection = self.conn_pool.get()?;
+        connection
+            .query_row("SELECT MIN(next_run_at) FROM scheduled_tasks", [], |row| {
+                row.get(0)
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn get_due_scheduled_tasks(&self, now_timestamp: i64) -> Result<Vec<ScheduledTask>> {
+        let connection = self.conn_pool.get()?;
+        let mut statement = connection.prepare(&format!(
+            "{} WHERE st.next_run_at <= ?1 ORDER BY st.next_run_at ASC, st.id ASC",
+            Self::scheduled_task_select_sql()
+        ))?;
+        let tasks = statement
+            .query_map(params![now_timestamp], Self::scheduled_task_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tasks)
+    }
+
+    /// 条件更新相当于认领到期任务；若任务已被修改或删除，旧调度结果不会再触发。
+    pub fn claim_scheduled_task(
+        &self,
+        task_id: &str,
+        expected_next_run_at: i64,
+        following_run_at: Option<i64>,
+    ) -> Result<bool> {
+        let connection = self.conn_pool.get()?;
+        let changed = match following_run_at {
+            Some(next_run_at) => connection.execute(
+                "
+                UPDATE scheduled_tasks
+                SET last_triggered_at = next_run_at,
+                    next_run_at = ?3,
+                    updated_at = ?4
+                WHERE id = ?1 AND next_run_at = ?2
+                ",
+                params![
+                    task_id,
+                    expected_next_run_at,
+                    next_run_at,
+                    Utc::now().timestamp()
+                ],
+            )?,
+            None => connection.execute(
+                "DELETE FROM scheduled_tasks WHERE id = ?1 AND next_run_at = ?2",
+                params![task_id, expected_next_run_at],
+            )?,
+        };
+        Ok(changed > 0)
+    }
+
+    fn scheduled_task_select_sql() -> &'static str {
+        "
+        SELECT
+            st.id,
+            st.conversation_id,
+            c.source,
+            c.source_conversation_id,
+            c.kind,
+            c.title,
+            st.bot_id,
+            st.title,
+            st.schedule,
+            st.instruction,
+            st.next_run_at,
+            st.last_triggered_at,
+            st.created_at,
+            st.updated_at
+        FROM scheduled_tasks st
+        INNER JOIN conversations c ON c.id = st.conversation_id
+        "
+    }
+
+    fn scheduled_task_from_row(row: &Row<'_>) -> rusqlite::Result<ScheduledTask> {
+        Ok(ScheduledTask {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            source: row.get(2)?,
+            source_conversation_id: row.get(3)?,
+            conversation_kind: row.get(4)?,
+            conversation_title: row.get(5)?,
+            bot_id: row.get(6)?,
+            title: row.get(7)?,
+            schedule: row.get(8)?,
+            instruction: row.get(9)?,
+            next_run_at: row.get(10)?,
+            last_triggered_at: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
+        })
     }
 
     /// 统计指定会话的消息总数，用于计算按块淘汰的窗口位置。
@@ -739,6 +1333,47 @@ impl QQChatContextManager {
         Ok(())
     }
 
+    /// 查询创建时间早于截止时间的图片文件，供后台资源清理服务处理。
+    pub fn get_received_images_created_before(
+        &self,
+        cutoff_timestamp: i64,
+    ) -> Result<Vec<ReceivedImageRecord>> {
+        let connection = self.conn_pool.get()?;
+        let mut statement = connection.prepare(
+            "
+            SELECT image_id, content_hash, local_path, description
+            FROM received_images
+            WHERE created_at < ?1
+            ORDER BY created_at ASC, id ASC
+            ",
+        )?;
+        let images = statement
+            .query_map(params![cutoff_timestamp], |row| {
+                Ok(ReceivedImageRecord {
+                    image_id: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    local_path: row.get(2)?,
+                    description: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(images)
+    }
+
+    /// 文件清理完成后条件删除图片索引，防止误删截止时间之后创建的记录。
+    pub fn delete_received_image_created_before(
+        &self,
+        image_id: &str,
+        cutoff_timestamp: i64,
+    ) -> Result<bool> {
+        let connection = self.conn_pool.get()?;
+        let changed = connection.execute(
+            "DELETE FROM received_images WHERE image_id = ?1 AND created_at < ?2",
+            params![image_id, cutoff_timestamp],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// 创建或更新一条会话目录记录，并返回数据库主键。
     fn upsert_conversation(
         tx: &Transaction<'_>,
@@ -809,5 +1444,260 @@ impl QQChatContextManager {
     /// 过滤掉空字符串，避免把无意义空值写入可选字段。
     fn normalize_optional_text(value: Option<&str>) -> Option<&str> {
         value.and_then(|text| if text.is_empty() { None } else { Some(text) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{ContextTimelineItem, NewChatMessage, QQChatContextManager};
+    use rand::Rng;
+
+    #[test]
+    fn context_window_joins_messages_and_preserves_block_order() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        let first_message = test_message("message-1", "第一条正文", 1);
+        let stored = manager
+            .write_message_internal(&first_message, true)
+            .unwrap();
+        let outgoing_message = test_message("message-2", "AI 发出的正文", 2);
+        let outgoing = manager.write_message(&outgoing_message).unwrap();
+        manager
+            .insert_ai_turn_context_block("test", "conversation", r#"{"rounds":[]}"#, outgoing.id)
+            .unwrap();
+        // 平台时间可能乱序；上下文仍必须严格使用 Actor 的入库顺序。
+        let next_message = test_message("message-3", "下一条正文", 0);
+        let next = manager.write_message_internal(&next_message, true).unwrap();
+
+        let window = manager
+            .get_conversation_context_window("test", "conversation", 10)
+            .unwrap();
+        assert_eq!(window.items.len(), 3);
+        assert_eq!(window.message_ids, vec![stored.id, outgoing.id, next.id]);
+        assert_eq!(window.pruned_block_count, 0);
+        match &window.items[0] {
+            ContextTimelineItem::InputMessage {
+                history_index,
+                message,
+                ..
+            } => {
+                assert_eq!(*history_index, 0);
+                assert_eq!(message.id, stored.id);
+                assert_eq!(message.content_text.as_deref(), Some("第一条正文"));
+            }
+            other => panic!("第一项应为输入消息，实际为 {other:?}"),
+        }
+        assert!(matches!(
+            &window.items[1],
+            ContextTimelineItem::AiTurn(ai_turn) if ai_turn.rounds.is_empty()
+        ));
+        assert!(matches!(
+            &window.items[2],
+            ContextTimelineItem::InputMessage { message, .. } if message.id == next.id
+        ));
+
+        let connection = manager.conn_pool.get().unwrap();
+        let first_payload: String = connection
+            .query_row(
+                "SELECT payload_json FROM conversation_context_timeline WHERE message_id = ?1",
+                [stored.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let first_payload: serde_json::Value = serde_json::from_str(&first_payload).unwrap();
+        assert_eq!(first_payload["role"], "user");
+        assert_eq!(first_payload["message_id"], stored.id);
+        assert_eq!(first_payload["content_text"], "第一条正文");
+        assert_eq!(first_payload["sender_id"], first_message.sender_id);
+
+        drop(connection);
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn context_window_prunes_blocks_when_retention_message_leaves() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        let first = manager
+            .write_message_internal(&test_message("message-1", "第一条正文", 1), true)
+            .unwrap();
+        let outgoing = manager
+            .write_message(&test_message("message-2", "AI 发出的正文", 2))
+            .unwrap();
+        manager
+            .insert_ai_turn_context_block("test", "conversation", r#"{"rounds":[]}"#, outgoing.id)
+            .unwrap();
+        let next = manager
+            .write_message_internal(&test_message("message-3", "下一条正文", 3), true)
+            .unwrap();
+
+        let window = manager
+            .get_conversation_context_window("test", "conversation", 2)
+            .unwrap();
+        assert_eq!(window.message_ids, vec![outgoing.id, next.id]);
+        assert_eq!(window.pruned_block_count, 1);
+        assert_eq!(window.items.len(), 2);
+        assert!(matches!(window.items[0], ContextTimelineItem::AiTurn(_)));
+        assert!(matches!(
+            window.items[1],
+            ContextTimelineItem::InputMessage { ref message, .. } if message.id == next.id
+        ));
+
+        assert!(first.id < outgoing.id);
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reset_conversation_removes_only_chat_state_and_keeps_scheduled_tasks() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        manager
+            .write_message_internal(&test_message("message-1", "需要删除", 1), true)
+            .unwrap();
+        manager
+            .insert_scheduled_task(
+                "task_ResetKeep",
+                "test",
+                "conversation",
+                "bot",
+                "保留任务",
+                "cron:0 9 * * *",
+                "重置后仍然保留",
+                100,
+            )
+            .unwrap();
+        let mut other_message = test_message("other-message", "其它会话", 2);
+        other_message.source_conversation_id = "other-conversation".to_string();
+        manager
+            .write_message_internal(&other_message, true)
+            .unwrap();
+
+        let result = manager
+            .reset_conversation_history("test", "conversation")
+            .unwrap();
+
+        assert_eq!(result.deleted_messages, 1);
+        assert_eq!(result.deleted_context_blocks, 1);
+        assert!(manager
+            .get_conversation_history("test", "conversation", 10)
+            .unwrap()
+            .is_empty());
+        assert!(manager
+            .get_conversation_context_window("test", "conversation", 10)
+            .unwrap()
+            .items
+            .is_empty());
+        assert_eq!(
+            manager
+                .get_conversation_history("test", "other-conversation", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(manager
+            .get_scheduled_task("test", "conversation", "task_ResetKeep")
+            .unwrap()
+            .is_some());
+
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scheduled_tasks_are_scoped_updated_and_claimed_atomically() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        manager
+            .write_message_internal(&test_message("message-1", "创建会话", 1), true)
+            .unwrap();
+        manager
+            .insert_scheduled_task(
+                "task_A1b2C3d4",
+                "test",
+                "conversation",
+                "bot",
+                "测试任务",
+                "cron:0 9 * * *",
+                "每天检查一次",
+                100,
+            )
+            .unwrap();
+
+        let tasks = manager
+            .get_running_scheduled_tasks("test", "conversation")
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "task_A1b2C3d4");
+        assert!(manager
+            .get_scheduled_task("test", "other-conversation", "task_A1b2C3d4")
+            .unwrap()
+            .is_none());
+
+        assert!(manager
+            .update_scheduled_task(
+                "test",
+                "conversation",
+                "task_A1b2C3d4",
+                "新标题",
+                "cron:30 10 * * *",
+                "新的任务说明",
+                200,
+            )
+            .unwrap());
+        assert!(!manager
+            .claim_scheduled_task("task_A1b2C3d4", 100, Some(300))
+            .unwrap());
+        assert!(manager
+            .claim_scheduled_task("task_A1b2C3d4", 200, Some(300))
+            .unwrap());
+
+        let task = manager
+            .get_scheduled_task("test", "conversation", "task_A1b2C3d4")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.next_run_at, 300);
+        assert_eq!(task.last_triggered_at, Some(200));
+        assert!(manager
+            .claim_scheduled_task("task_A1b2C3d4", 300, None)
+            .unwrap());
+        assert!(manager
+            .get_running_scheduled_tasks("test", "conversation")
+            .unwrap()
+            .is_empty());
+
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
+    fn test_message(source_message_id: &str, content: &str, timestamp: i64) -> NewChatMessage {
+        NewChatMessage {
+            source: "test".to_string(),
+            source_conversation_id: "conversation".to_string(),
+            conversation_kind: "group".to_string(),
+            conversation_title: None,
+            conversation_metadata_json: "{}".to_string(),
+            source_message_id: Some(source_message_id.to_string()),
+            sender_id: "user".to_string(),
+            sender_display_name: "user".to_string(),
+            sender_nickname: None,
+            sender_role: None,
+            content_text: content.to_string(),
+            message_type: "text".to_string(),
+            content_parts_json: "[]".to_string(),
+            metadata_json: "{}".to_string(),
+            event_timestamp: timestamp,
+        }
+    }
+
+    fn temporary_db_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rolava-context-test-{}-{}.db",
+            std::process::id(),
+            rand::thread_rng().gen::<u64>()
+        ))
     }
 }

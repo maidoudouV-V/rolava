@@ -3,24 +3,26 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
+use tracing::warn;
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"通过在线AI模型检索互联网中的实时或近期信息。
-查询应包含完成检索所需的必要上下文。
-适用于新闻、公告、版本变化、价格、比赛结果或指定网页内容。"#;
+const DESCRIPTION: &str = r#"启动一个新的互联网Agent查询内容
+输入你的问题，此工具会启用子Agent通过互联网查询并解决你的问题。
+当需要获取互联网实时信息时调用，工具暂时不提供图片搜索功能。
+请注意调用频率，只有确实需要连接互联网才能提供回答时才可使用。"#;
 
 #[derive(Debug, Deserialize)]
-pub struct WebSearchArgs {
-    pub query: String,
+pub struct AgentWebSearchArgs {
+    pub question: String,
 }
 
-pub struct WebSearchTool;
+pub struct AgentWebSearchTool;
 
 #[async_trait]
-impl Tool for WebSearchTool {
+impl Tool for AgentWebSearchTool {
     fn name(&self) -> &'static str {
-        "web_search"
+        "agent_web_search"
     }
 
     fn description(&self) -> &'static str {
@@ -31,20 +33,20 @@ impl Tool for WebSearchTool {
         json!({
             "type": "object",
             "properties": {
-                "query": {
+                "question": {
                     "type": "string",
-                    "description": "具体、完整的自然语言查询，可包含需要读取的 URL"
+                    "description": "给网络搜索 Agent 的问题描述"
                 }
             },
-            "required": ["query"],
+            "required": ["question"],
             "additionalProperties": false
         })
     }
 
     async fn execute(&self, context: &ToolContext, arguments: &str) -> Result<ToolOutput> {
-        let WebSearchArgs { query } = parse_arguments(self.name(), arguments)?;
-        let query = query.trim();
-        if query.is_empty() {
+        let AgentWebSearchArgs { question } = parse_arguments(self.name(), arguments)?;
+        let question = question.trim();
+        if question.is_empty() {
             anyhow::bail!("联网搜索内容不能为空");
         }
 
@@ -59,11 +61,11 @@ impl Tool for WebSearchTool {
                 .get(&context.services.app_config.app.web_search_model_name)
                 .ok_or_else(|| anyhow::anyhow!("找不到联网搜索模型配置"))?;
             let search_result = if timeout_seconds == 0 {
-                provider.web_search(query).await
+                provider.web_search(question).await
             } else {
                 match timeout(
                     Duration::from_secs(timeout_seconds),
-                    provider.web_search(query),
+                    provider.web_search(question),
                 )
                 .await
                 {
@@ -78,10 +80,7 @@ impl Tool for WebSearchTool {
             match search_result {
                 Ok(content) => return Ok(ToolOutput::text(content)),
                 Err(error) => {
-                    eprintln!(
-                        "联网搜索 API 请求失败，第 {}/{} 次: {}",
-                        attempt, max_attempts, error
-                    );
+                    warn!(attempt, max_attempts, error = %error, "联网搜索 API 请求失败");
                     last_error = Some(error);
                 }
             }

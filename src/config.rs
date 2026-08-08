@@ -1,6 +1,6 @@
 use crate::ai_provider::{
-    anthropic::AnthropicProvider, google_aistudio::GoogleAIStudioProvider,
-    openai_compatible::OpenAICompatibleProvider, openrouter::OpenRouterProvider, AIProvider,
+    google_aistudio::GoogleAIStudioProvider, openai_compatible::OpenAICompatibleProvider,
+    openrouter::OpenRouterProvider, AIProvider,
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -10,6 +10,7 @@ use std::path::Path;
 
 const DEFAULT_AI_REQUEST_RETRY_COUNT: u32 = 1;
 const DEFAULT_AI_REQUEST_TIMEOUT_SECONDS: u64 = 0;
+const DEFAULT_VISION_IMAGE_MESSAGE_WINDOW: usize = 10;
 
 #[derive(Deserialize, Debug)]
 struct TomlConfig {
@@ -21,6 +22,37 @@ struct TomlConfig {
     providers: Vec<ProviderConfig>,
     /// AI 模型配置列表
     models: Vec<ModelConfig>,
+    /// 日志配置。
+    #[serde(default)]
+    logging: LoggingSection,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct LoggingSection {
+    /// 应用日志级别，可选 error、warn、info 或 debug。
+    #[serde(default)]
+    pub level: LogLevel,
 }
 
 #[derive(Deserialize, Debug)]
@@ -29,6 +61,9 @@ pub struct AppSection {
     pub prompt_dir: String,
     /// 发送给模型的最大历史消息数。
     pub max_history_messages: u32,
+    /// 主模型请求中允许附带原始图片的最近正文消息数；0 表示不附带原图。
+    #[serde(default = "default_vision_image_message_window")]
+    pub vision_image_message_window: usize,
     /// 更主动回复的概率，范围 0-100；保留供后续流程使用。
     pub proactive_reply_percent: f64,
     /// 默认聊天模型名称
@@ -56,6 +91,9 @@ pub struct AppSection {
     pub direct_whitelist: Vec<String>,
     /// 群聊白名单群号，空数组表示放行所有群聊。
     pub group_whitelist: Vec<String>,
+    /// 命令执行账号白名单；空数组表示所有账号都不能执行命令。
+    #[serde(default)]
+    pub command_whitelist: Vec<String>,
     /// 是否按换行符拆分并逐段发送回复文本。
     pub split_reply_on_newlines: bool,
     /// 模拟回复时总随机等待的最大秒数。
@@ -74,6 +112,10 @@ fn default_ai_request_retry_count() -> u32 {
 
 fn default_ai_request_timeout_seconds() -> u64 {
     DEFAULT_AI_REQUEST_TIMEOUT_SECONDS
+}
+
+fn default_vision_image_message_window() -> usize {
+    DEFAULT_VISION_IMAGE_MESSAGE_WINDOW
 }
 
 fn default_enable_ai_filter() -> bool {
@@ -98,7 +140,7 @@ pub struct ServerSection {
 pub struct ProviderConfig {
     /// 服务商名称，用作唯一标识
     pub name: String,
-    /// 服务商类型，如 openai_compatible、anthropic 或 openrouter
+    /// 服务商类型，如 openai_compatible、google_aistudio 或 openrouter
     pub r#type: String,
     /// 服务商访问密钥
     pub key: String,
@@ -118,6 +160,29 @@ pub struct ModelConfig {
     pub max_tokens: i32,
     /// 推理强度，必填，如 none、minimal、low、medium、high、xhigh
     pub reasoning_effort: String,
+    /// 是否启用模型的图像输入能力；未配置时默认禁用。
+    #[serde(default)]
+    pub vision: ModelFeatureState,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelFeatureState {
+    Enable,
+    #[default]
+    Disable,
+}
+
+impl ModelFeatureState {
+    pub fn is_enabled(self) -> bool {
+        self == Self::Enable
+    }
+}
+
+/// 模型配置声明的输入与工具能力，不代表 Provider 会自动探测能力。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelCapabilities {
+    pub vision: ModelFeatureState,
 }
 
 pub struct AppConfig {
@@ -127,8 +192,12 @@ pub struct AppConfig {
     pub server: ServerSection,
     /// 按模型配置名称索引的 AI 模型实例
     pub ai_models: HashMap<String, Box<dyn AIProvider + Send + Sync>>,
+    /// 按模型配置名称索引的能力声明。
+    pub model_capabilities: HashMap<String, ModelCapabilities>,
     /// 提示词配置
     pub prompt_config: PromptConfig,
+    /// 日志输出配置。
+    pub logging: LoggingSection,
 }
 
 impl AppConfig {
@@ -139,6 +208,7 @@ impl AppConfig {
             server,
             providers,
             models,
+            logging,
         } = toml::from_str(&toml_str)?;
 
         let mut provider_configs = HashMap::new();
@@ -153,7 +223,14 @@ impl AppConfig {
         }
 
         let mut ai_models = HashMap::<String, Box<dyn AIProvider + Send + Sync>>::new();
+        let mut model_capabilities = HashMap::new();
         for model_config in models {
+            model_capabilities.insert(
+                model_config.name.clone(),
+                ModelCapabilities {
+                    vision: model_config.vision,
+                },
+            );
             let provider_config =
                 provider_configs
                     .get(&model_config.provider)
@@ -171,12 +248,6 @@ impl AppConfig {
                     model_config.model,
                     model_config.max_tokens,
                     model_config.reasoning_effort,
-                )),
-                "anthropic" => Box::new(AnthropicProvider::new(
-                    provider_config.key.clone(),
-                    provider_config.base_url.clone(),
-                    model_config.model,
-                    model_config.max_tokens,
                 )),
                 "openrouter" => Box::new(OpenRouterProvider::new(
                     provider_config.key.clone(),
@@ -220,13 +291,22 @@ impl AppConfig {
             app,
             server,
             ai_models,
+            model_capabilities,
             prompt_config,
+            logging,
         })
+    }
+
+    pub fn chat_model_supports_vision(&self) -> bool {
+        self.model_capabilities
+            .get(&self.app.chat_model_name)
+            .is_some_and(|capabilities| capabilities.vision.is_enabled())
     }
 }
 
 pub struct PromptConfig {
     pub system_prompt: String,
+    pub system_prompt_without_recognize_image: String,
     pub character_prompt: String,
     pub instruction_prompt: String,
     pub filter_prompt: String,
@@ -235,12 +315,18 @@ impl PromptConfig {
     pub fn new(app: &AppSection) -> Result<Self> {
         let prompt_dir = Path::new(&app.prompt_dir);
         let system_template = fs::read_to_string(prompt_dir.join("system.md"))?;
-        let enabled_actions_prompt = Self::load_enabled_action_prompts(app, prompt_dir)?;
+        let enabled_actions_prompt = Self::load_enabled_action_prompts(app, prompt_dir, None)?;
+        let actions_without_recognize_image =
+            Self::load_enabled_action_prompts(app, prompt_dir, Some("recognize_image"))?;
         let character_prompt = fs::read_to_string(prompt_dir.join("character.md"))?;
         let filter_template = fs::read_to_string(prompt_dir.join("filter.md"))?;
         let new_config = Self {
             system_prompt: system_template
                 .replace("{{enabled_actions}}", enabled_actions_prompt.trim()),
+            system_prompt_without_recognize_image: system_template.replace(
+                "{{enabled_actions}}",
+                actions_without_recognize_image.trim(),
+            ),
             character_prompt: character_prompt.clone(),
             instruction_prompt: fs::read_to_string(prompt_dir.join("instruction.md"))?,
             filter_prompt: filter_template.replace("{{character_prompt}}", character_prompt.trim()),
@@ -249,11 +335,15 @@ impl PromptConfig {
     }
 
     /// 按配置读取可选动作提示词，文件名必须与动作名一致。
-    fn load_enabled_action_prompts(app: &AppSection, prompt_dir: &Path) -> Result<String> {
+    fn load_enabled_action_prompts(
+        app: &AppSection,
+        prompt_dir: &Path,
+        excluded_action: Option<&str>,
+    ) -> Result<String> {
         let mut action_prompts = Vec::new();
         for action_name in &app.enabled_actions {
             let action_name = action_name.trim();
-            if action_name.is_empty() {
+            if action_name.is_empty() || excluded_action == Some(action_name) {
                 continue;
             }
             if action_name.contains('/') || action_name.contains('\\') || action_name.contains("..")

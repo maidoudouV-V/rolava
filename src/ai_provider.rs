@@ -1,11 +1,10 @@
-pub mod anthropic;
 pub mod google_aistudio;
 pub mod openai_compatible;
 pub mod openrouter;
 use crate::tools::{ToolCall, ToolDefinition, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -32,7 +31,8 @@ pub struct ChatUsage {
 }
 
 /// 工具调用下一轮需要原样回传的推理载荷。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ReasoningPayload {
     Text(String),
     Structured(Value),
@@ -64,16 +64,18 @@ pub struct ChatResponse {
 }
 
 /// 支持 function tools 的通用对话消息。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
 pub enum ToolChatMessage {
     System {
         content: String,
     },
     User {
-        content: String,
+        content: ToolChatUserContent,
     },
     Assistant {
         content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning: Option<ReasoningPayload>,
         tool_calls: Vec<ToolCall>,
     },
@@ -83,6 +85,56 @@ pub enum ToolChatMessage {
     },
 }
 
+/// 用户消息始终按原始顺序保存内容块，Provider 再决定序列化为字符串或数组。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ToolChatUserContent(Vec<ToolChatContentPart>);
+
+impl ToolChatUserContent {
+    pub fn text(content: impl Into<String>) -> Self {
+        Self(vec![ToolChatContentPart::Text {
+            text: content.into(),
+        }])
+    }
+
+    pub fn from_parts(parts: Vec<ToolChatContentPart>) -> Self {
+        Self(parts)
+    }
+
+    /// 追加文本时合并相邻文本片段，避免请求结构无意义膨胀。
+    pub fn push_text(&mut self, text: &str) {
+        match self.0.last_mut() {
+            Some(ToolChatContentPart::Text { text: content }) => content.push_str(text),
+            _ => self.0.push(ToolChatContentPart::Text {
+                text: text.to_string(),
+            }),
+        }
+    }
+
+    pub fn push_image(&mut self, data_url: String) {
+        self.0.push(ToolChatContentPart::Image { data_url });
+    }
+
+    /// 纯文本消息在兼容接口中仍使用字符串格式，避免强制要求多模态数组支持。
+    pub fn as_text(&self) -> Option<&str> {
+        match self.0.as_slice() {
+            [ToolChatContentPart::Text { text }] => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn parts(&self) -> &[ToolChatContentPart] {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChatContentPart {
+    Text { text: String },
+    Image { data_url: String },
+}
+
 impl From<&ContextMessage> for ToolChatMessage {
     fn from(message: &ContextMessage) -> Self {
         match &message.role {
@@ -90,7 +142,7 @@ impl From<&ContextMessage> for ToolChatMessage {
                 content: message.content.clone(),
             },
             MessageRole::User => Self::User {
-                content: message.content.clone(),
+                content: ToolChatUserContent::text(message.content.clone()),
             },
             MessageRole::Assistant => Self::Assistant {
                 content: Some(message.content.clone()),
@@ -164,10 +216,15 @@ pub(crate) fn context_messages_without_tools(
                 role: MessageRole::System,
                 content: content.clone(),
             }),
-            ToolChatMessage::User { content } => Ok(ContextMessage {
-                role: MessageRole::User,
-                content: content.clone(),
-            }),
+            ToolChatMessage::User { content } => {
+                let content = content
+                    .as_text()
+                    .ok_or_else(|| anyhow::anyhow!("当前服务商尚未支持多模态用户消息"))?;
+                Ok(ContextMessage {
+                    role: MessageRole::User,
+                    content: content.to_string(),
+                })
+            }
             ToolChatMessage::Assistant {
                 content,
                 tool_calls,

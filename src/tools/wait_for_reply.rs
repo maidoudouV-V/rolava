@@ -7,13 +7,13 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, info_span, Instrument};
 
 use crate::conversation_trigger::ConversationTrigger;
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
 const DESCRIPTION: &str = r#"等待指定秒数，如果指定目标在此期间没有发送任何消息，系统将触发模型调用。
-当对方在指定时间内发言，此定时触发任务将自动取消。
 重复调用时，会以目标用户为键值覆盖老任务。
 当需要等待对方回复时使用，适合等待对方回答或确认。"#;
 
@@ -87,6 +87,11 @@ impl Tool for WaitForReplyTool {
         })
     }
 
+    fn reset_conversation_state(&self) {
+        // 清空目标映射后，已经休眠的后台任务会在醒来时自行退出。
+        self.pending_tasks.lock().targets.clear();
+    }
+
     async fn execute(&self, context: &ToolContext, arguments: &str) -> Result<ToolOutput> {
         let arguments: WaitForReplyArgs = parse_arguments(self.name(), arguments)?;
         let target = arguments.target.trim().to_string();
@@ -114,14 +119,12 @@ impl Tool for WaitForReplyTool {
         let pending_tasks = self.pending_tasks.clone();
         let db_manager = context.services.db_manager.clone();
         let trigger_sender = context.conversation.trigger_sender.clone();
-        let conversation_messages = context.conversation.current_messages.clone();
         let task_target = target.clone();
 
-        println!(
-            "会话 {} 开始等待 {} 回复，最长 {} 秒，原因：{}",
-            context.conversation.key, target, timeout_seconds, reason
-        );
+        info!(target = %target, timeout_seconds, "已创建等待回复任务");
+        debug!(target = %target, reason = %reason, "等待回复原因");
 
+        let task_span = info_span!("wait_for_reply", target = %target, timeout_seconds);
         tokio::spawn(async move {
             sleep(Duration::from_secs(timeout_seconds)).await;
 
@@ -151,7 +154,7 @@ impl Tool for WaitForReplyTool {
 
             match replied {
                 Ok(true) => {
-                    println!("{} 已在等待期间回复，不再触发模型", task_target);
+                    info!("目标已在等待期间回复，不再触发模型");
                 }
                 Ok(false) => {
                     let user_prompt = format!(
@@ -159,17 +162,18 @@ impl Tool for WaitForReplyTool {
                         task_target, reason
                     );
                     if let Err(error) = trigger_sender.send_trigger(ConversationTrigger {
-                        conversation_messages,
                         user_prompt,
                     }) {
-                        eprintln!("等待 {} 回复到期后触发会话失败：{}", task_target, error);
+                        error!(error = %error, "等待回复到期后触发会话失败");
+                    } else {
+                        info!("等待回复到期，已触发会话");
                     }
                 }
                 Err(error) => {
-                    eprintln!("检查 {} 是否在等待期间回复失败：{}", task_target, error);
+                    error!(error = %error, "检查目标是否在等待期间回复失败");
                 }
             }
-        });
+        }.instrument(task_span));
 
         Ok(ToolOutput::text(format!(
             "等待 {} 回复的任务添加成功",
@@ -180,7 +184,7 @@ impl Tool for WaitForReplyTool {
 
 #[cfg(test)]
 mod tests {
-    use super::WaitForReplyTool;
+    use super::{Tool, WaitForReplyTool};
 
     #[test]
     fn same_target_is_replaced_and_different_targets_coexist() {
@@ -197,5 +201,8 @@ mod tests {
             Some(&second_id)
         );
         assert_eq!(tool.pending_tasks.lock().targets.len(), 2);
+
+        tool.reset_conversation_state();
+        assert!(tool.pending_tasks.lock().targets.is_empty());
     }
 }

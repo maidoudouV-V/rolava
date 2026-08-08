@@ -4,7 +4,7 @@ use crate::transport::message::{
     Conversation, ConversationKind, IncomingMessage, MessageContent, MessagePart, MessageTarget,
     Participant,
 };
-use crate::transport::{MessageSender, SendOptions};
+use crate::transport::{MessageSender, SendOptions, SentMessage};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use axum::extract::State;
@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, warn};
 
 const RAW_MESSAGE_CHANNEL_CAPACITY: usize = 128;
 
@@ -733,8 +734,14 @@ impl OneBotMessageSender {
             .collect()
     }
 
-    async fn send_text_segment(&self, target: &MessageTarget, text: &str) -> Result<()> {
+    async fn send_text_segment(
+        &self,
+        target: &MessageTarget,
+        text: &str,
+        persist: bool,
+    ) -> Result<Option<SentMessage>> {
         let (api_path, conversation_kind, payload) = Self::request_parts(target, text);
+        debug!(api_path, payload = %payload, "OneBot 发送消息请求");
         let mut request = self
             .client
             .post(format!("{}/{}", self.onebot_api_url, api_path))
@@ -749,16 +756,13 @@ impl OneBotMessageSender {
             .context("调用 OneBot 发送消息接口失败")?;
         let http_status = response.status();
         let response_text = response.text().await.context("读取 OneBot 发送响应失败")?;
+        debug!(status = %http_status, response = %response_text, "OneBot 发送消息原始响应");
         if !http_status.is_success() {
-            bail!(
-                "OneBot 发送消息接口返回 HTTP {}：{}",
-                http_status,
-                response_text
-            );
+            bail!("OneBot 发送消息接口返回 HTTP {}", http_status);
         }
 
-        let response: OneBotSendMessageResponse = serde_json::from_str(&response_text)
-            .with_context(|| format!("解析 OneBot 发送响应失败：{}", response_text))?;
+        let response: OneBotSendMessageResponse =
+            serde_json::from_str(&response_text).context("解析 OneBot 发送响应失败")?;
         if response.status != "ok" || response.retcode != 0 {
             bail!(
                 "OneBot 发送消息失败，status={}，retcode={}：{}",
@@ -766,6 +770,14 @@ impl OneBotMessageSender {
                 response.retcode,
                 Self::response_error(&response)
             );
+        }
+
+        if !persist {
+            info!(
+                conversation_id = %target.conversation.id,
+                "OneBot 临时消息发送成功"
+            );
+            return Ok(None);
         }
 
         let source_message_id = response
@@ -803,11 +815,21 @@ impl OneBotMessageSender {
             .to_string(),
             event_timestamp: Utc::now().timestamp(),
         };
-        self.db_manager
+        let stored_message = self
+            .db_manager
             .write_message(&outgoing_message)
             .context("消息已发送，但写入聊天记录失败")?;
+        info!(
+            conversation_kind,
+            conversation_id = %target.conversation.id,
+            message_id = stored_message.id,
+            "OneBot 消息发送并入库成功"
+        );
 
-        Ok(())
+        Ok(Some(SentMessage {
+            database_id: stored_message.id,
+            text: text.to_string(),
+        }))
     }
 }
 
@@ -818,7 +840,7 @@ impl MessageSender for OneBotMessageSender {
         target: &MessageTarget,
         text: &str,
         options: SendOptions,
-    ) -> Result<()> {
+    ) -> Result<Vec<SentMessage>> {
         if target.source != "onebot" {
             bail!("OneBot 发送器不支持消息来源：{}", target.source);
         }
@@ -829,13 +851,34 @@ impl MessageSender for OneBotMessageSender {
 
         let delay = self.reply_delay(options);
         if !delay.is_zero() {
+            debug!(delay_ms = delay.as_millis(), "等待消息发送延时");
             sleep(delay).await;
         }
 
+        let mut sent_messages = Vec::with_capacity(segments.len());
         for segment in segments {
-            self.send_text_segment(target, segment).await?;
+            let sent_message = self
+                .send_text_segment(target, segment, true)
+                .await?
+                .expect("持久化发送必须返回数据库消息");
+            sent_messages.push(sent_message);
         }
 
+        Ok(sent_messages)
+    }
+
+    async fn send_transient_text(&self, target: &MessageTarget, text: &str) -> Result<()> {
+        if target.source != "onebot" {
+            bail!("OneBot 发送器不支持消息来源：{}", target.source);
+        }
+        let segments = Self::text_segments(text, self.split_reply_on_newlines);
+        if segments.is_empty() {
+            bail!("不能发送空消息");
+        }
+
+        for segment in segments {
+            self.send_text_segment(target, segment, false).await?;
+        }
         Ok(())
     }
 }
@@ -1005,10 +1048,7 @@ impl OneBotHttpServer {
         let resp = match request.send().await {
             Ok(resp) => resp,
             Err(err) => {
-                eprintln!(
-                    "查询群成员信息失败: group_id={}, user_id={}, err={}",
-                    group_id, user_id, err
-                );
+                warn!(group_id, user_id, error = %err, "查询群成员信息失败");
                 return None;
             }
         };
@@ -1018,17 +1058,16 @@ impl OneBotHttpServer {
         {
             Ok(result) => result,
             Err(err) => {
-                eprintln!(
-                    "解析群成员信息失败: group_id={}, user_id={}, err={}",
-                    group_id, user_id, err
-                );
+                warn!(group_id, user_id, error = %err, "解析群成员信息失败");
                 return None;
             }
         };
         if result.retcode != 0 {
-            eprintln!(
-                "查询群成员信息返回错误: group_id={}, user_id={}, retcode={}",
-                group_id, user_id, result.retcode
+            warn!(
+                group_id,
+                user_id,
+                retcode = result.retcode,
+                "查询群成员信息返回错误"
             );
             return None;
         }
@@ -1074,13 +1113,13 @@ impl OneBotHttpServer {
         let app = Router::new()
             .route("/", post(on_event))
             .with_state(shared_state);
-        println!("{}", log_out);
+        info!(address = %log_out, "OneBot HTTP 服务已启动");
 
         let forward_messages = async move {
             while let Some(message) = raw_message_rx.recv().await {
                 let incoming_message = message.into_incoming_message(&server).await;
                 if let Err(err) = server.message_tx.send(incoming_message).await {
-                    eprintln!("OneBot 消息发送到平台通道失败: {}", err);
+                    error!(error = %err, "OneBot 消息发送到平台通道失败");
                     break;
                 }
             }
@@ -1088,7 +1127,7 @@ impl OneBotHttpServer {
 
         tokio::select! {
             result = axum::serve(listener, app) => result.unwrap(),
-            _ = forward_messages => eprintln!("OneBot 消息转发任务已停止"),
+            _ = forward_messages => warn!("OneBot 消息转发任务已停止"),
         }
     }
 }
@@ -1104,7 +1143,7 @@ async fn on_event(
     match state.message_tx.send(message).await {
         Ok(()) => StatusCode::OK,
         Err(err) => {
-            eprintln!("OneBot 原始消息进入转换队列失败: {}", err);
+            error!(error = %err, "OneBot 原始消息进入转换队列失败");
             StatusCode::SERVICE_UNAVAILABLE
         }
     }

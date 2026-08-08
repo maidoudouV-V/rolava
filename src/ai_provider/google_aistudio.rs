@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::debug;
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -77,6 +78,8 @@ struct GeminiGenerationConfig {
     max_output_tokens: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_mime_type: Option<&'static str>,
+    #[serde(rename = "mediaResolution", skip_serializing_if = "Option::is_none")]
+    media_resolution: Option<&'static str>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -112,8 +115,6 @@ struct GeminiCandidate {
     content: Option<GeminiResponseContent>,
     #[serde(rename = "finishReason")]
     finish_reason: Option<String>,
-    #[serde(rename = "groundingMetadata")]
-    grounding_metadata: Option<GeminiGroundingMetadata>,
 }
 
 #[derive(Deserialize)]
@@ -124,25 +125,6 @@ struct GeminiResponseContent {
 #[derive(Deserialize)]
 struct GeminiResponsePart {
     text: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GeminiGroundingMetadata {
-    #[serde(rename = "webSearchQueries")]
-    web_search_queries: Option<Vec<String>>,
-    #[serde(rename = "groundingChunks")]
-    grounding_chunks: Option<Vec<GeminiGroundingChunk>>,
-}
-
-#[derive(Deserialize)]
-struct GeminiGroundingChunk {
-    web: Option<GeminiGroundingWeb>,
-}
-
-#[derive(Deserialize)]
-struct GeminiGroundingWeb {
-    uri: Option<String>,
-    title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -174,18 +156,20 @@ impl AIProvider for GoogleAIStudioProvider {
             generation_config: GeminiGenerationConfig {
                 max_output_tokens: self.max_tokens,
                 response_mime_type: Some("text/plain"),
+                media_resolution: None,
             },
         };
+        debug!(
+            provider = "google_aistudio",
+            model = %self.model,
+            request = %serde_json::to_string_pretty(&body)
+                .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
+            "AI Provider 完整请求"
+        );
         let response_text = self.send_generate_content(&body).await?;
         let raw_response: Value = serde_json::from_str(&response_text)?;
-        let parsed: GeminiGenerateContentResponse =
-            serde_json::from_str(&response_text).map_err(|err| {
-                anyhow!(
-                    "解析 Google AI Studio 响应失败：{}\n原始响应：\n{}",
-                    err,
-                    response_text
-                )
-            })?;
+        let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
+            .map_err(|err| anyhow!("解析 Google AI Studio 响应失败：{}", err))?;
         let content =
             extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Google AI Studio 响应内容为空"))?;
         let finish_reason = parsed
@@ -213,6 +197,8 @@ impl AIProvider for GoogleAIStudioProvider {
 
     async fn describe_image(&self, image_data_url: &str, prompt: &str) -> anyhow::Result<String> {
         let image = parse_data_url(image_data_url)?;
+        let image_data_bytes = image.data.len();
+        let image_mime_type = image.mime_type.clone();
         let body = GeminiGenerateContentRequest {
             system_instruction: None,
             contents: vec![GeminiContent {
@@ -232,18 +218,21 @@ impl AIProvider for GoogleAIStudioProvider {
             generation_config: GeminiGenerationConfig {
                 max_output_tokens: self.max_tokens,
                 response_mime_type: None,
+                media_resolution: Some("MEDIA_RESOLUTION_HIGH"),
             },
         };
+        debug!(
+            provider = "google_aistudio",
+            model = %self.model,
+            prompt,
+            image_data_bytes,
+            mime_type = %image_mime_type,
+            "视觉 Provider 请求"
+        );
 
         let response_text = self.send_generate_content(&body).await?;
-        let parsed: GeminiGenerateContentResponse =
-            serde_json::from_str(&response_text).map_err(|err| {
-                anyhow!(
-                    "解析 Google AI Studio 视觉响应失败：{}\n原始响应：\n{}",
-                    err,
-                    response_text
-                )
-            })?;
+        let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
+            .map_err(|err| anyhow!("解析 Google AI Studio 视觉响应失败：{}", err))?;
         extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Google AI Studio 视觉响应内容为空"))
     }
 
@@ -280,21 +269,23 @@ impl AIProvider for GoogleAIStudioProvider {
             generation_config: GeminiGenerationConfig {
                 max_output_tokens: self.max_tokens,
                 response_mime_type: None,
+                media_resolution: None,
             },
         };
+        debug!(
+            provider = "google_aistudio",
+            model = %self.model,
+            request = %serde_json::to_string_pretty(&body)
+                .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
+            "联网搜索 Provider 完整请求"
+        );
 
         let response_text = self.send_generate_content(&body).await?;
-        let parsed: GeminiGenerateContentResponse =
-            serde_json::from_str(&response_text).map_err(|err| {
-                anyhow!(
-                    "解析 Google AI Studio 联网搜索响应失败：{}\n原始响应：\n{}",
-                    err,
-                    response_text
-                )
-            })?;
+        let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
+            .map_err(|err| anyhow!("解析 Google AI Studio 联网搜索响应失败：{}", err))?;
         let answer = extract_gemini_text(&parsed)
             .ok_or_else(|| anyhow!("Google AI Studio 联网搜索响应内容为空"))?;
-        Ok(format_grounded_search_result(answer, &parsed))
+        Ok(answer)
     }
 }
 
@@ -312,17 +303,14 @@ impl GoogleAIStudioProvider {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "Google AI Studio API 调用失败，状态码 {}：{}",
-                status,
-                error_text
-            ));
+        let status = resp.status();
+        let response_text = resp.text().await?;
+        debug!(provider = "google_aistudio", status = %status, response = %response_text, "AI Provider 原始响应");
+        if !status.is_success() {
+            return Err(anyhow!("Google AI Studio API 调用失败，状态码 {}", status));
         }
 
-        Ok(resp.text().await?)
+        Ok(response_text)
     }
 }
 
@@ -404,69 +392,6 @@ fn extract_gemini_text(response: &GeminiGenerateContentResponse) -> Option<Strin
         None
     } else {
         Some(text)
-    }
-}
-
-fn format_grounded_search_result(
-    answer: String,
-    response: &GeminiGenerateContentResponse,
-) -> String {
-    let answer = limit_chars(answer.trim(), 900);
-    let Some(metadata) = response
-        .candidates
-        .as_ref()
-        .and_then(|candidates| candidates.first())
-        .and_then(|candidate| candidate.grounding_metadata.as_ref())
-    else {
-        return answer;
-    };
-
-    let mut sections = vec![answer];
-    if let Some(queries) = metadata
-        .web_search_queries
-        .as_ref()
-        .filter(|queries| !queries.is_empty())
-    {
-        sections.push(format!("搜索词：{}", queries.join("；")));
-    }
-    let sources = metadata
-        .grounding_chunks
-        .as_ref()
-        .map(|chunks| {
-            chunks
-                .iter()
-                .filter_map(|chunk| chunk.web.as_ref())
-                .filter_map(|web| {
-                    let uri = web.uri.as_deref()?.trim();
-                    if uri.is_empty() {
-                        return None;
-                    }
-                    let title = web
-                        .title
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|title| !title.is_empty())
-                        .unwrap_or("来源");
-                    Some(format!("{}：{}", title, uri))
-                })
-                .take(3)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if !sources.is_empty() {
-        sections.push(format!("来源：\n{}", sources.join("\n")));
-    }
-
-    limit_chars(&sections.join("\n"), 1400)
-}
-
-fn limit_chars(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let limited: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{}...", limited)
-    } else {
-        limited
     }
 }
 

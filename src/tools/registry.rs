@@ -4,9 +4,9 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 
 use super::{
-    CancelScheduledTaskTool, ContinueConversationTool, EndConversationTool, RecognizeImageTool,
-    RememberTool, ScheduleTaskTool, Tool, ToolCall, ToolContext, ToolDefinition, ToolResult,
-    WaitForReplyTool, WebSearchTool,
+    AgentWebSearchTool, ContinueConversationTool, CreateScheduledTaskTool, DeleteScheduledTaskTool,
+    EndConversationTool, GetScheduledTaskTool, RecognizeImageTool, RememberTool, Tool, ToolCall,
+    ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool, WaitForReplyTool,
 };
 
 /// 已注册工具的稳定有序集合。
@@ -25,11 +25,13 @@ impl ToolRegistry {
         let mut registry = Self::new();
         // registry.register(super::SendMessageTool).unwrap();
         registry.register(RecognizeImageTool).unwrap();
-        registry.register(WebSearchTool).unwrap();
+        registry.register(AgentWebSearchTool).unwrap();
         registry.register(RememberTool).unwrap();
         registry.register(WaitForReplyTool::new()).unwrap();
-        registry.register(ScheduleTaskTool).unwrap();
-        registry.register(CancelScheduledTaskTool).unwrap();
+        registry.register(CreateScheduledTaskTool).unwrap();
+        registry.register(GetScheduledTaskTool).unwrap();
+        registry.register(UpdateScheduledTaskTool).unwrap();
+        registry.register(DeleteScheduledTaskTool).unwrap();
         registry.register(ContinueConversationTool).unwrap();
         registry.register(EndConversationTool).unwrap();
         registry
@@ -51,8 +53,24 @@ impl ToolRegistry {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
 
+    /// 为特定模型请求排除不适用的工具，工具本身仍保留在注册表中。
+    pub fn definitions_excluding(&self, excluded_names: &[&str]) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .filter(|(name, _)| !excluded_names.contains(name))
+            .map(|(_, tool)| tool.definition())
+            .collect()
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// 重置所有工具持有的当前会话临时状态。
+    pub fn reset_conversation_state(&self) {
+        for tool in self.tools.values() {
+            tool.reset_conversation_state();
+        }
     }
 
     /// 根据调用名称执行对应工具，并把成功或错误统一转换为工具结果。
@@ -96,14 +114,16 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "cancel_scheduled_task",
+                "agent_web_search",
                 "continue_conversation",
+                "create_scheduled_task",
+                "delete_scheduled_task",
                 "end_conversation",
+                "get_scheduled_task",
                 "recognize_image",
                 "remember",
-                "schedule_task",
+                "update_scheduled_task",
                 "wait_for_reply",
-                "web_search",
             ]
         );
     }

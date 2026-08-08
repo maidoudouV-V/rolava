@@ -1,5 +1,6 @@
 use crate::ai_provider::{
-    AIProvider, ChatUsage, ReasoningPayload, ReasoningState, ToolChatMessage, ToolChatResponse,
+    AIProvider, ChatUsage, ReasoningPayload, ReasoningState, ToolChatContentPart, ToolChatMessage,
+    ToolChatResponse, ToolChatUserContent,
 };
 use crate::tools::{ToolCall, ToolDefinition};
 use anyhow::{anyhow, bail};
@@ -7,9 +8,12 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::debug;
 
 /// 视觉识别只做图片转写，固定使用最低推理强度。
 const VISION_REASONING_EFFORT: &str = "minimal";
+/// 官方 Web Search 的平衡档搜索上下文大小。
+const WEB_SEARCH_CONTEXT_SIZE: &str = "medium";
 
 // ========== OpenAI Compatible 接口 ==========
 pub struct OpenAICompatibleProvider {
@@ -74,7 +78,7 @@ enum OpenAICompatibleToolMessage<'a> {
         content: &'a str,
     },
     User {
-        content: &'a str,
+        content: OpenAICompatibleUserContent<'a>,
     },
     Assistant {
         content: Option<&'a str>,
@@ -86,6 +90,24 @@ enum OpenAICompatibleToolMessage<'a> {
     Tool {
         tool_call_id: &'a str,
         content: &'a str,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum OpenAICompatibleUserContent<'a> {
+    Text(&'a str),
+    Parts(Vec<OpenAICompatibleUserContentPart<'a>>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAICompatibleUserContentPart<'a> {
+    Text {
+        text: &'a str,
+    },
+    ImageUrl {
+        image_url: OpenAICompatibleImageUrl<'a>,
     },
 }
 
@@ -132,6 +154,20 @@ enum OpenAICompatibleVisionContent<'a> {
 #[derive(Serialize)]
 struct OpenAICompatibleImageUrl<'a> {
     url: &'a str,
+    detail: &'static str,
+}
+
+/// OpenAI Chat Completions 官方 Web Search 请求结构。
+#[derive(Serialize)]
+struct OpenAICompatibleWebSearchRequest<'a> {
+    model: &'a str,
+    messages: Vec<OpenAICompatibleToolMessage<'a>>,
+    web_search_options: OpenAICompatibleWebSearchOptions,
+}
+
+#[derive(Serialize)]
+struct OpenAICompatibleWebSearchOptions {
+    search_context_size: &'static str,
 }
 
 /// OpenAI Compatible 响应结构
@@ -192,7 +228,7 @@ fn build_openai_compatible_request<'a>(
                 content: content.as_str(),
             },
             ToolChatMessage::User { content } => OpenAICompatibleToolMessage::User {
-                content: content.as_str(),
+                content: openai_user_content(content),
             },
             ToolChatMessage::Assistant {
                 content,
@@ -251,6 +287,32 @@ fn build_openai_compatible_request<'a>(
     }
 }
 
+fn openai_user_content(content: &ToolChatUserContent) -> OpenAICompatibleUserContent<'_> {
+    if let Some(text) = content.as_text() {
+        OpenAICompatibleUserContent::Text(text)
+    } else {
+        OpenAICompatibleUserContent::Parts(
+            content
+                .parts()
+                .iter()
+                .map(|part| match part {
+                    ToolChatContentPart::Text { text } => {
+                        OpenAICompatibleUserContentPart::Text { text }
+                    }
+                    ToolChatContentPart::Image { data_url } => {
+                        OpenAICompatibleUserContentPart::ImageUrl {
+                            image_url: OpenAICompatibleImageUrl {
+                                url: data_url,
+                                detail: "high",
+                            },
+                        }
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
 #[async_trait]
 impl AIProvider for OpenAICompatibleProvider {
     async fn chat_completions(
@@ -266,6 +328,13 @@ impl AIProvider for OpenAICompatibleProvider {
             messages,
             tools,
         );
+        debug!(
+            provider = "openai_compatible",
+            model = %self.model,
+            request = %serde_json::to_string_pretty(&body)
+                .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
+            "AI Provider 完整请求"
+        );
         let resp = self
             .http_client
             .post(url)
@@ -277,14 +346,12 @@ impl AIProvider for OpenAICompatibleProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "OpenAI Compatible API 调用失败，状态码 {}：{}",
-                status,
-                error_text
-            ));
+            debug!(provider = "openai_compatible", status = %status, response = %error_text, "AI Provider 原始错误响应");
+            return Err(anyhow!("OpenAI Compatible API 调用失败，状态码 {}", status));
         }
 
         let response_text = resp.text().await?;
+        debug!(provider = "openai_compatible", response = %response_text, "AI Provider 原始响应");
         parse_openai_compatible_chat_response(&response_text)
     }
 
@@ -299,6 +366,7 @@ impl AIProvider for OpenAICompatibleProvider {
                     OpenAICompatibleVisionContent::ImageUrl {
                         image_url: OpenAICompatibleImageUrl {
                             url: image_data_url,
+                            detail: "high",
                         },
                     },
                 ],
@@ -306,6 +374,13 @@ impl AIProvider for OpenAICompatibleProvider {
             max_tokens: self.max_tokens,
             reasoning_effort: VISION_REASONING_EFFORT,
         };
+        debug!(
+            provider = "openai_compatible",
+            model = %self.model,
+            prompt,
+            image_data_url_bytes = image_data_url.len(),
+            "视觉 Provider 请求"
+        );
 
         let resp = self
             .http_client
@@ -318,40 +393,82 @@ impl AIProvider for OpenAICompatibleProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
+            debug!(provider = "openai_compatible", status = %status, response = %error_text, "视觉 Provider 原始错误响应");
             return Err(anyhow!(
-                "OpenAI Compatible 视觉 API 调用失败，状态码 {}：{}",
-                status,
-                error_text
+                "OpenAI Compatible 视觉 API 调用失败，状态码 {}",
+                status
             ));
         }
 
         let response_text = resp.text().await?;
+        debug!(provider = "openai_compatible", response = %response_text, "视觉 Provider 原始响应");
         let parsed =
             parse_openai_compatible_response(&response_text, "OpenAI Compatible 视觉响应")?;
         first_choice(&parsed, &response_text, "OpenAI Compatible 视觉响应")?
             .message
             .content
             .clone()
-            .ok_or_else(|| {
-                anyhow!(
-                    "OpenAI Compatible 视觉响应内容为空\n原始响应：\n{}",
-                    response_text
-                )
-            })
+            .ok_or_else(|| anyhow!("OpenAI Compatible 视觉响应内容为空"))
+    }
+
+    async fn web_search(&self, query: &str) -> anyhow::Result<String> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let body = OpenAICompatibleWebSearchRequest {
+            model: &self.model,
+            messages: vec![OpenAICompatibleToolMessage::User {
+                content: OpenAICompatibleUserContent::Text(query),
+            }],
+            web_search_options: OpenAICompatibleWebSearchOptions {
+                search_context_size: WEB_SEARCH_CONTEXT_SIZE,
+            },
+        };
+        debug!(
+            provider = "openai_compatible",
+            model = %self.model,
+            request = %serde_json::to_string_pretty(&body)
+                .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
+            "联网搜索 Provider 完整请求"
+        );
+
+        let resp = self
+            .http_client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_text = resp.text().await.unwrap_or_default();
+            debug!(provider = "openai_compatible", status = %status, response = %error_text, "联网搜索 Provider 原始错误响应");
+            return Err(anyhow!(
+                "OpenAI Compatible 联网搜索 API 调用失败，状态码 {}",
+                status
+            ));
+        }
+
+        let response_text = resp.text().await?;
+        debug!(provider = "openai_compatible", response = %response_text, "联网搜索 Provider 原始响应");
+        let parsed =
+            parse_openai_compatible_response(&response_text, "OpenAI Compatible 联网搜索响应")?;
+        let choice = first_choice(&parsed, &response_text, "OpenAI Compatible 联网搜索响应")?;
+        choice
+            .message
+            .content
+            .as_deref()
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("OpenAI Compatible 联网搜索响应内容为空"))
     }
 }
 
 fn parse_openai_compatible_chat_response(response_text: &str) -> anyhow::Result<ToolChatResponse> {
     let response_name = "OpenAI Compatible 响应";
     let parsed = parse_openai_compatible_response(response_text, response_name)?;
-    let raw_response: Value = serde_json::from_str(response_text).map_err(|error| {
-        anyhow!(
-            "解析{}原始 JSON 失败：{}\n原始响应：\n{}",
-            response_name,
-            error,
-            response_text
-        )
-    })?;
+    let raw_response: Value = serde_json::from_str(response_text)
+        .map_err(|error| anyhow!("解析{}原始 JSON 失败：{}", response_name, error))?;
     let first_choice = first_choice(&parsed, response_text, response_name)?;
     let content = first_choice.message.content.clone();
     let reasoning_content = first_choice.message.reasoning_content.clone();
@@ -364,12 +481,7 @@ fn parse_openai_compatible_chat_response(response_text: &str) -> anyhow::Result<
         .unwrap_or_default()
     {
         if call.call_type != "function" {
-            bail!(
-                "{}包含不支持的工具类型：{}\n原始响应：\n{}",
-                response_name,
-                call.call_type,
-                response_text
-            );
+            bail!("{}包含不支持的工具类型：{}", response_name, call.call_type);
         }
         tool_calls.push(ToolCall {
             id: call.id.clone(),
@@ -379,10 +491,9 @@ fn parse_openai_compatible_chat_response(response_text: &str) -> anyhow::Result<
     }
     if content.is_none() && tool_calls.is_empty() && finish_reason.as_deref() != Some("stop") {
         bail!(
-            "{}既没有文本内容，也没有 tool_calls，且 finish_reason 不是 stop（当前：{:?}）\n原始响应：\n{}",
+            "{}既没有文本内容，也没有 tool_calls，且 finish_reason 不是 stop（当前：{:?}）",
             response_name,
-            finish_reason,
-            response_text
+            finish_reason
         );
     }
 
@@ -411,14 +522,8 @@ fn parse_openai_compatible_response(
     response_text: &str,
     response_name: &str,
 ) -> anyhow::Result<OpenAICompatibleChatResponse> {
-    serde_json::from_str(response_text).map_err(|e| {
-        anyhow!(
-            "解析{}失败：{}\n原始响应：\n{}",
-            response_name,
-            e,
-            response_text
-        )
-    })
+    serde_json::from_str(response_text)
+        .map_err(|error| anyhow!("解析{}失败：{}", response_name, error))
 }
 
 #[cfg(test)]
@@ -502,26 +607,81 @@ mod tests {
 
         assert!(error.to_string().contains("finish_reason 不是 stop"));
     }
+
+    #[test]
+    fn web_search_request_uses_official_medium_context_option() {
+        let request = OpenAICompatibleWebSearchRequest {
+            model: "gpt-5-search-api",
+            messages: vec![OpenAICompatibleToolMessage::User {
+                content: OpenAICompatibleUserContent::Text("今天有什么新闻？"),
+            }],
+            web_search_options: OpenAICompatibleWebSearchOptions {
+                search_context_size: WEB_SEARCH_CONTEXT_SIZE,
+            },
+        };
+        let request_json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(request_json["model"], "gpt-5-search-api");
+        assert_eq!(request_json["messages"][0]["role"], "user");
+        assert_eq!(
+            request_json["web_search_options"]["search_context_size"],
+            "medium"
+        );
+    }
+
+    #[test]
+    fn plain_text_user_message_stays_string() {
+        let messages = vec![ToolChatMessage::User {
+            content: ToolChatUserContent::text("纯文本"),
+        }];
+
+        let request = build_openai_compatible_request("test", 100, "medium", &messages, &[]);
+        let request_json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(request_json["messages"][0]["content"], "纯文本");
+    }
+
+    #[test]
+    fn multimodal_user_message_uses_high_detail_image_url() {
+        let messages = vec![ToolChatMessage::User {
+            content: ToolChatUserContent::from_parts(vec![
+                ToolChatContentPart::Text {
+                    text: "看看这张图".to_string(),
+                },
+                ToolChatContentPart::Image {
+                    data_url: "data:image/jpeg;base64,abc".to_string(),
+                },
+            ]),
+        }];
+
+        let request = build_openai_compatible_request("test", 100, "medium", &messages, &[]);
+        let request_json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(request_json["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(
+            request_json["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/jpeg;base64,abc"
+        );
+        assert_eq!(
+            request_json["messages"][0]["content"][1]["image_url"]["detail"],
+            "high"
+        );
+    }
 }
 
 fn first_choice<'a>(
     response: &'a OpenAICompatibleChatResponse,
-    response_text: &str,
+    _response_text: &str,
     response_name: &str,
 ) -> anyhow::Result<&'a OpenAICompatibleChoice> {
     let Some(choices) = response.choices.as_ref() else {
         return Err(anyhow!(
-            "{}缺少 choices 数组，可能是上游返回了 choices=null 或错误体。\n原始响应：\n{}",
-            response_name,
-            response_text
+            "{}缺少 choices 数组，可能是上游返回了 choices=null 或错误体。",
+            response_name
         ));
     };
 
-    choices.get(0).ok_or_else(|| {
-        anyhow!(
-            "{}的 choices 为空。\n原始响应：\n{}",
-            response_name,
-            response_text
-        )
-    })
+    choices
+        .first()
+        .ok_or_else(|| anyhow!("{}的 choices 为空。", response_name))
 }
