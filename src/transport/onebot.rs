@@ -24,6 +24,8 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 const RAW_MESSAGE_CHANNEL_CAPACITY: usize = 128;
+const FOLLOWUP_SEGMENT_DELAY_PER_CHAR_MS: u64 = 100;
+const FOLLOWUP_SEGMENT_MAX_DELAY: Duration = Duration::from_secs(6);
 
 /// OneBot 原始上报事件 DTO。
 /// 直接对应 OneBot 的 HTTP 上报 JSON，通过 `post_type` 区分事件大类。
@@ -683,6 +685,17 @@ impl OneBotMessageSender {
         total_delay.saturating_sub(elapsed)
     }
 
+    /// 后续分段在随机延时上按实际字符数追加打字时间，并限制总延时最多六秒。
+    fn followup_segment_delay(random_delay: Duration, text: &str) -> Duration {
+        let character_count = u64::try_from(text.chars().count()).unwrap_or(u64::MAX);
+        let typing_delay = Duration::from_millis(
+            character_count.saturating_mul(FOLLOWUP_SEGMENT_DELAY_PER_CHAR_MS),
+        );
+        random_delay
+            .saturating_add(typing_delay)
+            .min(FOLLOWUP_SEGMENT_MAX_DELAY)
+    }
+
     fn request_parts(target: &MessageTarget, text: &str) -> (&'static str, &'static str, Value) {
         let target_id = target
             .conversation
@@ -849,14 +862,25 @@ impl MessageSender for OneBotMessageSender {
             bail!("不能发送空消息");
         }
 
-        let delay = self.reply_delay(options);
-        if !delay.is_zero() {
-            debug!(delay_ms = delay.as_millis(), "等待消息发送延时");
-            sleep(delay).await;
-        }
-
         let mut sent_messages = Vec::with_capacity(segments.len());
-        for segment in segments {
+        let segment_count = segments.len();
+        for (segment_index, segment) in segments.into_iter().enumerate() {
+            // 第一段沿用原计时起点；后续分段重新计算随机延时和按字数增加的打字时间。
+            let delay = if segment_index == 0 {
+                self.reply_delay(options)
+            } else {
+                Self::followup_segment_delay(self.reply_delay(SendOptions::default()), segment)
+            };
+            if !delay.is_zero() {
+                debug!(
+                    segment = segment_index + 1,
+                    segment_count,
+                    delay_ms = delay.as_millis(),
+                    "等待分段消息发送延时"
+                );
+                sleep(delay).await;
+            }
+
             let sent_message = self
                 .send_text_segment(target, segment, true)
                 .await?
@@ -1152,6 +1176,7 @@ async fn on_event(
 #[cfg(test)]
 mod tests {
     use super::OneBotMessageSender;
+    use tokio::time::Duration;
 
     #[test]
     fn text_segments_skip_consecutive_and_blank_lines() {
@@ -1167,5 +1192,17 @@ mod tests {
 
         assert_eq!(OneBotMessageSender::text_segments(text, false), vec![text]);
         assert!(OneBotMessageSender::text_segments(" \n\r\n ", false).is_empty());
+    }
+
+    #[test]
+    fn followup_segment_delay_adds_per_character_time_and_caps_at_six_seconds() {
+        assert_eq!(
+            OneBotMessageSender::followup_segment_delay(Duration::from_millis(500), "你好a"),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            OneBotMessageSender::followup_segment_delay(Duration::from_secs(1), &"字".repeat(100)),
+            Duration::from_secs(6)
+        );
     }
 }

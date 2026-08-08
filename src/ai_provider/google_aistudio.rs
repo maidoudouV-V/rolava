@@ -236,23 +236,13 @@ impl AIProvider for GoogleAIStudioProvider {
         extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Google AI Studio 视觉响应内容为空"))
     }
 
-    async fn web_search(&self, query: &str) -> anyhow::Result<String> {
-        let prompt = format!(
-            "你是一个给角色扮演聊天机器人使用的互联网查询工具。请使用 Google Search 查询实时信息，并给出简短、可靠、适合交给角色继续聊天使用的中文答案。\n\
-要求：\n\
-1. 直接回答查询问题，不要写成客服或长篇报告。\n\
-2. 如果信息不确定，明确说明不确定。\n\
-3. 控制在 600 字以内。\n\
-4. 如果有关键来源，答案中可以简短提及来源名称。\n\n\
-查询：{}",
-            query
-        );
+    async fn web_search(&self, question: &str) -> anyhow::Result<String> {
         let body = GeminiGenerateContentRequest {
             system_instruction: None,
             contents: vec![GeminiContent {
                 role: Some("user"),
                 parts: vec![GeminiPart {
-                    text: Some(prompt),
+                    text: Some(question.to_string()),
                     inline_data: None,
                 }],
             }],

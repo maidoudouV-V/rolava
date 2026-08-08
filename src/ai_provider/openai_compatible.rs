@@ -411,12 +411,12 @@ impl AIProvider for OpenAICompatibleProvider {
             .ok_or_else(|| anyhow!("OpenAI Compatible 视觉响应内容为空"))
     }
 
-    async fn web_search(&self, query: &str) -> anyhow::Result<String> {
+    async fn web_search(&self, question: &str) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = OpenAICompatibleWebSearchRequest {
             model: &self.model,
             messages: vec![OpenAICompatibleToolMessage::User {
-                content: OpenAICompatibleUserContent::Text(query),
+                content: OpenAICompatibleUserContent::Text(question),
             }],
             web_search_options: OpenAICompatibleWebSearchOptions {
                 search_context_size: WEB_SEARCH_CONTEXT_SIZE,
