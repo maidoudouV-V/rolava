@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::config::AppConfig;
 use crate::repository::db_manager::{
@@ -348,11 +348,11 @@ impl MessageEnricher {
     async fn enrich_image_part(&self, image_data: &Value) -> Result<Option<EnrichedImage>> {
         let Some(image_url) = Self::image_download_url(image_data) else {
             warn!("图片消息缺少可下载 URL");
-            debug!(image_data = %image_data, "无法下载的图片消息数据");
+            trace!(image_data = %image_data, "无法下载的图片消息原始数据");
             return Ok(None);
         };
         info!("检测到图片消息，开始下载");
-        debug!(image_url = %image_url, "图片下载地址");
+        trace!(image_url = %image_url, "图片完整下载地址");
 
         let downloaded_image = self.download_image(&image_url).await?;
         debug!(

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// 视觉识别只做图片转写，固定使用 OpenRouter 支持的最低推理强度。
 const VISION_REASONING_EFFORT: &str = "low";
@@ -330,7 +330,7 @@ impl AIProvider for OpenRouterProvider {
             messages,
             tools,
         );
-        debug!(
+        trace!(
             provider = "openrouter",
             model = %self.model,
             request = %serde_json::to_string_pretty(&body)
@@ -349,12 +349,12 @@ impl AIProvider for OpenRouterProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
-            debug!(provider = "openrouter", status = %status, response = %error_text, "AI Provider 原始错误响应");
+            trace!(provider = "openrouter", status = %status, response = %error_text, "AI Provider 原始错误响应");
             return Err(anyhow!("OpenRouter API 调用失败，状态码 {}", status));
         }
 
         let response_text = resp.text().await?;
-        debug!(provider = "openrouter", response = %response_text, "AI Provider 原始响应");
+        trace!(provider = "openrouter", response = %response_text, "AI Provider 原始响应");
         parse_openrouter_chat_response(&response_text)
     }
 
@@ -400,12 +400,12 @@ impl AIProvider for OpenRouterProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
-            debug!(provider = "openrouter", status = %status, response = %error_text, "视觉 Provider 原始错误响应");
+            trace!(provider = "openrouter", status = %status, response = %error_text, "视觉 Provider 原始错误响应");
             return Err(anyhow!("OpenRouter 视觉 API 调用失败，状态码 {}", status));
         }
 
         let response_text = resp.text().await?;
-        debug!(provider = "openrouter", response = %response_text, "视觉 Provider 原始响应");
+        trace!(provider = "openrouter", response = %response_text, "视觉 Provider 原始响应");
         let parsed: OpenRouterChatResponse = serde_json::from_str(&response_text)
             .map_err(|e| anyhow!("解析 OpenRouter 视觉响应失败：{}", e))?;
         parsed

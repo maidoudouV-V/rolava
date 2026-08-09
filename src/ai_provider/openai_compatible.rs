@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// 视觉识别只做图片转写，固定使用最低推理强度。
 const VISION_REASONING_EFFORT: &str = "minimal";
@@ -328,7 +328,7 @@ impl AIProvider for OpenAICompatibleProvider {
             messages,
             tools,
         );
-        debug!(
+        trace!(
             provider = "openai_compatible",
             model = %self.model,
             request = %serde_json::to_string_pretty(&body)
@@ -346,12 +346,12 @@ impl AIProvider for OpenAICompatibleProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
-            debug!(provider = "openai_compatible", status = %status, response = %error_text, "AI Provider 原始错误响应");
+            trace!(provider = "openai_compatible", status = %status, response = %error_text, "AI Provider 原始错误响应");
             return Err(anyhow!("OpenAI Compatible API 调用失败，状态码 {}", status));
         }
 
         let response_text = resp.text().await?;
-        debug!(provider = "openai_compatible", response = %response_text, "AI Provider 原始响应");
+        trace!(provider = "openai_compatible", response = %response_text, "AI Provider 原始响应");
         parse_openai_compatible_chat_response(&response_text)
     }
 
@@ -393,7 +393,7 @@ impl AIProvider for OpenAICompatibleProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
-            debug!(provider = "openai_compatible", status = %status, response = %error_text, "视觉 Provider 原始错误响应");
+            trace!(provider = "openai_compatible", status = %status, response = %error_text, "视觉 Provider 原始错误响应");
             return Err(anyhow!(
                 "OpenAI Compatible 视觉 API 调用失败，状态码 {}",
                 status
@@ -401,7 +401,7 @@ impl AIProvider for OpenAICompatibleProvider {
         }
 
         let response_text = resp.text().await?;
-        debug!(provider = "openai_compatible", response = %response_text, "视觉 Provider 原始响应");
+        trace!(provider = "openai_compatible", response = %response_text, "视觉 Provider 原始响应");
         let parsed =
             parse_openai_compatible_response(&response_text, "OpenAI Compatible 视觉响应")?;
         first_choice(&parsed, &response_text, "OpenAI Compatible 视觉响应")?
@@ -422,7 +422,7 @@ impl AIProvider for OpenAICompatibleProvider {
                 search_context_size: WEB_SEARCH_CONTEXT_SIZE,
             },
         };
-        debug!(
+        trace!(
             provider = "openai_compatible",
             model = %self.model,
             request = %serde_json::to_string_pretty(&body)
@@ -441,7 +441,7 @@ impl AIProvider for OpenAICompatibleProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
-            debug!(provider = "openai_compatible", status = %status, response = %error_text, "联网搜索 Provider 原始错误响应");
+            trace!(provider = "openai_compatible", status = %status, response = %error_text, "联网搜索 Provider 原始错误响应");
             return Err(anyhow!(
                 "OpenAI Compatible 联网搜索 API 调用失败，状态码 {}",
                 status
@@ -449,7 +449,7 @@ impl AIProvider for OpenAICompatibleProvider {
         }
 
         let response_text = resp.text().await?;
-        debug!(provider = "openai_compatible", response = %response_text, "联网搜索 Provider 原始响应");
+        trace!(provider = "openai_compatible", response = %response_text, "联网搜索 Provider 原始响应");
         let parsed =
             parse_openai_compatible_response(&response_text, "OpenAI Compatible 联网搜索响应")?;
         let choice = first_choice(&parsed, &response_text, "OpenAI Compatible 联网搜索响应")?;

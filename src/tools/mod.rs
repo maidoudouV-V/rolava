@@ -1,30 +1,37 @@
 mod agent_web_search;
 mod continue_conversation;
 mod create_scheduled_task;
+mod create_user_memory;
+mod delete_character_memory;
 mod delete_scheduled_task;
+mod delete_user_memory;
 mod end_conversation;
 mod get_scheduled_task;
 mod registry;
-mod remember;
 mod send_message;
 mod send_qq_expression;
+mod set_character_memory;
 mod update_scheduled_task;
+mod update_user_memory;
 mod wait_for_reply;
 
-pub use agent_web_search::{AgentWebSearchArgs, AgentWebSearchTool};
+pub use agent_web_search::AgentWebSearchTool;
 pub use continue_conversation::ContinueConversationTool;
-pub use create_scheduled_task::{CreateScheduledTaskArgs, CreateScheduledTaskTool};
-pub use delete_scheduled_task::{DeleteScheduledTaskArgs, DeleteScheduledTaskTool};
+pub use create_scheduled_task::CreateScheduledTaskTool;
+pub use create_user_memory::CreateUserMemoryTool;
+pub use delete_character_memory::DeleteCharacterMemoryTool;
+pub use delete_scheduled_task::DeleteScheduledTaskTool;
+pub use delete_user_memory::DeleteUserMemoryTool;
 pub use end_conversation::EndConversationTool;
-pub use get_scheduled_task::{GetScheduledTaskArgs, GetScheduledTaskTool};
+pub use get_scheduled_task::GetScheduledTaskTool;
 pub use registry::ToolRegistry;
-pub use remember::{RememberArgs, RememberTool};
-pub use send_message::{SendMessageArgs, SendMessageTool};
-pub use send_qq_expression::{SendQqExpressionArgs, SendQqExpressionTool};
-pub use update_scheduled_task::{UpdateScheduledTaskArgs, UpdateScheduledTaskTool};
-pub use wait_for_reply::{WaitForReplyArgs, WaitForReplyTool};
+pub use send_qq_expression::SendQqExpressionTool;
+pub use set_character_memory::SetCharacterMemoryTool;
+pub use update_scheduled_task::UpdateScheduledTaskTool;
+pub use update_user_memory::UpdateUserMemoryTool;
+pub use wait_for_reply::WaitForReplyTool;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -34,6 +41,7 @@ use std::sync::Arc;
 use crate::config::AppConfig;
 use crate::conversation_control::ConversationControl;
 use crate::conversation_trigger::ConversationTriggerSender;
+use crate::memory::{CharacterMemorySession, UserMemorySession};
 use crate::repository::db_manager::QQChatContextManager;
 use crate::scheduler::SchedulerService;
 use crate::transport::message::{IncomingMessage, MessageTarget};
@@ -64,6 +72,8 @@ pub struct ConversationToolContext {
     pub current_messages: Vec<IncomingMessage>,
     pub control: Arc<ConversationControl>,
     pub trigger_sender: Arc<dyn ConversationTriggerSender>,
+    pub character_memory: Arc<CharacterMemorySession>,
+    pub user_memory: Arc<UserMemorySession>,
 }
 
 /// 所有工具共享的应用服务。新增系统能力时统一从这里注入。
@@ -104,6 +114,16 @@ pub struct ToolOutput {
     /// 工具产生的结果内容，与是否继续请求 AI 相互独立。
     pub content: String,
     pub requires_ai_response: bool,
+    /// 工具对当前对话生命周期产生的通用影响。
+    pub conversation_effect: ConversationEffect,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConversationEffect {
+    #[default]
+    None,
+    Continue,
+    End,
 }
 
 impl ToolOutput {
@@ -111,6 +131,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             requires_ai_response,
+            conversation_effect: ConversationEffect::None,
         }
     }
 
@@ -119,9 +140,20 @@ impl ToolOutput {
         Self::new(content, true)
     }
 
-    /// 不返回内容，也不再触发后续模型请求；仅用于结束或继续查看对话。
-    pub fn none() -> Self {
-        Self::new(String::new(), false)
+    pub fn end_conversation() -> Self {
+        Self {
+            content: String::new(),
+            requires_ai_response: false,
+            conversation_effect: ConversationEffect::End,
+        }
+    }
+
+    pub fn continue_conversation() -> Self {
+        Self {
+            content: String::new(),
+            requires_ai_response: false,
+            conversation_effect: ConversationEffect::Continue,
+        }
     }
 }
 
@@ -133,6 +165,7 @@ pub struct ToolResult {
     pub content: String,
     pub requires_ai_response: bool,
     pub is_error: bool,
+    pub conversation_effect: ConversationEffect,
 }
 
 #[async_trait]
@@ -163,8 +196,4 @@ where
 {
     serde_json::from_str(arguments)
         .with_context(|| format!("工具 {} 的参数不是有效 JSON", tool_name))
-}
-
-pub(crate) fn execution_not_implemented(tool_name: &str) -> Result<ToolOutput> {
-    bail!("工具 {} 尚未接入执行逻辑", tool_name)
 }

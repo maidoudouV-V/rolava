@@ -7,19 +7,19 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info, info_span, Instrument};
+use tracing::{error, info, info_span, trace, Instrument};
 
 use crate::conversation_trigger::ConversationTrigger;
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
 const DESCRIPTION: &str = r#"等待指定秒数，如果指定目标在此期间没有发送任何消息，系统将触发模型调用。
-重复调用时，会以目标用户为键值覆盖老任务。
+重复调用时，同一用户的新任务会替换旧任务。
 当需要等待对方回复时使用，适合等待对方回答或确认。"#;
 
 #[derive(Debug, Deserialize)]
 pub struct WaitForReplyArgs {
-    pub target: String,
+    pub user_id: String,
     pub timeout_seconds: u64,
     pub reason: String,
 }
@@ -65,9 +65,9 @@ impl Tool for WaitForReplyTool {
         json!({
             "type": "object",
             "properties": {
-                "target": {
+                "user_id": {
                     "type": "string",
-                    "description": "需要等待回复的目标，使用聊天记录中显示的用户名称",
+                    "description": "需要等待回复的用户 QQ 号，使用最近活跃用户中显示的真实 QQ 号",
                     "minLength": 1
                 },
                 "timeout_seconds": {
@@ -82,7 +82,7 @@ impl Tool for WaitForReplyTool {
                     "minLength": 1
                 }
             },
-            "required": ["target", "timeout_seconds", "reason"],
+            "required": ["user_id", "timeout_seconds", "reason"],
             "additionalProperties": false
         })
     }
@@ -94,10 +94,10 @@ impl Tool for WaitForReplyTool {
 
     async fn execute(&self, context: &ToolContext, arguments: &str) -> Result<ToolOutput> {
         let arguments: WaitForReplyArgs = parse_arguments(self.name(), arguments)?;
-        let target = arguments.target.trim().to_string();
+        let target = arguments.user_id.trim().to_string();
         let reason = arguments.reason.trim().to_string();
         if target.is_empty() {
-            anyhow::bail!("等待回复的目标不能为空");
+            anyhow::bail!("等待回复的用户 QQ 号不能为空");
         }
         if !(10..=3600).contains(&arguments.timeout_seconds) {
             anyhow::bail!("最长等待秒数必须在 10 到 3600 之间");
@@ -122,7 +122,7 @@ impl Tool for WaitForReplyTool {
         let task_target = target.clone();
 
         info!(target = %target, timeout_seconds, "已创建等待回复任务");
-        debug!(target = %target, reason = %reason, "等待回复原因");
+        trace!(target = %target, reason = %reason, "等待回复完整原因");
 
         let task_span = info_span!("wait_for_reply", target = %target, timeout_seconds);
         tokio::spawn(async move {
@@ -132,7 +132,7 @@ impl Tool for WaitForReplyTool {
                 return;
             }
 
-            let replied = db_manager.has_sender_named_message_after(
+            let replied = db_manager.has_sender_message_after(
                 &source,
                 &conversation_id,
                 &task_target,
@@ -158,7 +158,7 @@ impl Tool for WaitForReplyTool {
                 }
                 Ok(false) => {
                     let user_prompt = format!(
-                        "# 系统提示\n等待 {} 回复的任务已到期，对方在等待期间没有发送消息。等待原因：{}",
+                        "# 系统提示\n等待 QQ {} 回复的任务已到期，对方在等待期间没有发送消息。等待原因：{}",
                         task_target, reason
                     );
                     if let Err(error) = trigger_sender.send_trigger(ConversationTrigger {
@@ -176,7 +176,7 @@ impl Tool for WaitForReplyTool {
         }.instrument(task_span));
 
         Ok(ToolOutput::text(format!(
-            "等待 {} 回复的任务添加成功",
+            "等待 QQ {} 回复的任务添加成功",
             target
         )))
     }
@@ -190,14 +190,14 @@ mod tests {
     fn same_target_is_replaced_and_different_targets_coexist() {
         let tool = WaitForReplyTool::new();
 
-        let first_id = tool.replace_target_task("小明".to_string());
-        let second_id = tool.replace_target_task("小明".to_string());
-        let other_id = tool.replace_target_task("小红".to_string());
+        let first_id = tool.replace_target_task("10001".to_string());
+        let second_id = tool.replace_target_task("10001".to_string());
+        let other_id = tool.replace_target_task("10002".to_string());
 
         assert_ne!(first_id, second_id);
         assert_ne!(second_id, other_id);
         assert_eq!(
-            tool.pending_tasks.lock().targets.get("小明"),
+            tool.pending_tasks.lock().targets.get("10001"),
             Some(&second_id)
         );
         assert_eq!(tool.pending_tasks.lock().targets.len(), 2);

@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 use super::{Tool, ToolContext, ToolOutput};
 
 const DESCRIPTION: &str = r#"结束查看实时聊天内容。
-降低查看群消息频率，不再实时查看每条聊天内容，只在群会话中有效。
-在当前聊天内容和你无关时调用。"#;
+降低查看群消息频率，不再实时查看每条聊天内容，只在群聊场景中生效。
+在当前聊天内容与你无关时调用。"#;
 
 pub struct EndConversationTool;
 
@@ -30,6 +30,6 @@ impl Tool for EndConversationTool {
 
     async fn execute(&self, context: &ToolContext, _arguments: &str) -> Result<ToolOutput> {
         context.conversation.control.set_ai_filter_bypassed(false);
-        Ok(ToolOutput::none())
+        Ok(ToolOutput::end_conversation())
     }
 }

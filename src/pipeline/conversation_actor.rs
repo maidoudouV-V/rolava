@@ -116,6 +116,7 @@ impl ConversationActor {
             CommandRuntimeAction::ResetConversation => {
                 // 数据库已由命令清空；这里统一丢弃 Actor 内仍引用旧会话的临时状态。
                 self.filter.reset_conversation_state();
+                self.processor.reset_conversation_state();
                 self.conversation_control.set_ai_filter_bypassed(false);
                 self.tools.reset_conversation_state();
             }

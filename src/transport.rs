@@ -10,10 +10,17 @@ use message::MessageTarget;
 /// 一条已经由平台确认发送并完成本地入库的正文。
 #[derive(Debug, Clone)]
 pub struct SentMessage {
-    /// messages 表主键，用于绑定持久化 AI 上下文块。
+    /// messages 表主键，用于在内存工具历史中定位已经发送的正文。
     pub database_id: i64,
     /// 平台实际收到的分段正文。
     pub text: String,
+}
+
+/// 消息平台返回的群聊基础资料。
+#[derive(Debug, Clone)]
+pub struct GroupInfo {
+    pub name: String,
+    pub member_count: u64,
 }
 
 /// QQ 原生表情动作；随机类表情的实际结果由平台在发送后产生。
@@ -42,6 +49,11 @@ impl SendOptions {
 /// 向消息平台投递当前会话的文本，并在成功后完成发送记录持久化。
 #[async_trait]
 pub trait MessageSender: Send + Sync {
+    /// 查询群名称和当前成员数量；不支持或非群聊时返回 None。
+    async fn get_group_info(&self, _target: &MessageTarget) -> Result<Option<GroupInfo>> {
+        Ok(None)
+    }
+
     /// 发送普通聊天正文，并在平台确认后写入统一聊天记录。
     async fn send_text(
         &self,

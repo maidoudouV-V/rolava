@@ -1,3 +1,4 @@
+use crate::scheduler::ScheduledTask;
 use crate::transport::message::{ConversationKind, IncomingMessage};
 use anyhow::Result;
 use chrono::Utc;
@@ -5,13 +6,6 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, params_from_iter, OptionalExtension, Row, Transaction};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-
-use crate::conversation_context::AiTurnBlock;
-use crate::scheduler::ScheduledTask;
-
-const CONTEXT_BLOCK_INPUT_MESSAGE: &str = "input_message";
-const CONTEXT_BLOCK_AI_TURN: &str = "ai_turn";
 
 /// 一条已经写入数据库的消息标识。
 #[derive(Debug, Clone, Copy)]
@@ -24,30 +18,13 @@ pub struct StoredMessage {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResetConversationResult {
     pub deleted_messages: usize,
-    pub deleted_context_blocks: usize,
 }
 
-/// 主模型上下文中按实际发生顺序排列的一项。
+/// 主模型本轮使用的数据库消息窗口及其统一分块容量。
 #[derive(Debug, Clone)]
-pub enum ContextTimelineItem {
-    /// 一条从 messages 表读取的人类输入消息。
-    InputMessage {
-        history_index: usize,
-        message: ChatMessage,
-    },
-    /// 一次完整的 assistant 与工具调用循环。
-    AiTurn(AiTurnBlock),
-}
-
-/// 已完成窗口计算和过期清理的主模型上下文时间线。
-#[derive(Debug, Clone)]
-pub struct ConversationContextWindow {
-    /// 按 block 自增主键排列的上下文项。
-    pub items: Vec<ContextTimelineItem>,
-    /// 当前正文窗口内全部平台消息 ID，供视觉窗口等附加规则使用。
-    pub message_ids: Vec<i64>,
-    /// 本次读取时清理的过期上下文块数量。
-    pub pruned_block_count: usize,
+pub struct ConversationHistoryWindow {
+    pub messages: Vec<ChatMessage>,
+    pub history_block_size: usize,
 }
 
 /// 一条会话目录记录。
@@ -229,7 +206,7 @@ impl ChatMessage {
 /// 聊天记录数据库管理器。
 pub struct QQChatContextManager {
     /// SQLite 连接池。
-    conn_pool: Pool<SqliteConnectionManager>,
+    pub(super) conn_pool: Pool<SqliteConnectionManager>,
 }
 
 impl QQChatContextManager {
@@ -280,77 +257,6 @@ impl QQChatContextManager {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_conversation_source_message
             ON messages (conversation_id, source_message_id);
 
-            CREATE TABLE IF NOT EXISTS conversation_context_blocks (
-                -- 上下文块主键。
-                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-                -- 所属会话，对应 conversations.id。
-                conversation_id             INTEGER NOT NULL,
-                -- input_message 表示人类输入引用，ai_turn 表示完整 AI 工具循环。
-                block_type                  TEXT    NOT NULL,
-                -- input_message 引用的 messages.id；ai_turn 为空。
-                message_id                  INTEGER,
-                -- 最早依赖的正文消息；该消息滚出窗口时删除整个块。
-                retention_message_id        INTEGER NOT NULL,
-                -- ai_turn 保存完整模型轮次；input_message 为空并通过 message_id 读取正文。
-                payload_json                TEXT,
-                -- 上下文块写入数据库时的 Unix 时间戳。
-                created_at                  INTEGER NOT NULL,
-                FOREIGN KEY (conversation_id) REFERENCES conversations(id),
-                FOREIGN KEY (message_id) REFERENCES messages(id),
-                FOREIGN KEY (retention_message_id) REFERENCES messages(id),
-                CHECK(block_type IN ('input_message', 'ai_turn')),
-                CHECK(
-                    (
-                        block_type = 'input_message'
-                        AND message_id IS NOT NULL
-                        AND retention_message_id = message_id
-                        AND payload_json IS NULL
-                    )
-                    OR (
-                        block_type = 'ai_turn'
-                        AND message_id IS NULL
-                        AND payload_json IS NOT NULL
-                    )
-                )
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_context_blocks_conversation_id
-            ON conversation_context_blocks (conversation_id, id ASC);
-
-            CREATE INDEX IF NOT EXISTS idx_context_blocks_retention
-            ON conversation_context_blocks (conversation_id, retention_message_id);
-
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_context_blocks_input_message
-            ON conversation_context_blocks (message_id)
-            WHERE message_id IS NOT NULL;
-
-            -- 只读视图负责联表查看人类消息，避免在上下文块中复制消息 JSON。
-            CREATE VIEW IF NOT EXISTS conversation_context_timeline AS
-            SELECT
-                b.id AS block_id,
-                b.conversation_id,
-                b.block_type,
-                b.message_id,
-                b.retention_message_id,
-                CASE
-                    WHEN b.block_type = 'input_message' THEN json_object(
-                        'role', 'user',
-                        'message_id', m.id,
-                        'source_message_id', m.source_message_id,
-                        'sender_id', m.sender_id,
-                        'sender_display_name', m.sender_display_name,
-                        'sender_nickname', m.sender_nickname,
-                        'content_text', m.content_text,
-                        'content_parts', json(m.content_parts_json),
-                        'metadata', json(m.metadata_json),
-                        'event_timestamp', m.event_timestamp
-                    )
-                    ELSE json(b.payload_json)
-                END AS payload_json,
-                b.created_at
-            FROM conversation_context_blocks b
-            LEFT JOIN messages m ON m.id = b.message_id;
-
             CREATE TABLE IF NOT EXISTS scheduled_tasks (
                 -- 稳定任务 ID；修改时间或内容时保持不变。
                 id                  TEXT    PRIMARY KEY,
@@ -375,6 +281,47 @@ impl QQChatContextManager {
 
             CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_next_run_at
             ON scheduled_tasks (next_run_at ASC);
+
+            CREATE TABLE IF NOT EXISTS user_memories (
+                -- 内部自增主键只负责稳定排序，不暴露给模型。
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- 模型修改和删除记忆时使用的稳定随机 ID。
+                memory_id   TEXT    NOT NULL UNIQUE,
+                -- 平台、机器人账号和用户账号共同确定一份用户记忆。
+                source      TEXT    NOT NULL,
+                bot_id      TEXT    NOT NULL,
+                user_id     TEXT    NOT NULL,
+                content     TEXT    NOT NULL,
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_memories_owner
+            ON user_memories (source, bot_id, user_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS character_memories (
+                -- 内部主键用于稳定排序和标记本轮实际展示的记忆。
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- 平台、机器人账号和会话共同确定一份独立角色记忆。
+                source                      TEXT    NOT NULL,
+                bot_id                      TEXT    NOT NULL,
+                source_conversation_id      TEXT    NOT NULL,
+                -- 标题是模型修改和删除记忆时使用的会话内唯一键。
+                title                       TEXT    NOT NULL,
+                content                     TEXT    NOT NULL,
+                -- 到期时间使用 Unix 时间戳；到期后仍需给主模型一次续期机会。
+                expires_at                  INTEGER NOT NULL,
+                -- 主模型看过“即将遗忘”且本轮没有续期后才写入。
+                expired_seen_at             INTEGER,
+                created_at                  INTEGER NOT NULL,
+                updated_at                  INTEGER NOT NULL,
+                UNIQUE (source, bot_id, source_conversation_id, title)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_character_memories_owner
+            ON character_memories (
+                source, bot_id, source_conversation_id, expires_at ASC, id ASC
+            );
 
             CREATE TABLE IF NOT EXISTS received_images (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -440,10 +387,10 @@ impl QQChatContextManager {
         }
     }
 
-    /// 将一条通用入站消息及其上下文位置写入数据库。
+    /// 将一条通用入站消息写入数据库。
     pub fn write_incoming_message(&self, message: &IncomingMessage) -> Result<StoredMessage> {
         let new_message = Self::new_message_from_incoming(message);
-        self.write_message_internal(&new_message, true)
+        self.write_message_internal(&new_message)
     }
 
     /// 幂等写入平台消息；相同会话中的平台消息 ID 已存在时返回 `None`。
@@ -452,7 +399,7 @@ impl QQChatContextManager {
         message: &IncomingMessage,
     ) -> Result<Option<StoredMessage>> {
         let new_message = Self::new_message_from_incoming(message);
-        self.write_message_internal_if_new(&new_message, true)
+        self.write_message_internal_if_new(&new_message)
     }
 
     /// 在执行多媒体增强前检查平台消息是否已存在。
@@ -481,30 +428,24 @@ impl QQChatContextManager {
 
     /// 写入一条标准化后的聊天记录。
     pub fn write_message(&self, message: &NewChatMessage) -> Result<StoredMessage> {
-        self.write_message_internal(message, false)
+        self.write_message_internal(message)
     }
 
-    fn write_message_internal(
-        &self,
-        message: &NewChatMessage,
-        add_input_context_block: bool,
-    ) -> Result<StoredMessage> {
-        self.write_message_internal_with_conflict_policy(message, add_input_context_block, false)?
+    fn write_message_internal(&self, message: &NewChatMessage) -> Result<StoredMessage> {
+        self.write_message_internal_with_conflict_policy(message, false)?
             .ok_or_else(|| anyhow::anyhow!("普通消息写入不应被忽略"))
     }
 
     fn write_message_internal_if_new(
         &self,
         message: &NewChatMessage,
-        add_input_context_block: bool,
     ) -> Result<Option<StoredMessage>> {
-        self.write_message_internal_with_conflict_policy(message, add_input_context_block, true)
+        self.write_message_internal_with_conflict_policy(message, true)
     }
 
     fn write_message_internal_with_conflict_policy(
         &self,
         message: &NewChatMessage,
-        add_input_context_block: bool,
         ignore_source_message_conflict: bool,
     ) -> Result<Option<StoredMessage>> {
         let now_timestamp = Utc::now().timestamp();
@@ -584,180 +525,9 @@ impl QQChatContextManager {
         let stored_message = StoredMessage {
             id: tx.last_insert_rowid(),
         };
-        if add_input_context_block {
-            Self::insert_input_message_context_block(
-                &tx,
-                conversation_id,
-                stored_message.id,
-                now_timestamp,
-            )?;
-        }
 
         tx.commit()?;
         Ok(Some(stored_message))
-    }
-
-    /// 持久化一次完整 AI 处理原子块；最早依赖的正文消息负责整个块的淘汰。
-    pub fn insert_ai_turn_context_block(
-        &self,
-        source: &str,
-        source_conversation_id: &str,
-        payload_json: &str,
-        retention_message_id: i64,
-    ) -> Result<i64> {
-        let now_timestamp = Utc::now().timestamp();
-        let mut connection = self.conn_pool.get()?;
-        let tx = connection.transaction()?;
-        let conversation_id = tx.query_row(
-            "
-            SELECT id
-            FROM conversations
-            WHERE source = ?1 AND source_conversation_id = ?2
-            ",
-            params![source, source_conversation_id],
-            |row| row.get::<_, i64>(0),
-        )?;
-        tx.execute(
-            "
-            INSERT INTO conversation_context_blocks (
-                conversation_id,
-                block_type,
-                message_id,
-                retention_message_id,
-                payload_json,
-                created_at
-            ) VALUES (?1, 'ai_turn', NULL, ?2, ?3, ?4)
-            ",
-            params![
-                conversation_id,
-                retention_message_id,
-                payload_json,
-                now_timestamp,
-            ],
-        )?;
-        let block_id = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(block_id)
-    }
-
-    /// 返回已按消息窗口筛选并清理过期块的类型化上下文时间线。
-    pub fn get_conversation_context_window(
-        &self,
-        source: &str,
-        source_conversation_id: &str,
-        max_history_messages: u32,
-    ) -> Result<ConversationContextWindow> {
-        let history =
-            self.get_conversation_history(source, source_conversation_id, max_history_messages)?;
-        let connection = self.conn_pool.get()?;
-        if history.is_empty() {
-            let pruned_block_count = connection.execute(
-                "
-                DELETE FROM conversation_context_blocks
-                WHERE conversation_id = (
-                    SELECT id FROM conversations
-                    WHERE source = ?1 AND source_conversation_id = ?2
-                )
-                ",
-                params![source, source_conversation_id],
-            )?;
-            return Ok(ConversationContextWindow {
-                items: Vec::new(),
-                message_ids: Vec::new(),
-                pruned_block_count,
-            });
-        }
-
-        let conversation_id = history[0].conversation_id;
-        let oldest_visible_message_id = history[0].id;
-        let message_ids = history.iter().map(|message| message.id).collect();
-        let mut history_by_id = history
-            .into_iter()
-            .enumerate()
-            .map(|(index, message)| (message.id, (index, message)))
-            .collect::<HashMap<_, _>>();
-
-        // 上下文窗口按 messages.id 连续滚动，最早依赖消息滚出后整个原子块即可删除。
-        let pruned_block_count = connection.execute(
-            "
-            DELETE FROM conversation_context_blocks
-            WHERE conversation_id = ?1 AND retention_message_id < ?2
-            ",
-            params![conversation_id, oldest_visible_message_id],
-        )?;
-
-        let mut stmt = connection.prepare(
-            "
-            SELECT
-                b.id,
-                b.block_type,
-                b.message_id,
-                b.payload_json
-            FROM conversation_context_blocks b
-            WHERE b.conversation_id = ?1
-              AND b.retention_message_id >= ?2
-            ORDER BY b.id ASC
-            ",
-        )?;
-        let mut rows = stmt.query(params![conversation_id, oldest_visible_message_id])?;
-        let mut items = Vec::new();
-        while let Some(row) = rows.next()? {
-            let block_id: i64 = row.get(0)?;
-            let block_type: String = row.get(1)?;
-            match block_type.as_str() {
-                CONTEXT_BLOCK_INPUT_MESSAGE => {
-                    let message_id: i64 = row.get(2)?;
-                    let (history_index, message) =
-                        history_by_id.remove(&message_id).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "上下文块 {} 引用的消息 {} 不在当前正文窗口中",
-                                block_id,
-                                message_id
-                            )
-                        })?;
-                    items.push(ContextTimelineItem::InputMessage {
-                        history_index,
-                        message,
-                    });
-                }
-                CONTEXT_BLOCK_AI_TURN => {
-                    let payload_json: String = row.get(3)?;
-                    let ai_turn = serde_json::from_str(&payload_json).map_err(|error| {
-                        anyhow::anyhow!("解析会话上下文块 {} 失败: {}", block_id, error)
-                    })?;
-                    items.push(ContextTimelineItem::AiTurn(ai_turn));
-                }
-                _ => unreachable!("数据库约束保证上下文块类型有效"),
-            }
-        }
-
-        Ok(ConversationContextWindow {
-            items,
-            message_ids,
-            pruned_block_count,
-        })
-    }
-
-    fn insert_input_message_context_block(
-        tx: &Transaction<'_>,
-        conversation_id: i64,
-        message_id: i64,
-        now_timestamp: i64,
-    ) -> Result<()> {
-        tx.execute(
-            "
-            INSERT INTO conversation_context_blocks (
-                conversation_id,
-                block_type,
-                message_id,
-                retention_message_id,
-                payload_json,
-                created_at
-            ) VALUES (?1, 'input_message', ?2, ?2, NULL, ?3)
-            ",
-            params![conversation_id, message_id, now_timestamp],
-        )?;
-        Ok(())
     }
 
     /// 获取指定来源会话的目录记录。
@@ -791,7 +561,7 @@ impl QQChatContextManager {
         }
     }
 
-    /// 原子清空单个会话的聊天记录和模型上下文，保留会话目录及其定时任务。
+    /// 原子清空单个会话的聊天记录，保留会话目录及其定时任务。
     pub fn reset_conversation_history(
         &self,
         source: &str,
@@ -815,11 +585,6 @@ impl QQChatContextManager {
             return Ok(ResetConversationResult::default());
         };
 
-        // 上下文块引用消息主键，必须先删上下文块再删正文消息。
-        let deleted_context_blocks = tx.execute(
-            "DELETE FROM conversation_context_blocks WHERE conversation_id = ?1",
-            params![conversation_id],
-        )?;
         let deleted_messages = tx.execute(
             "DELETE FROM messages WHERE conversation_id = ?1",
             params![conversation_id],
@@ -830,10 +595,7 @@ impl QQChatContextManager {
         )?;
         tx.commit()?;
 
-        Ok(ResetConversationResult {
-            deleted_messages,
-            deleted_context_blocks,
-        })
+        Ok(ResetConversationResult { deleted_messages })
     }
 
     /// 获取指定来源会话的聊天记录；按入库顺序分块滚动，平台时间只用于内容展示。
@@ -843,6 +605,38 @@ impl QQChatContextManager {
         source_conversation_id: &str,
         max_history_messages: u32,
     ) -> Result<Vec<ChatMessage>> {
+        Ok(self
+            .get_conversation_history_window(source, source_conversation_id, max_history_messages)?
+            .messages)
+    }
+
+    /// 获取主模型消息窗口，并只在这里计算滚动和合并共同使用的块容量。
+    pub fn get_conversation_history_window(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+        max_history_messages: u32,
+    ) -> Result<ConversationHistoryWindow> {
+        let history_block_size = Self::history_block_size(max_history_messages);
+        let messages = self.get_conversation_history_with_block_size(
+            source,
+            source_conversation_id,
+            max_history_messages,
+            history_block_size,
+        )?;
+        Ok(ConversationHistoryWindow {
+            messages,
+            history_block_size,
+        })
+    }
+
+    fn get_conversation_history_with_block_size(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+        max_history_messages: u32,
+        history_block_size: usize,
+    ) -> Result<Vec<ChatMessage>> {
         if max_history_messages == 0 {
             return Ok(Vec::new());
         }
@@ -850,8 +644,11 @@ impl QQChatContextManager {
         let connection = self.conn_pool.get()?;
         let total_message_count =
             Self::count_conversation_messages(&connection, source, source_conversation_id)?;
-        let history_offset =
-            Self::history_block_offset(total_message_count, max_history_messages as i64);
+        let history_offset = Self::history_block_offset(
+            total_message_count,
+            max_history_messages as i64,
+            history_block_size as i64,
+        );
 
         let mut stmt = connection.prepare(
             "
@@ -1014,12 +811,12 @@ impl QQChatContextManager {
         Ok(message_id)
     }
 
-    /// 判断指定名称的发送者是否在给定消息之后发过言。
-    pub fn has_sender_named_message_after(
+    /// 判断指定账号的发送者是否在给定消息之后发过言。
+    pub fn has_sender_message_after(
         &self,
         source: &str,
         source_conversation_id: &str,
-        sender_name: &str,
+        sender_id: &str,
         after_message_id: i64,
     ) -> Result<bool> {
         let connection = self.conn_pool.get()?;
@@ -1032,19 +829,11 @@ impl QQChatContextManager {
                 WHERE c.source = ?1
                   AND c.source_conversation_id = ?2
                   AND m.id > ?3
-                  AND (
-                      m.sender_display_name = ?4
-                      OR m.sender_nickname = ?4
-                  )
+                  AND m.sender_id = ?4
                 LIMIT 1
             )
             ",
-            params![
-                source,
-                source_conversation_id,
-                after_message_id,
-                sender_name
-            ],
+            params![source, source_conversation_id, after_message_id, sender_id],
             |row| row.get(0),
         )?;
         Ok(exists != 0)
@@ -1321,16 +1110,24 @@ impl QQChatContextManager {
         Ok(total_message_count)
     }
 
-    /// 计算历史窗口需要跳过的旧消息数量；块大小为最大历史消息数的五分之一。
-    fn history_block_offset(total_message_count: i64, max_history_messages: i64) -> i64 {
+    /// 计算一次上下文窗口使用的统一正文块大小。
+    fn history_block_size(max_history_messages: u32) -> usize {
+        ((max_history_messages as usize) / 5).max(1)
+    }
+
+    /// 计算历史窗口需要跳过的旧消息数量，始终淘汰整数个完整正文块。
+    fn history_block_offset(
+        total_message_count: i64,
+        max_history_messages: i64,
+        history_block_size: i64,
+    ) -> i64 {
         if total_message_count <= max_history_messages {
             return 0;
         }
 
-        let block_size = (max_history_messages / 5).max(1);
         let overflow = total_message_count - max_history_messages;
-        let dropped_blocks = ((overflow - 1) / block_size) + 1;
-        dropped_blocks * block_size
+        let dropped_blocks = ((overflow - 1) / history_block_size) + 1;
+        dropped_blocks * history_block_size
     }
 
     /// 将已经加入上下文并成功完成 AI 请求的消息标记为已读。
@@ -1691,118 +1488,44 @@ impl QQChatContextManager {
 mod tests {
     use std::fs;
 
-    use super::{ContextTimelineItem, NewChatMessage, NewReceivedImage, QQChatContextManager};
+    use super::{NewChatMessage, NewReceivedImage, QQChatContextManager};
     use rand::Rng;
 
     #[test]
-    fn context_window_joins_messages_and_preserves_block_order() {
+    fn history_window_rolls_by_the_same_block_size_it_returns() {
         let path = temporary_db_path();
         let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
-        let first_message = test_message("message-1", "第一条正文", 1);
-        let stored = manager
-            .write_message_internal(&first_message, true)
-            .unwrap();
-        let outgoing_message = test_message("message-2", "AI 发出的正文", 2);
-        let outgoing = manager.write_message(&outgoing_message).unwrap();
-        manager
-            .insert_ai_turn_context_block("test", "conversation", r#"{"rounds":[]}"#, outgoing.id)
-            .unwrap();
-        // 平台时间可能乱序；上下文仍必须严格使用 Actor 的入库顺序。
-        let next_message = test_message("message-3", "下一条正文", 0);
-        let next = manager.write_message_internal(&next_message, true).unwrap();
-
-        let window = manager
-            .get_conversation_context_window("test", "conversation", 10)
-            .unwrap();
-        assert_eq!(window.items.len(), 3);
-        assert_eq!(window.message_ids, vec![stored.id, outgoing.id, next.id]);
-        assert_eq!(window.pruned_block_count, 0);
-        match &window.items[0] {
-            ContextTimelineItem::InputMessage {
-                history_index,
-                message,
-                ..
-            } => {
-                assert_eq!(*history_index, 0);
-                assert_eq!(message.id, stored.id);
-                assert_eq!(message.content_text.as_deref(), Some("第一条正文"));
-            }
-            other => panic!("第一项应为输入消息，实际为 {other:?}"),
+        for index in 1..=11 {
+            manager
+                .write_message(&test_message(
+                    &format!("message-{index}"),
+                    &format!("正文 {index}"),
+                    index,
+                ))
+                .unwrap();
         }
-        assert!(matches!(
-            &window.items[1],
-            ContextTimelineItem::AiTurn(ai_turn) if ai_turn.rounds.is_empty()
-        ));
-        assert!(matches!(
-            &window.items[2],
-            ContextTimelineItem::InputMessage { message, .. } if message.id == next.id
-        ));
-
-        let connection = manager.conn_pool.get().unwrap();
-        let first_payload: String = connection
-            .query_row(
-                "SELECT payload_json FROM conversation_context_timeline WHERE message_id = ?1",
-                [stored.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let first_payload: serde_json::Value = serde_json::from_str(&first_payload).unwrap();
-        assert_eq!(first_payload["role"], "user");
-        assert_eq!(first_payload["message_id"], stored.id);
-        assert_eq!(first_payload["content_text"], "第一条正文");
-        assert_eq!(first_payload["sender_id"], first_message.sender_id);
-
-        drop(connection);
-        drop(manager);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn context_window_prunes_blocks_when_retention_message_leaves() {
-        let path = temporary_db_path();
-        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
-        let first = manager
-            .write_message_internal(&test_message("message-1", "第一条正文", 1), true)
-            .unwrap();
-        let outgoing = manager
-            .write_message(&test_message("message-2", "AI 发出的正文", 2))
-            .unwrap();
-        manager
-            .insert_ai_turn_context_block("test", "conversation", r#"{"rounds":[]}"#, outgoing.id)
-            .unwrap();
-        let next = manager
-            .write_message_internal(&test_message("message-3", "下一条正文", 3), true)
-            .unwrap();
 
         let window = manager
-            .get_conversation_context_window("test", "conversation", 2)
+            .get_conversation_history_window("test", "conversation", 10)
             .unwrap();
-        assert_eq!(window.message_ids, vec![outgoing.id, next.id]);
-        assert_eq!(window.pruned_block_count, 1);
-        assert_eq!(window.items.len(), 2);
-        assert!(matches!(window.items[0], ContextTimelineItem::AiTurn(_)));
-        assert!(matches!(
-            window.items[1],
-            ContextTimelineItem::InputMessage { ref message, .. } if message.id == next.id
-        ));
-
-        assert!(first.id < outgoing.id);
+        assert_eq!(window.history_block_size, 2);
+        assert_eq!(window.messages.len(), 9);
+        assert_eq!(
+            window.messages[0].source_message_id.as_deref(),
+            Some("message-3")
+        );
         drop(manager);
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn idempotent_incoming_write_keeps_one_unread_message_and_context_block() {
+    fn idempotent_incoming_write_keeps_one_unread_message() {
         let path = temporary_db_path();
         let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
         let message = test_message("message-1", "历史消息", 1);
 
-        let first = manager
-            .write_message_internal_if_new(&message, true)
-            .unwrap();
-        let duplicate = manager
-            .write_message_internal_if_new(&message, true)
-            .unwrap();
+        let first = manager.write_message_internal_if_new(&message).unwrap();
+        let duplicate = manager.write_message_internal_if_new(&message).unwrap();
 
         assert!(first.is_some());
         assert!(duplicate.is_none());
@@ -1811,14 +1534,6 @@ mod tests {
             .unwrap();
         assert_eq!(history.len(), 1);
         assert!(!history[0].is_read);
-        assert_eq!(
-            manager
-                .get_conversation_context_window("test", "conversation", 10)
-                .unwrap()
-                .items
-                .len(),
-            1
-        );
 
         drop(manager);
         fs::remove_file(path).unwrap();
@@ -1854,7 +1569,7 @@ mod tests {
             }
         }])
         .to_string();
-        manager.write_message_internal(&message, true).unwrap();
+        manager.write_message_internal(&message).unwrap();
         let updated = manager
             .complete_received_image_description(
                 "img_A1b2C3d4",
@@ -1902,7 +1617,7 @@ mod tests {
         let path = temporary_db_path();
         let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
         manager
-            .write_message_internal(&test_message("message-1", "需要删除", 1), true)
+            .write_message_internal(&test_message("message-1", "需要删除", 1))
             .unwrap();
         manager
             .insert_scheduled_task(
@@ -1918,24 +1633,16 @@ mod tests {
             .unwrap();
         let mut other_message = test_message("other-message", "其它会话", 2);
         other_message.source_conversation_id = "other-conversation".to_string();
-        manager
-            .write_message_internal(&other_message, true)
-            .unwrap();
+        manager.write_message_internal(&other_message).unwrap();
 
         let result = manager
             .reset_conversation_history("test", "conversation")
             .unwrap();
 
         assert_eq!(result.deleted_messages, 1);
-        assert_eq!(result.deleted_context_blocks, 1);
         assert!(manager
             .get_conversation_history("test", "conversation", 10)
             .unwrap()
-            .is_empty());
-        assert!(manager
-            .get_conversation_context_window("test", "conversation", 10)
-            .unwrap()
-            .items
             .is_empty());
         assert_eq!(
             manager
@@ -1958,7 +1665,7 @@ mod tests {
         let path = temporary_db_path();
         let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
         manager
-            .write_message_internal(&test_message("message-1", "创建会话", 1), true)
+            .write_message_internal(&test_message("message-1", "创建会话", 1))
             .unwrap();
         manager
             .insert_scheduled_task(

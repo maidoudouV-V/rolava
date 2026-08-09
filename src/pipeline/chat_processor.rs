@@ -5,19 +5,22 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
+use tokio::sync::OnceCell;
 use tokio::time::{timeout, Duration};
-use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
-use crate::conversation_context::{AiTurnBlock, AiTurnRound};
+use crate::conversation_context::{ActiveToolHistory, RuntimeContextState, ToolRoundHistory};
 use crate::conversation_control::ConversationControl;
 use crate::conversation_trigger::{ConversationTrigger, ConversationTriggerSender};
+use crate::memory::{CharacterMemorySession, UserMemorySession};
 use crate::message_enricher::MessageEnricher;
-use crate::repository::db_manager::{ChatMessage, ContextTimelineItem};
+use crate::repository::db_manager::ChatMessage;
 use crate::tools::{
-    ConversationToolContext, ToolContext, ToolDefinition, ToolRegistry, ToolResult, ToolServices,
+    ConversationEffect, ConversationToolContext, ToolContext, ToolDefinition, ToolRegistry,
+    ToolResult, ToolServices,
 };
-use crate::transport::message::{IncomingMessage, MessageTarget};
-use crate::transport::SendOptions;
+use crate::transport::message::{ConversationKind, IncomingMessage, MessageTarget};
+use crate::transport::{GroupInfo, SendOptions};
 
 use super::filter::FilteredMessage;
 
@@ -31,11 +34,23 @@ pub struct ChatProcessor {
     message_target: MessageTarget,
     conversation_control: Arc<ConversationControl>,
     trigger_sender: Arc<dyn ConversationTriggerSender>,
+    character_memory: Arc<CharacterMemorySession>,
+    user_memory: Arc<UserMemorySession>,
+    group_info: OnceCell<Option<GroupInfo>>,
+    runtime_context: RuntimeContextState,
 }
 
 struct BuiltContext {
     messages: Vec<ToolChatMessage>,
     unread_message_ids: Vec<i64>,
+    unread_message_time: Option<String>,
+    pending_expired_character_memory_ids: Vec<i64>,
+    latest_message_id: Option<i64>,
+}
+
+struct RenderedPrompt {
+    content: String,
+    pending_expired_character_memory_ids: Vec<i64>,
 }
 
 impl ChatProcessor {
@@ -48,6 +63,15 @@ impl ChatProcessor {
         conversation_control: Arc<ConversationControl>,
         trigger_sender: Arc<dyn ConversationTriggerSender>,
     ) -> Self {
+        let user_memory = Arc::new(UserMemorySession::new(
+            message_target.clone(),
+            services.app_config.as_ref(),
+            services.db_manager.clone(),
+        ));
+        let character_memory = Arc::new(CharacterMemorySession::new(
+            message_target.clone(),
+            services.db_manager.clone(),
+        ));
         Self {
             services,
             conversation_key,
@@ -55,18 +79,30 @@ impl ChatProcessor {
             message_target,
             conversation_control,
             trigger_sender,
+            character_memory,
+            user_memory,
+            group_info: OnceCell::new(),
+            runtime_context: RuntimeContextState::default(),
         }
+    }
+
+    pub fn reset_conversation_state(&mut self) {
+        self.user_memory.reset();
+        self.runtime_context.reset();
     }
 
     /// 处理平台发来的消息。过滤和入库已由当前会话 Actor 在调用前完成。
     pub async fn process_messages(
-        &self,
+        &mut self,
         filtered_messages: Vec<FilteredMessage>,
         tools: &ToolRegistry,
     ) {
         // Actor 在过滤完成后立即进入这里，回复延时从此刻开始计算。
         let send_options = SendOptions::delay_started_now();
-        let trigger_message_id = filtered_messages.first().map(|message| message.database_id);
+        let current_message_ids = filtered_messages
+            .iter()
+            .map(|message| message.database_id)
+            .collect::<Vec<_>>();
         let incoming_messages = filtered_messages
             .into_iter()
             .map(|message| message.message)
@@ -85,52 +121,41 @@ impl ChatProcessor {
             tools,
             None,
             send_options,
-            trigger_message_id,
+            &current_message_ids,
         )
         .await;
     }
 
     /// 处理工具产生的内部触发；临时提示只参与本次请求，不写入数据库。
     pub async fn process_internal_trigger(
-        &self,
+        &mut self,
         trigger: ConversationTrigger,
         tools: &ToolRegistry,
     ) {
         let send_options = SendOptions::delay_started_now();
         let ConversationTrigger { user_prompt } = trigger;
         info!("收到内部会话触发");
-        debug!(prompt = %user_prompt, "内部会话触发提示");
-        let trigger_message_id = self
-            .services
-            .db_manager
-            .get_latest_conversation_message_id(
-                &self.message_target.source,
-                &self.message_target.conversation.id,
-            )
-            .map(|message_id| (message_id > 0).then_some(message_id))
-            .unwrap_or_else(|error| {
-                warn!(error = %error, "读取内部触发依赖的正文消息失败");
-                None
-            });
-        self.process_conversation(
-            &[],
-            tools,
-            Some(&user_prompt),
-            send_options,
-            trigger_message_id,
-        )
-        .await;
+        trace!(prompt = %user_prompt, "内部会话触发完整提示");
+        self.process_conversation(&[], tools, Some(&user_prompt), send_options, &[])
+            .await;
     }
 
     async fn process_conversation(
-        &self,
+        &mut self,
         conversation_messages: &[IncomingMessage],
         tools: &ToolRegistry,
         transient_user_prompt: Option<&str>,
         send_options: SendOptions,
-        trigger_message_id: Option<i64>,
+        current_message_ids: &[i64],
     ) {
-        let built_context = match self.build_context().await {
+        let built_context = match self
+            .build_context(
+                conversation_messages,
+                current_message_ids,
+                transient_user_prompt,
+            )
+            .await
+        {
             Ok(context) => context,
             Err(err) => {
                 error!(error = %err, "构造聊天上下文失败");
@@ -138,12 +163,11 @@ impl ChatProcessor {
             }
         };
 
+        let unread_message_time = built_context.unread_message_time.clone();
         let mut request_messages = built_context.messages;
-        if let Some(prompt) = transient_user_prompt {
-            request_messages.push(ToolChatMessage::User {
-                content: ToolChatUserContent::text(prompt),
-            });
-        }
+        let mut pending_expired_character_memory_ids =
+            built_context.pending_expired_character_memory_ids;
+        let mut displayed_expired_character_memory_ids = HashSet::new();
         let tool_definitions = tools.definitions();
         let tool_context = ToolContext {
             conversation: ConversationToolContext {
@@ -152,12 +176,15 @@ impl ChatProcessor {
                 current_messages: conversation_messages.to_vec(),
                 control: self.conversation_control.clone(),
                 trigger_sender: self.trigger_sender.clone(),
+                character_memory: self.character_memory.clone(),
+                user_memory: self.user_memory.clone(),
             },
             services: self.services.clone(),
         };
         let mut messages_marked_read = false;
-        let mut ai_turn = AiTurnBlock::default();
-        let mut first_emitted_message_id = None;
+        let mut tool_round_history = Vec::new();
+        let mut tool_round_message_ids = Vec::new();
+        let mut conversation_effect = ConversationEffect::None;
 
         for tool_round in 0..=MAX_TOOL_ROUNDS {
             let ai_span = info_span!(
@@ -177,8 +204,11 @@ impl ChatProcessor {
                     break;
                 }
             };
+            displayed_expired_character_memory_ids
+                .extend(pending_expired_character_memory_ids.iter().copied());
 
             if !messages_marked_read {
+                self.runtime_context.seal_current_tail();
                 if let Err(err) = self
                     .services
                     .db_manager
@@ -190,6 +220,7 @@ impl ChatProcessor {
             }
 
             let visible_content = Self::non_empty_response_content(response.content.as_deref());
+            let mut emitted_message_ids = Vec::new();
             if let Some(content) = visible_content {
                 match self
                     .services
@@ -197,12 +228,8 @@ impl ChatProcessor {
                     .send_text(&self.message_target, content, send_options)
                     .await
                 {
-                    Ok(sent_messages) => {
-                        if first_emitted_message_id.is_none() {
-                            first_emitted_message_id =
-                                sent_messages.first().map(|message| message.database_id);
-                        }
-                    }
+                    Ok(sent_messages) => emitted_message_ids
+                        .extend(sent_messages.into_iter().map(|message| message.database_id)),
                     Err(err) => {
                         error!(error = %err, "发送 AI 回复失败")
                     }
@@ -212,14 +239,10 @@ impl ChatProcessor {
             let assistant_message = response.assistant_message();
             let tool_calls = response.tool_calls;
             if tool_calls.is_empty() {
-                // 初次请求的合法空 stop 是无动作；工具链后的空 stop 则用于完整关闭该链。
-                if visible_content.is_some() || !ai_turn.rounds.is_empty() {
-                    ai_turn
-                        .rounds
-                        .push(AiTurnRound::for_history(assistant_message, Vec::new()));
-                }
                 break;
             }
+
+            tool_round_message_ids.extend(emitted_message_ids);
 
             if tool_round == MAX_TOOL_ROUNDS {
                 warn!(
@@ -236,14 +259,16 @@ impl ChatProcessor {
                         ),
                     })
                     .collect();
-                ai_turn
-                    .rounds
-                    .push(AiTurnRound::for_history(assistant_message, tool_results));
+                match ToolRoundHistory::new(assistant_message, tool_results) {
+                    Ok(round) => tool_round_history.push(round),
+                    Err(error) => error!(error = %error, "保存内存工具轮次失败"),
+                }
                 break;
             }
 
             let mut tool_results = Vec::new();
             for tool_call in tool_calls {
+                let tool_arguments = tool_call.arguments.clone();
                 info!(
                     tool_name = %tool_call.name,
                     tool_call_id = %tool_call.id,
@@ -252,7 +277,7 @@ impl ChatProcessor {
                 debug!(
                     tool_name = %tool_call.name,
                     tool_call_id = %tool_call.id,
-                    arguments = %tool_call.arguments,
+                    arguments = %tool_arguments,
                     "工具调用参数"
                 );
                 let tool_span = info_span!(
@@ -269,6 +294,8 @@ impl ChatProcessor {
                         tool_name = %result.tool_name,
                         tool_call_id = %result.tool_call_id,
                         requires_ai_response = result.requires_ai_response,
+                        arguments = %tool_arguments,
+                        error = %result.content,
                         "工具调用失败"
                     );
                 } else {
@@ -288,42 +315,82 @@ impl ChatProcessor {
                 tool_results.push(result);
             }
 
+            for result in &tool_results {
+                if !result.is_error && result.conversation_effect != ConversationEffect::None {
+                    conversation_effect = result.conversation_effect;
+                }
+            }
+
             let tool_result_messages = tool_results
                 .iter()
                 .map(ToolChatMessage::from)
                 .collect::<Vec<_>>();
-            ai_turn.rounds.push(AiTurnRound::for_history(
-                assistant_message.clone(),
-                tool_result_messages.clone(),
-            ));
+            match ToolRoundHistory::new(assistant_message.clone(), tool_result_messages.clone()) {
+                Ok(round) => tool_round_history.push(round),
+                Err(error) => error!(error = %error, "保存内存工具轮次失败"),
+            }
 
             if !Self::should_continue_tool_loop(&tool_results) {
                 debug!("本轮工具均不需要 AI 后续响应，结束工具循环");
                 break;
             }
 
+            if tool_results.iter().any(|result| {
+                !result.is_error
+                    && matches!(
+                        result.tool_name.as_str(),
+                        "set_character_memory"
+                            | "delete_character_memory"
+                            | "create_user_memory"
+                            | "update_user_memory"
+                            | "delete_user_memory"
+                    )
+            }) {
+                match self.refresh_instruction_prompt(
+                    &mut request_messages,
+                    unread_message_time.as_deref(),
+                ) {
+                    Ok(pending_ids) => {
+                        pending_expired_character_memory_ids = pending_ids;
+                    }
+                    Err(error) => {
+                        error!(error = %error, "刷新记忆提示词失败");
+                    }
+                }
+            }
+
             request_messages.push(assistant_message);
             request_messages.extend(tool_result_messages);
         }
 
-        if !ai_turn.rounds.is_empty() {
-            match serde_json::to_string(&ai_turn) {
-                Ok(payload_json) => {
-                    let retention_message_id = first_emitted_message_id.or(trigger_message_id);
-                    if let Some(retention_message_id) = retention_message_id {
-                        if let Err(error) = self.services.db_manager.insert_ai_turn_context_block(
-                            &self.message_target.source,
-                            &self.message_target.conversation.id,
-                            &payload_json,
-                            retention_message_id,
-                        ) {
-                            error!(error = %error, "持久化 AI 上下文原子块失败");
-                        }
-                    } else {
-                        warn!("AI 上下文原子块没有可用的正文锚点，本轮不持久化");
+        if !displayed_expired_character_memory_ids.is_empty() {
+            let displayed_ids = displayed_expired_character_memory_ids
+                .into_iter()
+                .collect::<Vec<_>>();
+            match self.character_memory.finish_turn(&displayed_ids) {
+                Ok(marked) if marked > 0 => {
+                    debug!(memory_count = marked, "已确认展示本轮未续期的到期角色记忆");
+                }
+                Ok(_) => {}
+                Err(error) => error!(error = %error, "确认到期角色记忆展示状态失败"),
+            }
+        }
+
+        if conversation_effect == ConversationEffect::End {
+            let removed = self.runtime_context.compact_finished_conversation();
+            debug!(tool_history_count = removed, "对话结束，已压缩内存工具历史");
+        } else if !tool_round_history.is_empty() {
+            match ActiveToolHistory::new(
+                built_context.latest_message_id,
+                tool_round_history,
+                tool_round_message_ids,
+            ) {
+                Ok(history) => {
+                    if let Err(error) = self.runtime_context.push_tool_history(history) {
+                        error!(error = %error, "追加内存工具历史失败");
                     }
                 }
-                Err(error) => error!(error = %error, "序列化 AI 上下文原子块失败"),
+                Err(error) => error!(error = %error, "构造内存工具历史失败"),
             }
         }
     }
@@ -375,7 +442,7 @@ impl ChatProcessor {
                         has_content = resp.content.as_ref().is_some_and(|content| !content.is_empty()),
                         "AI 请求成功"
                     );
-                    debug!(
+                    trace!(
                         reasoning = %resp.reasoning.display_text.as_deref().unwrap_or(""),
                         content = %resp.content.as_deref().unwrap_or(""),
                         "AI 解析后的响应内容"
@@ -411,33 +478,52 @@ impl ChatProcessor {
     }
 
     /// 构建发送给聊天模型的完整上下文，包括系统提示词、聊天历史和当前指令。
-    async fn build_context(&self) -> anyhow::Result<BuiltContext> {
+    async fn build_context(
+        &mut self,
+        current_messages: &[IncomingMessage],
+        current_message_ids: &[i64],
+        transient_user_prompt: Option<&str>,
+    ) -> anyhow::Result<BuiltContext> {
+        let deleted_memories = self.character_memory.begin_turn()?;
+        if deleted_memories > 0 {
+            debug!(memory_count = deleted_memories, "已删除确认遗忘的角色记忆");
+        }
         let supports_vision = self.services.app_config.chat_model_supports_vision();
-        let system_prompt = &self.services.app_config.prompt_config.system_prompt;
-        let system_content = format!(
-            "{}\n\n{}\n\n{}",
-            system_prompt,
-            self.services.app_config.prompt_config.character_prompt,
-            self.render_instruction_prompt()?,
-        );
-        let mut context = vec![ToolChatMessage::System {
-            content: system_content,
-        }];
-
-        let context_window = self.services.db_manager.get_conversation_context_window(
+        let history_window = self.services.db_manager.get_conversation_history_window(
             &self.message_target.source,
             &self.message_target.conversation.id,
             self.services.app_config.app.max_history_messages,
         )?;
-        if context_window.pruned_block_count > 0 {
-            debug!(
-                block_count = context_window.pruned_block_count,
-                "已清理滚出正文窗口的上下文块"
-            );
+        let message_ids = history_window
+            .messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        if self.runtime_context.reconcile_message_ids(&message_ids)? {
+            debug!("聊天窗口已淘汰或删除旧记录，重新计算内存分块");
         }
+        self.user_memory
+            .refresh_active_users(
+                &history_window.messages,
+                current_messages,
+                current_message_ids,
+            )
+            .await;
+        self.ensure_group_info_loaded().await;
+        let earliest_unread_timestamp = history_window
+            .messages
+            .iter()
+            .find(|message| message.sender_id != self.message_target.bot_id && !message.is_read)
+            .map(|message| message.event_timestamp);
+        let unread_message_time = Self::render_unread_message_time(earliest_unread_timestamp);
+        let rendered_instruction_prompt =
+            self.render_instruction_prompt(unread_message_time.as_deref())?;
+        let mut context = vec![ToolChatMessage::System {
+            content: self.render_static_system_prompt(),
+        }];
         // 原始图片只附加到配置窗口内的正文消息，更早的消息仍保留 Markdown 图片 ID。
         let vision_message_ids = Self::vision_message_ids(
-            &context_window.message_ids,
+            &message_ids,
             supports_vision,
             self.services.app_config.app.vision_image_message_window,
         );
@@ -448,42 +534,79 @@ impl ChatProcessor {
         });
 
         let mut last_rendered_date: Option<String> = None;
-        let mut unread_divider_inserted = false;
-        let history_block_size =
-            Self::history_block_size(self.services.app_config.app.max_history_messages);
-        for item in context_window.items {
-            match item {
-                ContextTimelineItem::InputMessage {
-                    history_index,
-                    message: db_msg,
-                    ..
-                } => {
-                    let starts_new_user_block =
-                        history_index > 0 && history_index % history_block_size == 0;
-                    let image_data_urls = if vision_message_ids.contains(&db_msg.id) {
-                        self.load_message_image_data_urls(&db_msg).await
-                    } else {
-                        Vec::new()
-                    };
-                    Self::append_chat_message(
-                        &mut context,
-                        &db_msg,
-                        starts_new_user_block,
-                        &mut last_rendered_date,
-                        &mut unread_divider_inserted,
-                        &mut unread_message_ids,
-                        image_data_urls,
-                    );
-                }
-                ContextTimelineItem::AiTurn(ai_turn) => {
-                    ai_turn.extend_messages(&mut context);
-                }
+        let history_block_size = history_window.history_block_size;
+        let mut last_history_block_index = None;
+        let mut previous_message_id = None;
+        let mut pending_block_boundary = false;
+        let active_tool_histories = self.runtime_context.active_tool_histories().to_vec();
+        for history in active_tool_histories
+            .iter()
+            .filter(|history| history.after_message_id.is_none())
+        {
+            history.extend_messages(&mut context);
+        }
+
+        for (history_index, db_msg) in history_window.messages.iter().enumerate() {
+            let history_block_index = history_index / history_block_size;
+            if last_history_block_index.is_some_and(|previous| previous != history_block_index) {
+                pending_block_boundary = true;
+            }
+            if previous_message_id
+                .is_some_and(|message_id| self.runtime_context.is_sealed_after(message_id))
+            {
+                pending_block_boundary = true;
+            }
+            last_history_block_index = Some(history_block_index);
+            previous_message_id = Some(db_msg.id);
+
+            let suppressed = active_tool_histories
+                .iter()
+                .any(|history| history.suppresses_message(db_msg.id));
+            if !suppressed {
+                let image_data_urls = if db_msg.sender_id != self.message_target.bot_id
+                    && vision_message_ids.contains(&db_msg.id)
+                {
+                    self.load_message_image_data_urls(db_msg).await
+                } else {
+                    Vec::new()
+                };
+                Self::append_chat_message(
+                    &mut context,
+                    db_msg,
+                    &self.message_target.bot_id,
+                    pending_block_boundary,
+                    &mut last_rendered_date,
+                    &mut unread_message_ids,
+                    image_data_urls,
+                );
+                pending_block_boundary = false;
+            }
+
+            for history in active_tool_histories
+                .iter()
+                .filter(|history| history.after_message_id == Some(db_msg.id))
+            {
+                history.extend_messages(&mut context);
             }
         }
+
+        if let Some(prompt) = transient_user_prompt {
+            context.push(ToolChatMessage::User {
+                content: ToolChatUserContent::text(prompt),
+            });
+        }
+        // 动态 instruction 放在初始上下文末尾，避免它的变化破坏前面固定内容的缓存。
+        context.push(ToolChatMessage::System {
+            content: rendered_instruction_prompt.content,
+        });
 
         Ok(BuiltContext {
             messages: context,
             unread_message_ids,
+            unread_message_time,
+            pending_expired_character_memory_ids: rendered_instruction_prompt
+                .pending_expired_character_memory_ids,
+            latest_message_id: message_ids.last().copied(),
         })
     }
 
@@ -491,15 +614,15 @@ impl ChatProcessor {
     fn append_chat_message(
         context: &mut Vec<ToolChatMessage>,
         db_msg: &ChatMessage,
-        starts_new_user_block: bool,
+        bot_id: &str,
+        starts_new_block: bool,
         last_rendered_date: &mut Option<String>,
-        unread_divider_inserted: &mut bool,
         unread_message_ids: &mut Vec<i64>,
         image_data_urls: Vec<String>,
     ) {
-        if !db_msg.is_read && !*unread_divider_inserted {
-            Self::push_unread_divider(context);
-            *unread_divider_inserted = true;
+        if db_msg.sender_id == bot_id {
+            Self::append_assistant_history_message(context, db_msg, starts_new_block);
+            return;
         }
         if !db_msg.is_read {
             unread_message_ids.push(db_msg.id);
@@ -512,7 +635,7 @@ impl ChatProcessor {
         let should_render_date = last_rendered_date.as_deref() != Some(date_line.as_str());
 
         if let Some(ToolChatMessage::User { content }) = context.last_mut() {
-            if !starts_new_user_block {
+            if !starts_new_block {
                 if should_render_date {
                     content.push_text(&format!("\n{}", date_line));
                     *last_rendered_date = Some(date_line);
@@ -538,17 +661,31 @@ impl ChatProcessor {
         context.push(ToolChatMessage::User { content });
     }
 
-    /// 在聊天记录里插入已读和未读消息的分界线。
-    fn push_unread_divider(context: &mut Vec<ToolChatMessage>) {
-        let divider = "--- 以下是未读消息 ---";
-
-        if let Some(ToolChatMessage::User { content }) = context.last_mut() {
-            content.push_text(&format!("\n{}", divider));
-        } else {
-            context.push(ToolChatMessage::User {
-                content: ToolChatUserContent::text(divider),
-            });
+    fn append_assistant_history_message(
+        context: &mut Vec<ToolChatMessage>,
+        db_msg: &ChatMessage,
+        starts_new_block: bool,
+    ) {
+        let message = db_msg.content_text.clone().unwrap_or_default();
+        if !starts_new_block {
+            if let Some(ToolChatMessage::Assistant {
+                content: Some(content),
+                tool_calls,
+                ..
+            }) = context.last_mut()
+            {
+                if tool_calls.is_empty() {
+                    content.push('\n');
+                    content.push_str(&message);
+                    return;
+                }
+            }
         }
+        context.push(ToolChatMessage::Assistant {
+            content: Some(message),
+            reasoning: None,
+            tool_calls: Vec::new(),
+        });
     }
 
     /// 从消息富文本片段读取图片，并生成本轮请求使用的临时 data URL。
@@ -625,13 +762,11 @@ impl ChatProcessor {
             .collect()
     }
 
-    /// 聊天记录按和数据库淘汰逻辑一致的块大小拆分为多个 user 消息。
-    fn history_block_size(max_history_messages: u32) -> usize {
-        ((max_history_messages as usize) / 5).max(1)
-    }
-
-    /// 渲染当前指令模板，替换日期和场景占位符。
-    fn render_instruction_prompt(&self) -> anyhow::Result<String> {
+    /// 渲染当前指令模板，替换日期、场景和本轮未读边界等动态内容。
+    fn render_instruction_prompt(
+        &self,
+        unread_message_time: Option<&str>,
+    ) -> anyhow::Result<RenderedPrompt> {
         let date_text = Local::now().format("%Y-%m-%d").to_string();
         let tasks = self
             .services
@@ -639,14 +774,106 @@ impl ChatProcessor {
             .running_tasks(&self.message_target)?;
         let task_summaries = tasks.iter().map(|task| task.summary()).collect::<Vec<_>>();
         let scheduled_tasks_json = serde_json::to_string_pretty(&task_summaries)?;
-        Ok(self
-            .services
-            .app_config
-            .prompt_config
-            .instruction_prompt
+        let (character_memories, pending_expired_character_memory_ids) =
+            self.character_memory.render_prompt()?;
+        let recent_user_memories = self.user_memory.render_prompt()?;
+        let scene = self.render_scene();
+        let instruction_prompt = Self::replace_optional_prompt_line(
+            &self.services.app_config.prompt_config.instruction_prompt,
+            "{{unread_message_time}}",
+            unread_message_time,
+        );
+        let content = instruction_prompt
             .replace("{{date}}", &date_text)
-            .replace("{{scene}}", &self.scene)
-            .replace("{{scheduled_tasks}}", &scheduled_tasks_json))
+            .replace("{{scene}}", &scene)
+            .replace("{{scheduled_tasks}}", &scheduled_tasks_json)
+            .replace("{{character_memories}}", &character_memories)
+            .replace("{{recent_user_memories}}", &recent_user_memories);
+        Ok(RenderedPrompt {
+            content,
+            pending_expired_character_memory_ids,
+        })
+    }
+
+    async fn ensure_group_info_loaded(&self) {
+        if !matches!(
+            self.message_target.conversation.kind,
+            ConversationKind::Group
+        ) {
+            return;
+        }
+        self.group_info
+            .get_or_init(|| async {
+                match self
+                    .services
+                    .message_sender
+                    .get_group_info(&self.message_target)
+                    .await
+                {
+                    Ok(group_info) => group_info,
+                    Err(error) => {
+                        warn!(error = %error, "查询群聊基础资料失败，仅显示群聊场景");
+                        None
+                    }
+                }
+            })
+            .await;
+    }
+
+    fn render_scene(&self) -> String {
+        match self.group_info.get().and_then(Option::as_ref) {
+            Some(group_info) => format!(
+                "{}\n- 当前群名称:{}\n- 当前群成员数量:{}",
+                self.scene, group_info.name, group_info.member_count
+            ),
+            None => self.scene.clone(),
+        }
+    }
+
+    fn render_static_system_prompt(&self) -> String {
+        format!(
+            "{}\n\n{}",
+            self.services.app_config.prompt_config.system_prompt,
+            self.services.app_config.prompt_config.character_prompt,
+        )
+    }
+
+    fn refresh_instruction_prompt(
+        &self,
+        messages: &mut [ToolChatMessage],
+        unread_message_time: Option<&str>,
+    ) -> anyhow::Result<Vec<i64>> {
+        let instruction_prompt = self.render_instruction_prompt(unread_message_time)?;
+        let Some(content) = messages.iter_mut().rev().find_map(|message| match message {
+            ToolChatMessage::System { content } => Some(content),
+            _ => None,
+        }) else {
+            anyhow::bail!("工具循环上下文缺少 instruction 提示词");
+        };
+        *content = instruction_prompt.content;
+        Ok(instruction_prompt.pending_expired_character_memory_ids)
+    }
+
+    fn render_unread_message_time(earliest_unread_timestamp: Option<i64>) -> Option<String> {
+        let timestamp = earliest_unread_timestamp?;
+        let dt_utc = DateTime::<Utc>::from_timestamp(timestamp, 0)?;
+        let dt_local: DateTime<Local> = DateTime::<Local>::from(dt_utc);
+        Some(dt_local.format("%Y-%m-%d %H:%M").to_string())
+    }
+
+    /// 没有可用值时移除占位符所在行，避免向模型发送不完整的动态状态。
+    fn replace_optional_prompt_line(
+        prompt: &str,
+        placeholder: &str,
+        value: Option<&str>,
+    ) -> String {
+        match value {
+            Some(value) => prompt.replace(placeholder, value),
+            None => prompt
+                .split_inclusive('\n')
+                .filter(|line| !line.contains(placeholder))
+                .collect(),
+        }
     }
 
     /// 将数据库消息格式化为提示词里的聊天记录行。
@@ -665,7 +892,7 @@ impl ChatProcessor {
 #[cfg(test)]
 mod tests {
     use super::ChatProcessor;
-    use crate::tools::ToolResult;
+    use crate::tools::{ConversationEffect, ToolResult};
 
     #[test]
     fn tool_loop_stops_when_results_do_not_require_ai_response() {
@@ -709,6 +936,28 @@ mod tests {
         assert!(ChatProcessor::vision_message_ids(&message_ids, true, 0).is_empty());
     }
 
+    #[test]
+    fn unread_message_time_reports_earliest_boundary() {
+        assert_eq!(ChatProcessor::render_unread_message_time(None), None);
+
+        let time = ChatProcessor::render_unread_message_time(Some(0));
+        assert!(time.is_some_and(|time| time.len() == 16));
+    }
+
+    #[test]
+    fn optional_prompt_line_is_removed_without_a_value() {
+        let prompt = "# 当前状态\n- 当前日期:2026-08-09\n- 未读:{{time}}\n# 当前任务";
+
+        assert_eq!(
+            ChatProcessor::replace_optional_prompt_line(prompt, "{{time}}", None),
+            "# 当前状态\n- 当前日期:2026-08-09\n# 当前任务"
+        );
+        assert_eq!(
+            ChatProcessor::replace_optional_prompt_line(prompt, "{{time}}", Some("12:30")),
+            "# 当前状态\n- 当前日期:2026-08-09\n- 未读:12:30\n# 当前任务"
+        );
+    }
+
     fn tool_result(content: &str, requires_ai_response: bool) -> ToolResult {
         ToolResult {
             tool_call_id: "call_1".to_string(),
@@ -716,6 +965,7 @@ mod tests {
             content: content.to_string(),
             requires_ai_response,
             is_error: false,
+            conversation_effect: ConversationEffect::None,
         }
     }
 }

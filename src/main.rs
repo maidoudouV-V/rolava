@@ -4,6 +4,7 @@ mod config;
 mod conversation_context;
 pub mod conversation_control;
 pub mod conversation_trigger;
+mod memory;
 mod message_enricher;
 mod message_ingestion;
 mod pipeline;

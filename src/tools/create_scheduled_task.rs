@@ -6,9 +6,9 @@ use serde_json::{json, Value};
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"为当前会话创建一个新的运行中定时任务。
-
-单次时间使用 `at:YYYY-MM-DD HH:MM:SS`，周期时间使用五段 cron，例如每天 09:00 为 `cron:0 9 * * *`。时间均按系统本地时区解释。title 必须是最多 50 个字符的单行标题；instruction 是触发时要执行的完整说明，最多 1000 个字符。创建结果会返回稳定 task_id。"#;
+const DESCRIPTION: &str = r#"为当前会话创建一个新的定时任务。
+schedule 支持单次时间 `at:YYYY-MM-DD HH:MM:SS`，或五段周期时间 `cron:分 时 日 月 周`，例如每天 09:00 为 `cron:0 9 * * *`。时间均按系统本地时区解释，单次任务时间必须晚于当前时间。
+title 必须是最多 50 个字符的单行标题；instruction 是任务触发时交给模型执行的完整说明，最多 1000 个字符。创建成功后会返回稳定的 task_id。"#;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateScheduledTaskArgs {

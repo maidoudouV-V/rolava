@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::debug;
+use tracing::trace;
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -159,7 +159,7 @@ impl AIProvider for GoogleAIStudioProvider {
                 media_resolution: None,
             },
         };
-        debug!(
+        trace!(
             provider = "google_aistudio",
             model = %self.model,
             request = %serde_json::to_string_pretty(&body)
@@ -221,7 +221,7 @@ impl AIProvider for GoogleAIStudioProvider {
                 media_resolution: Some("MEDIA_RESOLUTION_HIGH"),
             },
         };
-        debug!(
+        trace!(
             provider = "google_aistudio",
             model = %self.model,
             prompt,
@@ -262,7 +262,7 @@ impl AIProvider for GoogleAIStudioProvider {
                 media_resolution: None,
             },
         };
-        debug!(
+        trace!(
             provider = "google_aistudio",
             model = %self.model,
             request = %serde_json::to_string_pretty(&body)
@@ -295,7 +295,7 @@ impl GoogleAIStudioProvider {
 
         let status = resp.status();
         let response_text = resp.text().await?;
-        debug!(provider = "google_aistudio", status = %status, response = %response_text, "AI Provider 原始响应");
+        trace!(provider = "google_aistudio", status = %status, response = %response_text, "AI Provider 原始响应");
         if !status.is_success() {
             return Err(anyhow!("Google AI Studio API 调用失败，状态码 {}", status));
         }

@@ -5,7 +5,7 @@ use crate::transport::message::{
     Conversation, ConversationKind, IncomingMessage, MessageContent, MessagePart, MessageTarget,
     Participant,
 };
-use crate::transport::{MessageSender, QqExpression, SendOptions, SentMessage};
+use crate::transport::{GroupInfo, MessageSender, QqExpression, SendOptions, SentMessage};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use axum::extract::State;
@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 mod history;
 
@@ -893,6 +893,13 @@ struct OneBotGroupMemberInfoDto {
     card: Option<String>,
 }
 
+/// OneBot 群基础资料响应数据。
+#[derive(Deserialize, Debug)]
+struct OneBotGroupInfoDto {
+    group_name: String,
+    member_count: u64,
+}
+
 /// OneBot 用户信息响应数据。
 #[derive(Deserialize, Debug)]
 struct OneBotUserInfoDto {
@@ -1011,7 +1018,7 @@ impl OneBotMessageSender {
         message: Value,
     ) -> Result<(&'static str, OneBotActionResponse<OneBotSendMessageData>)> {
         let (api_path, conversation_kind, payload) = Self::request_parts(target, message);
-        debug!(api_path, payload = %payload, "OneBot 发送消息请求");
+        trace!(api_path, payload = %payload, "OneBot 发送消息完整请求");
         let mut request = self
             .client
             .post(format!("{}/{}", self.onebot_api_url, api_path))
@@ -1026,7 +1033,7 @@ impl OneBotMessageSender {
             .context("调用 OneBot 发送消息接口失败")?;
         let http_status = response.status();
         let response_text = response.text().await.context("读取 OneBot 发送响应失败")?;
-        debug!(status = %http_status, response = %response_text, "OneBot 发送消息原始响应");
+        trace!(status = %http_status, response = %response_text, "OneBot 发送消息原始响应");
         if !http_status.is_success() {
             bail!("OneBot 发送消息接口返回 HTTP {}", http_status);
         }
@@ -1116,7 +1123,7 @@ impl OneBotMessageSender {
         expression_type: &str,
     ) -> Result<Option<OneBotMessageSegmentDto>> {
         let payload = serde_json::json!({ "message_id": message_id });
-        debug!(payload = %payload, "OneBot 查询已发送表情请求");
+        trace!(payload = %payload, "OneBot 查询已发送表情完整请求");
         let mut request = self
             .client
             .post(format!("{}/get_msg", self.onebot_api_url))
@@ -1134,7 +1141,7 @@ impl OneBotMessageSender {
             .text()
             .await
             .context("读取 OneBot get_msg 响应失败")?;
-        debug!(status = %http_status, response = %response_text, "OneBot get_msg 原始响应");
+        trace!(status = %http_status, response = %response_text, "OneBot get_msg 原始响应");
         if !http_status.is_success() {
             bail!("OneBot get_msg 接口返回 HTTP {}", http_status);
         }
@@ -1205,6 +1212,44 @@ impl OneBotMessageSender {
 
 #[async_trait]
 impl MessageSender for OneBotMessageSender {
+    async fn get_group_info(&self, target: &MessageTarget) -> Result<Option<GroupInfo>> {
+        if target.source != "onebot" || !matches!(target.conversation.kind, ConversationKind::Group)
+        {
+            return Ok(None);
+        }
+
+        let payload = serde_json::json!({
+            "group_id": target.conversation.id,
+        });
+        let mut request = self
+            .client
+            .post(format!("{}/get_group_info", self.onebot_api_url))
+            .json(&payload);
+        if let Some(token) = &self.onebot_token {
+            request = request.header(AUTHORIZATION, format!("Bearer {}", token));
+        }
+
+        let response = request
+            .send()
+            .await
+            .context("调用 OneBot get_group_info 失败")?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("OneBot get_group_info 返回 HTTP {}", status);
+        }
+        let result = response
+            .json::<OneBotApiResponse<OneBotGroupInfoDto>>()
+            .await
+            .context("解析 OneBot get_group_info 响应失败")?;
+        if result.retcode != 0 {
+            bail!("OneBot get_group_info 返回错误码 {}", result.retcode);
+        }
+        Ok(result.data.map(|group| GroupInfo {
+            name: group.group_name,
+            member_count: group.member_count,
+        }))
+    }
+
     async fn send_text(
         &self,
         target: &MessageTarget,

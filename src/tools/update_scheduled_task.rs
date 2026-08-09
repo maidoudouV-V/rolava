@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
 const DESCRIPTION: &str = r#"修改当前会话中已有定时任务的标题、时间表达式或完整任务说明。
-
-task_id 必须来自当前状态提供的运行中任务摘要，不要根据标题或时间猜测。只传需要修改的字段，至少提供 title、schedule 或 instruction 中的一项；需要先查看完整任务说明时调用 get_scheduled_task。修改 schedule 后会从当前时间重新计算下一次执行时间。"#;
+task_id 必须来自当前状态提供的运行中任务摘要，不要根据标题或时间猜测。只传需要修改的字段，至少提供 title、schedule 或 instruction 中的一项；需要先查看完整任务说明时调用 get_scheduled_task。
+schedule 支持单次时间 `at:YYYY-MM-DD HH:MM:SS`，或五段周期时间 `cron:分 时 日 月 周`，时间均按系统本地时区解释。无论修改哪个字段，更新成功后都会以当前时间为基准，根据最终的 schedule 重新计算下一次执行时间。"#;
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateScheduledTaskArgs {

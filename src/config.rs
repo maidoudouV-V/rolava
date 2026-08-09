@@ -35,6 +35,7 @@ pub enum LogLevel {
     #[default]
     Info,
     Debug,
+    Trace,
 }
 
 impl LogLevel {
@@ -44,13 +45,14 @@ impl LogLevel {
             Self::Warn => "warn",
             Self::Info => "info",
             Self::Debug => "debug",
+            Self::Trace => "trace",
         }
     }
 }
 
 #[derive(Deserialize, Debug, Default)]
 pub struct LoggingSection {
-    /// 应用日志级别，可选 error、warn、info 或 debug。
+    /// 应用日志级别，可选 error、warn、info、debug 或 trace。
     #[serde(default)]
     pub level: LogLevel,
 }

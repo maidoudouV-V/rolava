@@ -6,10 +6,7 @@ use serde_json::{json, Value};
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 use crate::transport::SendOptions;
 
-const DESCRIPTION: &str = r#"向当前聊天窗口发送一条消息。
-当角色需要回复当前会话时调用。每次调用只发送一条消息；需要连续发送多条时可以多次调用。
-你的回复应该符合聊天软件风格，你的发言要像真人即时打字：自然、口语化、通常 1 句话或 1～2 个短句，不要长篇解释。
-消息中不要包含说话人前缀、心理活动、动作描写或括号旁白。"#;
+const DESCRIPTION: &str = r#"向当前聊天窗口发送一条消息。未使用，仅占位"#;
 
 #[derive(Debug, Deserialize)]
 pub struct SendMessageArgs {

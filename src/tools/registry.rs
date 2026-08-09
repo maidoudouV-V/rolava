@@ -4,9 +4,11 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 
 use super::{
-    AgentWebSearchTool, ContinueConversationTool, CreateScheduledTaskTool, DeleteScheduledTaskTool,
-    EndConversationTool, GetScheduledTaskTool, RememberTool, SendQqExpressionTool, Tool, ToolCall,
-    ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool, WaitForReplyTool,
+    AgentWebSearchTool, ContinueConversationTool, CreateScheduledTaskTool, CreateUserMemoryTool,
+    DeleteCharacterMemoryTool, DeleteScheduledTaskTool, DeleteUserMemoryTool, EndConversationTool,
+    GetScheduledTaskTool, SendQqExpressionTool, SetCharacterMemoryTool, Tool, ToolCall,
+    ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool, UpdateUserMemoryTool,
+    WaitForReplyTool,
 };
 
 /// 已注册工具的稳定有序集合。
@@ -25,13 +27,17 @@ impl ToolRegistry {
         let mut registry = Self::new();
         // registry.register(super::SendMessageTool).unwrap();
         registry.register(AgentWebSearchTool).unwrap();
-        registry.register(RememberTool).unwrap();
         registry.register(SendQqExpressionTool).unwrap();
+        registry.register(SetCharacterMemoryTool).unwrap();
+        registry.register(CreateUserMemoryTool).unwrap();
+        registry.register(UpdateUserMemoryTool).unwrap();
         registry.register(WaitForReplyTool::new()).unwrap();
         registry.register(CreateScheduledTaskTool).unwrap();
         registry.register(GetScheduledTaskTool).unwrap();
         registry.register(UpdateScheduledTaskTool).unwrap();
         registry.register(DeleteScheduledTaskTool).unwrap();
+        registry.register(DeleteCharacterMemoryTool).unwrap();
+        registry.register(DeleteUserMemoryTool).unwrap();
         registry.register(ContinueConversationTool).unwrap();
         registry.register(EndConversationTool).unwrap();
         registry
@@ -78,13 +84,16 @@ impl ToolRegistry {
                 content: output.content,
                 requires_ai_response: output.requires_ai_response,
                 is_error: false,
+                conversation_effect: output.conversation_effect,
             },
             Err(error) => ToolResult {
                 tool_call_id: call.id,
                 tool_name: call.name,
-                content: error.to_string(),
+                // 保留完整错误链，既方便模型修正参数，也便于日志定位底层原因。
+                content: format!("{:#}", error),
                 requires_ai_response: true,
                 is_error: true,
+                conversation_effect: super::ConversationEffect::None,
             },
         }
     }
@@ -108,12 +117,16 @@ mod tests {
                 "agent_web_search",
                 "continue_conversation",
                 "create_scheduled_task",
+                "create_user_memory",
+                "delete_character_memory",
                 "delete_scheduled_task",
+                "delete_user_memory",
                 "end_conversation",
                 "get_scheduled_task",
-                "remember",
                 "send_qq_expression",
+                "set_character_memory",
                 "update_scheduled_task",
+                "update_user_memory",
                 "wait_for_reply",
             ]
         );

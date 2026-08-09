@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
-use tracing::debug;
+use tracing::trace;
 
 use super::{OneBotGroupMessageDto, OneBotHttpServer, OneBotMessageDto, OneBotMessageEnvelopeDto};
 use crate::transport::message::IncomingMessage;
@@ -106,7 +106,7 @@ impl OneBotHttpServer {
     where
         T: DeserializeOwned,
     {
-        debug!(api_path, payload = %payload, "OneBot 历史同步请求");
+        trace!(api_path, payload = %payload, "OneBot 历史同步完整请求");
         let mut request = self
             .client
             .post(format!("{}/{}", self.onebot_api_url, api_path))
@@ -125,7 +125,7 @@ impl OneBotHttpServer {
             .text()
             .await
             .with_context(|| format!("读取 OneBot {} 响应失败", api_path))?;
-        debug!(api_path, status = %http_status, response = %response_text, "OneBot 历史同步原始响应");
+        trace!(api_path, status = %http_status, response = %response_text, "OneBot 历史同步原始响应");
         if !http_status.is_success() {
             bail!("OneBot {} 接口返回 HTTP {}", api_path, http_status);
         }
