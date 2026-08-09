@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -12,8 +12,9 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
 use crate::repository::db_manager::{NewReceivedImage, QQChatContextManager, ReceivedImageRecord};
@@ -47,6 +48,13 @@ pub struct MessageEnricher {
     app_config: Arc<AppConfig>,
     db_manager: Arc<QQChatContextManager>,
     http_client: Client,
+    description_tx: Option<mpsc::UnboundedSender<String>>,
+}
+
+/// 下载和本地索引已经完成、可以立即写入聊天数据库的消息。
+pub struct EnrichedIncomingMessage {
+    pub message: IncomingMessage,
+    pending_image_descriptions: Vec<String>,
 }
 
 struct DownloadedImage {
@@ -60,6 +68,7 @@ struct EnrichedImage {
     content_hash: String,
     local_path: String,
     description: String,
+    needs_description: bool,
 }
 
 struct VisionImagePayload {
@@ -68,18 +77,20 @@ struct VisionImagePayload {
 }
 
 impl MessageEnricher {
-    /// 创建消息增强器，图片会按配置保存到本地，必要时交给视觉模型转写。
+    /// 创建消息增强器；视觉模型名称为空时不启动后台图片描述任务。
     pub fn new(app_config: Arc<AppConfig>, db_manager: Arc<QQChatContextManager>) -> Self {
+        let description_tx = Self::start_description_worker(&app_config, &db_manager);
         Self {
             app_config,
             db_manager,
             http_client: Client::new(),
+            description_tx,
         }
     }
 
-    /// 增强单条消息；图片会按主模型能力生成 Markdown 描述并保留图片 ID。
-    pub async fn enrich(&self, mut message: IncomingMessage) -> IncomingMessage {
-        let include_description = !self.app_config.chat_model_supports_vision();
+    /// 增强单条消息；图片先下载入库，描述任务必须等聊天消息写入后再调度。
+    pub async fn enrich(&self, mut message: IncomingMessage) -> EnrichedIncomingMessage {
+        let mut pending_image_descriptions = Vec::new();
         let image_indexes: Vec<usize> = message
             .content
             .parts
@@ -101,7 +112,10 @@ impl MessageEnricher {
                     if let Some(part) = message.content.parts.get_mut(image_index) {
                         Self::attach_image_info(&mut part.data, &image);
                     }
-                    image.context_text(include_description)
+                    if image.needs_description {
+                        pending_image_descriptions.push(image.image_id.clone());
+                    }
+                    image.context_text()
                 }
                 Ok(None) => IMAGE_READ_FAILED_TEXT.to_string(),
                 Err(err) => {
@@ -114,10 +128,96 @@ impl MessageEnricher {
                 Self::replace_next_image_placeholder(&message.content.text, &replacement);
         }
 
-        message
+        EnrichedIncomingMessage {
+            message,
+            pending_image_descriptions,
+        }
     }
 
-    /// 处理单个图片片段，优先用图片哈希复用数据库中已有描述。
+    /// 聊天消息成功入库后再投递描述任务，保证后台结果一定能回写到正文记录。
+    pub fn schedule_pending_descriptions(&self, enriched: &EnrichedIncomingMessage) {
+        let Some(description_tx) = &self.description_tx else {
+            return;
+        };
+        for image_id in &enriched.pending_image_descriptions {
+            if description_tx.send(image_id.clone()).is_err() {
+                error!(image_id, "图片描述后台队列已关闭");
+            }
+        }
+    }
+
+    fn start_description_worker(
+        app_config: &Arc<AppConfig>,
+        db_manager: &Arc<QQChatContextManager>,
+    ) -> Option<mpsc::UnboundedSender<String>> {
+        let model_name = app_config.app.visual_model_name.trim();
+        if model_name.is_empty() {
+            info!("后台图片描述功能未启用");
+            return None;
+        }
+
+        let (description_tx, description_rx) = mpsc::unbounded_channel();
+        let worker_config = app_config.clone();
+        let worker_db = db_manager.clone();
+        tokio::spawn(async move {
+            Self::run_description_worker(worker_config, worker_db, description_rx).await;
+        });
+        info!(model = model_name, "后台图片描述功能已启动");
+        Some(description_tx)
+    }
+
+    /// 单队列顺序处理图片，重复任务会先检查数据库并复用已经生成的描述。
+    async fn run_description_worker(
+        app_config: Arc<AppConfig>,
+        db_manager: Arc<QQChatContextManager>,
+        mut description_rx: mpsc::UnboundedReceiver<String>,
+    ) {
+        while let Some(image_id) = description_rx.recv().await {
+            if let Err(err) =
+                Self::process_description_job(&app_config, &db_manager, &image_id).await
+            {
+                warn!(image_id, error = %err, "后台图片描述失败");
+            }
+        }
+        warn!("后台图片描述队列已停止");
+    }
+
+    async fn process_description_job(
+        app_config: &AppConfig,
+        db_manager: &QQChatContextManager,
+        image_id: &str,
+    ) -> Result<()> {
+        let image = db_manager
+            .get_received_image_by_id(image_id)?
+            .with_context(|| format!("找不到待描述图片 ID: {}", image_id))?;
+        let description = if image.description.trim().is_empty() {
+            let bytes = fs::read(&image.local_path)
+                .await
+                .with_context(|| format!("读取待描述图片失败: {}", image.local_path))?;
+            Self::describe_image(
+                app_config,
+                &bytes,
+                Some(Self::mime_type_from_path(&image.local_path)),
+            )
+            .await?
+        } else {
+            image.description
+        };
+
+        let placeholder_text = EnrichedImage::context_text_for(image_id, "");
+        let described_text = EnrichedImage::context_text_for(image_id, &description);
+        let updated_messages = db_manager.complete_received_image_description(
+            image_id,
+            &description,
+            &placeholder_text,
+            &described_text,
+        )?;
+        info!(image_id, updated_messages, "后台图片描述已写回数据库");
+        debug!(image_id, description = %description, "后台图片描述内容");
+        Ok(())
+    }
+
+    /// 处理单个图片片段，只完成下载、去重和本地入库，不同步等待视觉模型。
     async fn enrich_image_part(&self, image_data: &Value) -> Result<Option<EnrichedImage>> {
         let Some(image_url) = Self::image_download_url(image_data) else {
             warn!("图片消息缺少可下载 URL");
@@ -135,25 +235,14 @@ impl MessageEnricher {
         );
         let content_hash = Self::sha256_hex(&downloaded_image.bytes);
         if let Some(record) = self.db_manager.get_received_image_by_hash(&content_hash)? {
-            info!(image_id = %record.image_id, "图片已存在，复用识别结果");
-            debug!(image_id = %record.image_id, description = %record.description, "复用的图片描述");
-            return Ok(Some(EnrichedImage::from(record)));
+            info!(image_id = %record.image_id, "图片已存在，复用本地记录");
+            let mut image = EnrichedImage::from(record);
+            image.needs_description = self.description_tx.is_some() && image.description.is_empty();
+            return Ok(Some(image));
         }
 
-        let description = if self.app_config.chat_model_supports_vision() {
-            String::new()
-        } else {
-            self.describe_image(
-                &downloaded_image.bytes,
-                downloaded_image.mime_type.as_deref(),
-            )
-            .await?
-        };
         let image_id = self.generate_image_id()?;
         info!(image_id = %image_id, "图片处理成功");
-        if !description.is_empty() {
-            debug!(image_id = %image_id, description = %description, "图片识别内容");
-        }
         let local_path = self
             .save_image_file(
                 &image_id,
@@ -169,7 +258,7 @@ impl MessageEnricher {
             original_url: Some(downloaded_image.original_url),
             mime_type: downloaded_image.mime_type,
             file_size: downloaded_image.bytes.len() as i64,
-            description: description.clone(),
+            description: String::new(),
             metadata_json: json!({
                 "source_part_data": image_data
             })
@@ -178,6 +267,13 @@ impl MessageEnricher {
         if let Err(err) = self.db_manager.insert_received_image(&image) {
             if let Err(remove_err) = fs::remove_file(&local_path).await {
                 warn!(path = %local_path, error = %remove_err, "清理未入库图片文件失败");
+            }
+            // 其它会话可能刚好先写入了同一图片，冲突后直接复用其稳定图片 ID。
+            if let Some(record) = self.db_manager.get_received_image_by_hash(&content_hash)? {
+                let mut image = EnrichedImage::from(record);
+                image.needs_description =
+                    self.description_tx.is_some() && image.description.is_empty();
+                return Ok(Some(image));
             }
             return Err(err);
         }
@@ -188,7 +284,8 @@ impl MessageEnricher {
             image_id,
             content_hash,
             local_path,
-            description,
+            description: String::new(),
+            needs_description: self.description_tx.is_some(),
         }))
     }
 
@@ -242,31 +339,29 @@ impl MessageEnricher {
     }
 
     /// 调用配置中的视觉模型，把图片转成一行短描述。
-    async fn describe_image(&self, bytes: &[u8], mime_type: Option<&str>) -> Result<String> {
+    async fn describe_image(
+        app_config: &AppConfig,
+        bytes: &[u8],
+        mime_type: Option<&str>,
+    ) -> Result<String> {
         let vision_image = Self::prepare_image_for_vision(bytes, mime_type)?;
         info!(
-            model = %self.app_config.app.visual_model_name,
+            model = %app_config.app.visual_model_name,
             image_size_kb = vision_image.bytes.len() / 1024,
             mime_type = %vision_image.mime_type,
             "准备调用视觉模型"
         );
         let image_data_url = Self::vision_image_data_url(&vision_image);
-        let visual_provider = self
-            .app_config
+        let visual_provider = app_config
             .ai_models
-            .get(&self.app_config.app.visual_model_name)
-            .with_context(|| {
-                format!(
-                    "找不到视觉模型配置: {}",
-                    self.app_config.app.visual_model_name
-                )
-            })?;
+            .get(&app_config.app.visual_model_name)
+            .with_context(|| format!("找不到视觉模型配置: {}", app_config.app.visual_model_name))?;
 
-        let max_attempts = self.app_config.app.ai_request_max_attempts();
+        let max_attempts = app_config.app.ai_request_max_attempts();
         let mut last_error = None;
         for attempt in 1..=max_attempts {
             match Self::run_ai_request_with_timeout(
-                &self.app_config,
+                app_config,
                 "图片识别 API 请求",
                 visual_provider.describe_image(&image_data_url, IMAGE_DESCRIPTION_PROMPT),
             )
@@ -346,21 +441,21 @@ impl MessageEnricher {
         Ok(Self::jpeg_vision_payload(compressed))
     }
 
-    /// 为工具等调用方准备可直接提交给视觉模型的图片 data URL。
-    pub(crate) fn prepare_vision_image_data_url(
-        bytes: &[u8],
-        mime_type: Option<&str>,
-    ) -> Result<String> {
-        let vision_image = Self::prepare_image_for_vision(bytes, mime_type)?;
-        Ok(Self::vision_image_data_url(&vision_image))
-    }
-
     fn vision_image_data_url(image: &VisionImagePayload) -> String {
         format!(
             "data:{};base64,{}",
             image.mime_type,
             general_purpose::STANDARD.encode(&image.bytes),
         )
+    }
+
+    /// 为主模型上下文准备可直接提交的图片 data URL。
+    pub(crate) fn prepare_vision_image_data_url(
+        bytes: &[u8],
+        mime_type: Option<&str>,
+    ) -> Result<String> {
+        let vision_image = Self::prepare_image_for_vision(bytes, mime_type)?;
+        Ok(Self::vision_image_data_url(&vision_image))
     }
 
     /// 等比例缩放到指定最大边长，并编码为 JPEG。
@@ -486,6 +581,22 @@ impl MessageEnricher {
         }
     }
 
+    fn mime_type_from_path(path: &str) -> &'static str {
+        match Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("png") => "image/png",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("bmp") => "image/bmp",
+            _ => "image/jpeg",
+        }
+    }
+
     /// 清理模型输出，保证插入聊天记录时是一行短文本。
     fn sanitize_description(description: &str) -> String {
         let description = description
@@ -503,18 +614,21 @@ impl MessageEnricher {
 }
 
 impl EnrichedImage {
-    /// 非视觉模型读取预识别描述；视觉模型只需固定说明，图片会作为原图块提交。
-    fn context_text(&self, include_description: bool) -> String {
-        let alt_text = if include_description && !self.description.trim().is_empty() {
-            self.description.as_str()
-        } else {
+    fn context_text(&self) -> String {
+        Self::context_text_for(&self.image_id, &self.description)
+    }
+
+    fn context_text_for(image_id: &str, description: &str) -> String {
+        let alt_text = if description.trim().is_empty() {
             "图片"
+        } else {
+            description
         };
         let alt_text = alt_text
             .replace('\\', "\\\\")
             .replace('[', "\\[")
             .replace(']', "\\]");
-        format!("![{}](attachment://{})", alt_text, self.image_id)
+        format!("![{}](attachment://{})", alt_text, image_id)
     }
 }
 
@@ -525,6 +639,7 @@ impl From<ReceivedImageRecord> for EnrichedImage {
             content_hash: record.content_hash,
             local_path: record.local_path,
             description: record.description,
+            needs_description: false,
         }
     }
 }
@@ -541,29 +656,31 @@ mod tests {
             content_hash: String::new(),
             local_path: String::new(),
             description: "一只白猫趴在窗台上".to_string(),
+            needs_description: false,
         };
 
         assert_eq!(
-            image.context_text(true),
+            image.context_text(),
             "![一只白猫趴在窗台上](attachment://img_7Kf3aQ9B)"
         );
         assert_eq!(
-            image.context_text(false),
+            EnrichedImage::context_text_for("img_7Kf3aQ9B", ""),
             "![图片](attachment://img_7Kf3aQ9B)"
         );
     }
 
     #[test]
-    fn image_context_escapes_description_for_non_vision_model() {
+    fn image_context_escapes_generated_description() {
         let image = EnrichedImage {
             image_id: "img_A1b2C3d4".to_string(),
             content_hash: String::new(),
             local_path: String::new(),
             description: r"截图包含 [确定] 和 C:\temp".to_string(),
+            needs_description: false,
         };
 
         assert_eq!(
-            image.context_text(true),
+            image.context_text(),
             r"![截图包含 \[确定\] 和 C:\\temp](attachment://img_A1b2C3d4)"
         );
     }

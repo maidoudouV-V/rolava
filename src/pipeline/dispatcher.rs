@@ -10,6 +10,7 @@ use crate::conversation_control::ConversationControl;
 use crate::conversation_trigger::{
     ConversationTrigger, ConversationTriggerSender, RoutedConversationTrigger,
 };
+use crate::message_ingestion::MessageIngestionService;
 use crate::repository::db_manager::QQChatContextManager;
 use crate::scheduler::SchedulerService;
 use crate::tools::ToolServices;
@@ -35,6 +36,7 @@ impl ConversationTriggerSender for ActorConversationTriggerSender {
 /// 根据会话 key 把平台消息投递给对应会话 Actor。
 pub struct ConversationDispatcher {
     tool_services: Arc<ToolServices>,
+    message_ingestion: Arc<MessageIngestionService>,
     command_system: Arc<CommandSystem>,
     message_rx: mpsc::Receiver<IncomingMessage>,
     internal_trigger_rx: mpsc::UnboundedReceiver<RoutedConversationTrigger>,
@@ -47,6 +49,7 @@ impl ConversationDispatcher {
         db_manager: Arc<QQChatContextManager>,
         message_sender: Arc<dyn MessageSender>,
         scheduler: Arc<SchedulerService>,
+        message_ingestion: Arc<MessageIngestionService>,
         message_rx: mpsc::Receiver<IncomingMessage>,
         internal_trigger_rx: mpsc::UnboundedReceiver<RoutedConversationTrigger>,
     ) -> Self {
@@ -62,6 +65,7 @@ impl ConversationDispatcher {
                 message_sender,
                 scheduler,
             )),
+            message_ingestion,
             command_system,
             message_rx,
             internal_trigger_rx,
@@ -129,6 +133,7 @@ impl ConversationDispatcher {
         let filter = ConversationFilter::new(
             self.tool_services.app_config.clone(),
             self.tool_services.db_manager.clone(),
+            self.message_ingestion.clone(),
             conversation_control.clone(),
         );
         let processor = ChatProcessor::new(

@@ -4,7 +4,7 @@ use tracing::{debug, error, info, warn};
 use crate::ai_provider::{ContextMessage, MessageRole, ToolChatMessage, ToolChatResponse};
 use crate::config::AppConfig;
 use crate::conversation_control::ConversationControl;
-use crate::message_enricher::MessageEnricher;
+use crate::message_ingestion::MessageIngestionService;
 use crate::repository::db_manager::{ChatMessage, QQChatContextManager};
 use crate::transport::message::{ConversationKind, IncomingMessage};
 
@@ -30,7 +30,7 @@ pub struct FilteredMessage {
 pub struct ConversationFilter {
     app_config: Arc<AppConfig>,
     db_manager: Arc<QQChatContextManager>,
-    message_enricher: MessageEnricher,
+    message_ingestion: Arc<MessageIngestionService>,
     conversation_control: Arc<ConversationControl>,
     filter_context: Vec<ContextMessage>,
     filter_context_initialized: bool,
@@ -40,12 +40,13 @@ impl ConversationFilter {
     pub fn new(
         app_config: Arc<AppConfig>,
         db_manager: Arc<QQChatContextManager>,
+        message_ingestion: Arc<MessageIngestionService>,
         conversation_control: Arc<ConversationControl>,
     ) -> Self {
         Self {
             app_config: app_config.clone(),
             db_manager: db_manager.clone(),
-            message_enricher: MessageEnricher::new(app_config, db_manager),
+            message_ingestion,
             conversation_control,
             filter_context: Vec::new(),
             filter_context_initialized: false,
@@ -70,12 +71,12 @@ impl ConversationFilter {
                 continue;
             }
 
-            let incoming_message = self.message_enricher.enrich(incoming_message).await;
-            match self.db_manager.write_incoming_message(&incoming_message) {
-                Ok(stored_message) => accepted_messages.push(FilteredMessage {
-                    message: incoming_message,
-                    database_id: stored_message.id,
+            match self.message_ingestion.ingest(incoming_message).await {
+                Ok(Some(ingested)) => accepted_messages.push(FilteredMessage {
+                    message: ingested.message,
+                    database_id: ingested.stored.id,
                 }),
+                Ok(None) => debug!("跳过已经入库的平台消息"),
                 Err(err) => {
                     error!(error = %err, "写入聊天消息失败，不进入后续处理");
                     continue;

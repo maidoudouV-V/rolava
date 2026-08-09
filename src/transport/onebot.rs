@@ -19,9 +19,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
+
+mod history;
 
 const RAW_MESSAGE_CHANNEL_CAPACITY: usize = 128;
 const FOLLOWUP_SEGMENT_DELAY_PER_CHAR_MS: u64 = 100;
@@ -1121,7 +1123,7 @@ impl OneBotHttpServer {
     }
 
     /// 启动接收 OneBot 上报的 HTTP 服务。
-    pub async fn run(&self) {
+    pub async fn run(&self, ready_tx: oneshot::Sender<()>) {
         let listener_ip = self.listener_ip.clone();
         let listener_port = self.listener_port;
         let listener = tokio::net::TcpListener::bind(format!("{}:{}", listener_ip, listener_port))
@@ -1138,6 +1140,7 @@ impl OneBotHttpServer {
             .route("/", post(on_event))
             .with_state(shared_state);
         info!(address = %log_out, "OneBot HTTP 服务已启动");
+        let _ = ready_tx.send(());
 
         let forward_messages = async move {
             while let Some(message) = raw_message_rx.recv().await {

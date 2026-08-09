@@ -5,20 +5,28 @@ mod conversation_context;
 pub mod conversation_control;
 pub mod conversation_trigger;
 mod message_enricher;
+mod message_ingestion;
 mod pipeline;
 mod repository;
 mod resource_cleanup;
 mod scheduler;
+mod startup_history_sync;
 pub mod tools;
 mod transport;
 
 use crate::config::AppConfig;
+use crate::message_ingestion::MessageIngestionService;
+use chrono::Utc;
 use pipeline::dispatcher::ConversationDispatcher;
 use repository::db_manager::QQChatContextManager;
 use resource_cleanup::ResourceCleanupService;
 use scheduler::SchedulerService;
+use startup_history_sync::StartupHistorySyncService;
 use std::sync::Arc;
-use tokio::{select, sync::mpsc};
+use tokio::{
+    select,
+    sync::{mpsc, oneshot},
+};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use transport::message::IncomingMessage;
@@ -39,6 +47,10 @@ async fn main() {
     // 测试数据库
     let manager = QQChatContextManager::new("test_chat.db").unwrap();
     let db_manager = Arc::new(manager);
+    let message_ingestion = Arc::new(MessageIngestionService::new(
+        app_config.clone(),
+        db_manager.clone(),
+    ));
     let scheduler = Arc::new(SchedulerService::new(
         db_manager.clone(),
         internal_trigger_tx,
@@ -50,6 +62,24 @@ async fn main() {
 
     // OneBot 入站服务与出站发送器分离；发送器只通过通用接口交给会话流程。
     let qq_receive_server = Arc::new(OneBotHttpServer::new(app_config.as_ref(), platform_tx));
+    // 先启动上报接收器并缓存实时消息，再回填启动时刻之前的历史记录。
+    let (receive_ready_tx, receive_ready_rx) = oneshot::channel();
+    let receive_server = qq_receive_server.clone();
+    let qq_receive_task = tokio::spawn(async move {
+        receive_server.run(receive_ready_tx).await;
+    });
+    if receive_ready_rx.await.is_err() {
+        warn!("OneBot HTTP 服务未能完成启动通知");
+    }
+    let history_before_timestamp = Utc::now().timestamp();
+    StartupHistorySyncService::new(
+        app_config.clone(),
+        db_manager.clone(),
+        qq_receive_server.clone(),
+        message_ingestion.clone(),
+    )
+    .run(history_before_timestamp)
+    .await;
     let message_sender: Arc<dyn MessageSender> = Arc::new(OneBotMessageSender::new(
         app_config.as_ref(),
         db_manager.clone(),
@@ -61,6 +91,7 @@ async fn main() {
         db_manager.clone(),
         message_sender,
         scheduler.clone(),
+        message_ingestion,
         platform_rx,
         internal_trigger_rx,
     );
@@ -68,7 +99,7 @@ async fn main() {
     // 运行所有服务
     info!("服务启动完成");
     select! {
-        _ = qq_receive_server.run() => {
+        _ = qq_receive_task => {
             warn!("HTTP 服务已停止");
         }
         _ = conversation_dispatcher.run() => {

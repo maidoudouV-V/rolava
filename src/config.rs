@@ -75,7 +75,7 @@ pub struct AppSection {
     pub enable_ai_filter: bool,
     /// 联网搜索模型名称。
     pub web_search_model_name: String,
-    /// 默认视觉模型名称，用于图片识别等消息增强流程。
+    /// 后台图片描述模型名称；为空时关闭图片描述功能。
     pub visual_model_name: String,
     /// AI 请求失败后的额外重试次数；1 表示最多尝试 2 次。
     #[serde(default = "default_ai_request_retry_count")]
@@ -281,7 +281,7 @@ impl AppConfig {
             ("联网搜索", &app.web_search_model_name),
             ("图像识别", &app.visual_model_name),
         ] {
-            if !ai_models.contains_key(model_name) {
+            if !model_name.trim().is_empty() && !ai_models.contains_key(model_name) {
                 anyhow::bail!("{}模型配置不存在：{}", purpose, model_name);
             }
         }
@@ -306,7 +306,6 @@ impl AppConfig {
 
 pub struct PromptConfig {
     pub system_prompt: String,
-    pub system_prompt_without_recognize_image: String,
     pub character_prompt: String,
     pub instruction_prompt: String,
     pub filter_prompt: String,
@@ -315,18 +314,12 @@ impl PromptConfig {
     pub fn new(app: &AppSection) -> Result<Self> {
         let prompt_dir = Path::new(&app.prompt_dir);
         let system_template = fs::read_to_string(prompt_dir.join("system.md"))?;
-        let enabled_actions_prompt = Self::load_enabled_action_prompts(app, prompt_dir, None)?;
-        let actions_without_recognize_image =
-            Self::load_enabled_action_prompts(app, prompt_dir, Some("recognize_image"))?;
+        let enabled_actions_prompt = Self::load_enabled_action_prompts(app, prompt_dir)?;
         let character_prompt = fs::read_to_string(prompt_dir.join("character.md"))?;
         let filter_template = fs::read_to_string(prompt_dir.join("filter.md"))?;
         let new_config = Self {
             system_prompt: system_template
                 .replace("{{enabled_actions}}", enabled_actions_prompt.trim()),
-            system_prompt_without_recognize_image: system_template.replace(
-                "{{enabled_actions}}",
-                actions_without_recognize_image.trim(),
-            ),
             character_prompt: character_prompt.clone(),
             instruction_prompt: fs::read_to_string(prompt_dir.join("instruction.md"))?,
             filter_prompt: filter_template.replace("{{character_prompt}}", character_prompt.trim()),
@@ -335,15 +328,11 @@ impl PromptConfig {
     }
 
     /// 按配置读取可选动作提示词，文件名必须与动作名一致。
-    fn load_enabled_action_prompts(
-        app: &AppSection,
-        prompt_dir: &Path,
-        excluded_action: Option<&str>,
-    ) -> Result<String> {
+    fn load_enabled_action_prompts(app: &AppSection, prompt_dir: &Path) -> Result<String> {
         let mut action_prompts = Vec::new();
         for action_name in &app.enabled_actions {
             let action_name = action_name.trim();
-            if action_name.is_empty() || excluded_action == Some(action_name) {
+            if action_name.is_empty() {
                 continue;
             }
             if action_name.contains('/') || action_name.contains('\\') || action_name.contains("..")

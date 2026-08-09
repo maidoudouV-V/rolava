@@ -440,6 +440,39 @@ impl QQChatContextManager {
         self.write_message_internal(&new_message, true)
     }
 
+    /// 幂等写入平台消息；相同会话中的平台消息 ID 已存在时返回 `None`。
+    pub fn write_incoming_message_if_new(
+        &self,
+        message: &IncomingMessage,
+    ) -> Result<Option<StoredMessage>> {
+        let new_message = Self::new_message_from_incoming(message);
+        self.write_message_internal_if_new(&new_message, true)
+    }
+
+    /// 在执行多媒体增强前检查平台消息是否已存在。
+    pub fn incoming_message_exists(&self, message: &IncomingMessage) -> Result<bool> {
+        let Some(source_message_id) = Self::normalize_optional_text(message.message_id.as_deref())
+        else {
+            return Ok(false);
+        };
+        let connection = self.conn_pool.get()?;
+        let exists = connection.query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM messages m
+                INNER JOIN conversations c ON c.id = m.conversation_id
+                WHERE c.source = ?1
+                  AND c.source_conversation_id = ?2
+                  AND m.source_message_id = ?3
+            )
+            ",
+            params![&message.source, &message.conversation.id, source_message_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     /// 写入一条标准化后的聊天记录。
     pub fn write_message(&self, message: &NewChatMessage) -> Result<StoredMessage> {
         self.write_message_internal(message, false)
@@ -450,6 +483,24 @@ impl QQChatContextManager {
         message: &NewChatMessage,
         add_input_context_block: bool,
     ) -> Result<StoredMessage> {
+        self.write_message_internal_with_conflict_policy(message, add_input_context_block, false)?
+            .ok_or_else(|| anyhow::anyhow!("普通消息写入不应被忽略"))
+    }
+
+    fn write_message_internal_if_new(
+        &self,
+        message: &NewChatMessage,
+        add_input_context_block: bool,
+    ) -> Result<Option<StoredMessage>> {
+        self.write_message_internal_with_conflict_policy(message, add_input_context_block, true)
+    }
+
+    fn write_message_internal_with_conflict_policy(
+        &self,
+        message: &NewChatMessage,
+        add_input_context_block: bool,
+        ignore_source_message_conflict: bool,
+    ) -> Result<Option<StoredMessage>> {
         let now_timestamp = Utc::now().timestamp();
         let mut connection = self.conn_pool.get()?;
         let tx = connection.transaction()?;
@@ -465,7 +516,7 @@ impl QQChatContextManager {
             now_timestamp,
         )?;
 
-        tx.execute(
+        let insert_sql = if ignore_source_message_conflict {
             "
             INSERT INTO messages (
                 conversation_id,
@@ -481,7 +532,28 @@ impl QQChatContextManager {
                 event_timestamp,
                 created_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-            ",
+            ON CONFLICT(conversation_id, source_message_id) DO NOTHING
+            "
+        } else {
+            "
+            INSERT INTO messages (
+                conversation_id,
+                source_message_id,
+                sender_id,
+                sender_display_name,
+                sender_nickname,
+                sender_role,
+                content_text,
+                message_type,
+                content_parts_json,
+                metadata_json,
+                event_timestamp,
+                created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "
+        };
+        let changed = tx.execute(
+            insert_sql,
             params![
                 conversation_id,
                 Self::normalize_optional_text(message.source_message_id.as_deref()),
@@ -498,6 +570,11 @@ impl QQChatContextManager {
             ],
         )?;
 
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+
         let stored_message = StoredMessage {
             id: tx.last_insert_rowid(),
         };
@@ -511,7 +588,7 @@ impl QQChatContextManager {
         }
 
         tx.commit()?;
-        Ok(stored_message)
+        Ok(Some(stored_message))
     }
 
     /// 持久化一次完整 AI 处理原子块；最早依赖的正文消息负责整个块的淘汰。
@@ -1263,7 +1340,7 @@ impl QQChatContextManager {
         Ok(record)
     }
 
-    /// 根据图片短 ID 查询已接收图片，用于后续识图动作找回原图。
+    /// 根据图片短 ID 查询已接收图片，供后台描述和主模型图像上下文读取原图。
     pub fn get_received_image_by_id(&self, image_id: &str) -> Result<Option<ReceivedImageRecord>> {
         let connection = self.conn_pool.get()?;
         let record = connection
@@ -1331,6 +1408,96 @@ impl QQChatContextManager {
             ],
         )?;
         Ok(())
+    }
+
+    /// 完成后台图片描述，并同步更新所有已经引用该图片的消息正文与结构化片段。
+    pub fn complete_received_image_description(
+        &self,
+        image_id: &str,
+        description: &str,
+        placeholder_text: &str,
+        described_text: &str,
+    ) -> Result<usize> {
+        let now_timestamp = Utc::now().timestamp();
+        let mut connection = self.conn_pool.get()?;
+        let tx = connection.transaction()?;
+        let image_changed = tx.execute(
+            "
+            UPDATE received_images
+            SET description = ?2, updated_at = ?3
+            WHERE image_id = ?1
+            ",
+            params![image_id, description, now_timestamp],
+        )?;
+        if image_changed == 0 {
+            tx.commit()?;
+            return Ok(0);
+        }
+
+        // 先筛出可能引用该图片的消息，再用 JSON 结构确认并修改对应图片片段。
+        let candidates = {
+            let mut statement = tx.prepare(
+                "
+                SELECT id, content_text, content_parts_json
+                FROM messages
+                WHERE instr(content_parts_json, ?1) > 0
+                ",
+            )?;
+            let rows = statement
+                .query_map(params![image_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+
+        let mut updated_messages = 0usize;
+        for (message_id, content_text, content_parts_json) in candidates {
+            let mut parts: Value = serde_json::from_str(&content_parts_json)?;
+            let Some(parts) = parts.as_array_mut() else {
+                continue;
+            };
+            let mut references_image = false;
+            for part in &mut *parts {
+                if part.get("kind").and_then(Value::as_str) != Some("image") {
+                    continue;
+                }
+                let Some(data) = part.get_mut("data").and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                if data.get("image_id").and_then(Value::as_str) != Some(image_id) {
+                    continue;
+                }
+                data.insert(
+                    "description".to_string(),
+                    Value::String(description.to_string()),
+                );
+                references_image = true;
+            }
+            if !references_image {
+                continue;
+            }
+
+            let content_text =
+                content_text.map(|text| text.replace(placeholder_text, described_text));
+            let content_parts_json = serde_json::to_string(parts)?;
+            tx.execute(
+                "
+                UPDATE messages
+                SET content_text = ?2, content_parts_json = ?3
+                WHERE id = ?1
+                ",
+                params![message_id, content_text, content_parts_json],
+            )?;
+            updated_messages += 1;
+        }
+
+        tx.commit()?;
+        Ok(updated_messages)
     }
 
     /// 查询创建时间早于截止时间的图片文件，供后台资源清理服务处理。
@@ -1451,7 +1618,7 @@ impl QQChatContextManager {
 mod tests {
     use std::fs;
 
-    use super::{ContextTimelineItem, NewChatMessage, QQChatContextManager};
+    use super::{ContextTimelineItem, NewChatMessage, NewReceivedImage, QQChatContextManager};
     use rand::Rng;
 
     #[test]
@@ -1547,6 +1714,101 @@ mod tests {
         ));
 
         assert!(first.id < outgoing.id);
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn idempotent_incoming_write_keeps_one_unread_message_and_context_block() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        let message = test_message("message-1", "历史消息", 1);
+
+        let first = manager
+            .write_message_internal_if_new(&message, true)
+            .unwrap();
+        let duplicate = manager
+            .write_message_internal_if_new(&message, true)
+            .unwrap();
+
+        assert!(first.is_some());
+        assert!(duplicate.is_none());
+        let history = manager
+            .get_conversation_history("test", "conversation", 10)
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].is_read);
+        assert_eq!(
+            manager
+                .get_conversation_context_window("test", "conversation", 10)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn completed_image_description_updates_image_and_message_without_marking_it_read() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        manager
+            .insert_received_image(&NewReceivedImage {
+                image_id: "img_A1b2C3d4".to_string(),
+                content_hash: "hash".to_string(),
+                local_path: "image.jpg".to_string(),
+                original_url: None,
+                mime_type: Some("image/jpeg".to_string()),
+                file_size: 1,
+                description: String::new(),
+                metadata_json: "{}".to_string(),
+            })
+            .unwrap();
+        let mut message = test_message(
+            "message-image",
+            "看看 ![图片](attachment://img_A1b2C3d4)",
+            1,
+        );
+        message.message_type = "image".to_string();
+        message.content_parts_json = serde_json::json!([{
+            "kind": "image",
+            "data": {
+                "image_id": "img_A1b2C3d4",
+                "description": ""
+            }
+        }])
+        .to_string();
+        manager.write_message_internal(&message, true).unwrap();
+        let updated = manager
+            .complete_received_image_description(
+                "img_A1b2C3d4",
+                "一张测试图片",
+                "![图片](attachment://img_A1b2C3d4)",
+                "![一张测试图片](attachment://img_A1b2C3d4)",
+            )
+            .unwrap();
+
+        assert_eq!(updated, 1);
+        let image = manager
+            .get_received_image_by_id("img_A1b2C3d4")
+            .unwrap()
+            .unwrap();
+        assert_eq!(image.description, "一张测试图片");
+        let history = manager
+            .get_conversation_history("test", "conversation", 10)
+            .unwrap();
+        assert_eq!(
+            history[0].content_text.as_deref(),
+            Some("看看 ![一张测试图片](attachment://img_A1b2C3d4)")
+        );
+        let parts: serde_json::Value =
+            serde_json::from_str(&history[0].content_parts_json).unwrap();
+        assert_eq!(parts[0]["data"]["description"], "一张测试图片");
+        assert!(!history[0].is_read);
+
         drop(manager);
         fs::remove_file(path).unwrap();
     }

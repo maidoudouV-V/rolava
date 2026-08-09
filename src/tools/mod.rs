@@ -4,7 +4,6 @@ mod create_scheduled_task;
 mod delete_scheduled_task;
 mod end_conversation;
 mod get_scheduled_task;
-mod recognize_image;
 mod registry;
 mod remember;
 mod send_message;
@@ -17,7 +16,6 @@ pub use create_scheduled_task::{CreateScheduledTaskArgs, CreateScheduledTaskTool
 pub use delete_scheduled_task::{DeleteScheduledTaskArgs, DeleteScheduledTaskTool};
 pub use end_conversation::EndConversationTool;
 pub use get_scheduled_task::{GetScheduledTaskArgs, GetScheduledTaskTool};
-pub use recognize_image::{RecognizeImageArgs, RecognizeImageTool};
 pub use registry::ToolRegistry;
 pub use remember::{RememberArgs, RememberTool};
 pub use send_message::{SendMessageArgs, SendMessageTool};

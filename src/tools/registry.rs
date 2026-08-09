@@ -5,8 +5,8 @@ use anyhow::{bail, Result};
 
 use super::{
     AgentWebSearchTool, ContinueConversationTool, CreateScheduledTaskTool, DeleteScheduledTaskTool,
-    EndConversationTool, GetScheduledTaskTool, RecognizeImageTool, RememberTool, Tool, ToolCall,
-    ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool, WaitForReplyTool,
+    EndConversationTool, GetScheduledTaskTool, RememberTool, Tool, ToolCall, ToolContext,
+    ToolDefinition, ToolResult, UpdateScheduledTaskTool, WaitForReplyTool,
 };
 
 /// 已注册工具的稳定有序集合。
@@ -24,7 +24,6 @@ impl ToolRegistry {
     pub fn built_in() -> Self {
         let mut registry = Self::new();
         // registry.register(super::SendMessageTool).unwrap();
-        registry.register(RecognizeImageTool).unwrap();
         registry.register(AgentWebSearchTool).unwrap();
         registry.register(RememberTool).unwrap();
         registry.register(WaitForReplyTool::new()).unwrap();
@@ -51,15 +50,6 @@ impl ToolRegistry {
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|tool| tool.definition()).collect()
-    }
-
-    /// 为特定模型请求排除不适用的工具，工具本身仍保留在注册表中。
-    pub fn definitions_excluding(&self, excluded_names: &[&str]) -> Vec<ToolDefinition> {
-        self.tools
-            .iter()
-            .filter(|(name, _)| !excluded_names.contains(name))
-            .map(|(_, tool)| tool.definition())
-            .collect()
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -120,7 +110,6 @@ mod tests {
                 "delete_scheduled_task",
                 "end_conversation",
                 "get_scheduled_task",
-                "recognize_image",
                 "remember",
                 "update_scheduled_task",
                 "wait_for_reply",

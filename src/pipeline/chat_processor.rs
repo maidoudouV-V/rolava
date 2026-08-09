@@ -144,11 +144,7 @@ impl ChatProcessor {
                 content: ToolChatUserContent::text(prompt),
             });
         }
-        let tool_definitions = if self.services.app_config.chat_model_supports_vision() {
-            tools.definitions_excluding(&["recognize_image"])
-        } else {
-            tools.definitions()
-        };
+        let tool_definitions = tools.definitions();
         let tool_context = ToolContext {
             conversation: ConversationToolContext {
                 key: self.conversation_key.clone(),
@@ -417,15 +413,7 @@ impl ChatProcessor {
     /// 构建发送给聊天模型的完整上下文，包括系统提示词、聊天历史和当前指令。
     async fn build_context(&self) -> anyhow::Result<BuiltContext> {
         let supports_vision = self.services.app_config.chat_model_supports_vision();
-        let system_prompt = if supports_vision {
-            &self
-                .services
-                .app_config
-                .prompt_config
-                .system_prompt_without_recognize_image
-        } else {
-            &self.services.app_config.prompt_config.system_prompt
-        };
+        let system_prompt = &self.services.app_config.prompt_config.system_prompt;
         let system_content = format!(
             "{}\n\n{}\n\n{}",
             system_prompt,
