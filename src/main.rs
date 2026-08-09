@@ -53,7 +53,7 @@ async fn main() {
     ));
     let scheduler = Arc::new(SchedulerService::new(
         db_manager.clone(),
-        internal_trigger_tx,
+        internal_trigger_tx.clone(),
     ));
     let resource_cleanup = Arc::new(ResourceCleanupService::new(
         db_manager.clone(),
@@ -61,7 +61,11 @@ async fn main() {
     ));
 
     // OneBot 入站服务与出站发送器分离；发送器只通过通用接口交给会话流程。
-    let qq_receive_server = Arc::new(OneBotHttpServer::new(app_config.as_ref(), platform_tx));
+    let qq_receive_server = Arc::new(OneBotHttpServer::new(
+        app_config.as_ref(),
+        platform_tx,
+        internal_trigger_tx,
+    ));
     // 先启动上报接收器并缓存实时消息，再回填启动时刻之前的历史记录。
     let (receive_ready_tx, receive_ready_rx) = oneshot::channel();
     let receive_server = qq_receive_server.clone();

@@ -16,6 +16,14 @@ pub struct SentMessage {
     pub text: String,
 }
 
+/// QQ 原生表情动作；随机类表情的实际结果由平台在发送后产生。
+#[derive(Debug, Clone)]
+pub enum QqExpression {
+    Face { id: String, name: String },
+    Dice,
+    Rps,
+}
+
 /// 单次消息发送的行为选项。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SendOptions {
@@ -44,4 +52,12 @@ pub trait MessageSender: Send + Sync {
 
     /// 发送不会写入聊天记录的控制反馈，例如斜杠命令执行结果。
     async fn send_transient_text(&self, target: &MessageTarget, text: &str) -> Result<()>;
+
+    /// 发送 QQ 原生表情并持久化平台最终返回的内容。
+    async fn send_qq_expression(
+        &self,
+        target: &MessageTarget,
+        expression: QqExpression,
+        options: SendOptions,
+    ) -> Result<SentMessage>;
 }

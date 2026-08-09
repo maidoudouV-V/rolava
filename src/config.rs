@@ -198,10 +198,13 @@ pub struct AppConfig {
     pub prompt_config: PromptConfig,
     /// 日志输出配置。
     pub logging: LoggingSection,
+    /// QQ 经典表情 ID 到名称的映射。
+    pub face_id_map: HashMap<String, String>,
 }
 
 impl AppConfig {
     pub fn new(config_path: &str) -> Result<Self> {
+        let config_path = Path::new(config_path);
         let toml_str = std::fs::read_to_string(config_path)?;
         let TomlConfig {
             app,
@@ -287,6 +290,23 @@ impl AppConfig {
         }
 
         let prompt_config = PromptConfig::new(&app)?;
+        // 表情映射与主配置放在同一目录，启动时加载一次供所有消息转换复用。
+        let face_id_map_path = config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("face_id_map.json");
+        let face_id_map_text = fs::read_to_string(&face_id_map_path).with_context(|| {
+            format!(
+                "读取 QQ 表情映射失败：{}",
+                face_id_map_path.to_string_lossy()
+            )
+        })?;
+        let face_id_map = serde_json::from_str(&face_id_map_text).with_context(|| {
+            format!(
+                "解析 QQ 表情映射失败：{}",
+                face_id_map_path.to_string_lossy()
+            )
+        })?;
         Ok(AppConfig {
             app,
             server,
@@ -294,6 +314,7 @@ impl AppConfig {
             model_capabilities,
             prompt_config,
             logging,
+            face_id_map,
         })
     }
 

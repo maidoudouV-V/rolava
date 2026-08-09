@@ -5,8 +5,8 @@ use anyhow::{bail, Result};
 
 use super::{
     AgentWebSearchTool, ContinueConversationTool, CreateScheduledTaskTool, DeleteScheduledTaskTool,
-    EndConversationTool, GetScheduledTaskTool, RememberTool, Tool, ToolCall, ToolContext,
-    ToolDefinition, ToolResult, UpdateScheduledTaskTool, WaitForReplyTool,
+    EndConversationTool, GetScheduledTaskTool, RememberTool, SendQqExpressionTool, Tool, ToolCall,
+    ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool, WaitForReplyTool,
 };
 
 /// 已注册工具的稳定有序集合。
@@ -26,6 +26,7 @@ impl ToolRegistry {
         // registry.register(super::SendMessageTool).unwrap();
         registry.register(AgentWebSearchTool).unwrap();
         registry.register(RememberTool).unwrap();
+        registry.register(SendQqExpressionTool).unwrap();
         registry.register(WaitForReplyTool::new()).unwrap();
         registry.register(CreateScheduledTaskTool).unwrap();
         registry.register(GetScheduledTaskTool).unwrap();
@@ -111,6 +112,7 @@ mod tests {
                 "end_conversation",
                 "get_scheduled_task",
                 "remember",
+                "send_qq_expression",
                 "update_scheduled_task",
                 "wait_for_reply",
             ]

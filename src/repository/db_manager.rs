@@ -110,6 +110,12 @@ pub struct ChatMessage {
     pub created_at: i64,
 }
 
+/// 回复引用只需要的原消息摘要。
+pub struct ReferencedMessage {
+    pub sender_display_name: String,
+    pub content_text: Option<String>,
+}
+
 /// 一条待写入的通用聊天记录。
 #[derive(Debug, Clone)]
 pub struct NewChatMessage {
@@ -955,6 +961,39 @@ impl QQChatContextManager {
         Ok(messages)
     }
 
+    /// 按平台消息 ID 查询同一会话内的原消息，用于还原回复引用。
+    pub fn get_referenced_message(
+        &self,
+        source: &str,
+        source_conversation_id: &str,
+        source_message_id: &str,
+    ) -> Result<Option<ReferencedMessage>> {
+        let connection = self.conn_pool.get()?;
+        let message = connection
+            .query_row(
+                "
+                SELECT
+                    m.sender_display_name,
+                    m.content_text
+                FROM messages m
+                INNER JOIN conversations c ON c.id = m.conversation_id
+                WHERE c.source = ?1
+                  AND c.source_conversation_id = ?2
+                  AND m.source_message_id = ?3
+                LIMIT 1
+                ",
+                params![source, source_conversation_id, source_message_id],
+                |row| {
+                    Ok(ReferencedMessage {
+                        sender_display_name: row.get(0)?,
+                        content_text: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(message)
+    }
+
     /// 获取当前会话最新消息的数据库 ID，用作延时检查的起点。
     pub fn get_latest_conversation_message_id(
         &self,
@@ -1415,7 +1454,6 @@ impl QQChatContextManager {
         &self,
         image_id: &str,
         description: &str,
-        placeholder_text: &str,
         described_text: &str,
     ) -> Result<usize> {
         let now_timestamp = Utc::now().timestamp();
@@ -1455,6 +1493,7 @@ impl QQChatContextManager {
             rows
         };
 
+        let placeholder_text = format!("![图片](attachment://{})", image_id);
         let mut updated_messages = 0usize;
         for (message_id, content_text, content_parts_json) in candidates {
             let mut parts: Value = serde_json::from_str(&content_parts_json)?;
@@ -1462,6 +1501,7 @@ impl QQChatContextManager {
                 continue;
             };
             let mut references_image = false;
+            let mut context_replacements = Vec::new();
             for part in &mut *parts {
                 if part.get("kind").and_then(Value::as_str) != Some("image") {
                     continue;
@@ -1472,18 +1512,37 @@ impl QQChatContextManager {
                 if data.get("image_id").and_then(Value::as_str) != Some(image_id) {
                     continue;
                 }
+                let previous_context = data
+                    .get("context_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&placeholder_text)
+                    .to_string();
+                let next_context = Self::image_context_with_description(
+                    &previous_context,
+                    image_id,
+                    described_text,
+                );
                 data.insert(
                     "description".to_string(),
                     Value::String(description.to_string()),
                 );
+                data.insert(
+                    "context_text".to_string(),
+                    Value::String(next_context.clone()),
+                );
+                context_replacements.push((previous_context, next_context));
                 references_image = true;
             }
             if !references_image {
                 continue;
             }
 
-            let content_text =
-                content_text.map(|text| text.replace(placeholder_text, described_text));
+            let content_text = content_text.map(|mut text| {
+                for (previous_context, next_context) in context_replacements {
+                    text = text.replace(&previous_context, &next_context);
+                }
+                text
+            });
             let content_parts_json = serde_json::to_string(parts)?;
             tx.execute(
                 "
@@ -1498,6 +1557,20 @@ impl QQChatContextManager {
 
         tx.commit()?;
         Ok(updated_messages)
+    }
+
+    /// 只替换内部图片占位，保留文件图片的外层文件信息。
+    fn image_context_with_description(
+        previous_context: &str,
+        image_id: &str,
+        described_text: &str,
+    ) -> String {
+        let image_placeholder = format!("![图片](attachment://{})", image_id);
+        if previous_context.contains(&image_placeholder) {
+            previous_context.replace(&image_placeholder, described_text)
+        } else {
+            described_text.to_string()
+        }
     }
 
     /// 查询创建时间早于截止时间的图片文件，供后台资源清理服务处理。
@@ -1786,7 +1859,6 @@ mod tests {
             .complete_received_image_description(
                 "img_A1b2C3d4",
                 "一张测试图片",
-                "![图片](attachment://img_A1b2C3d4)",
                 "![一张测试图片](attachment://img_A1b2C3d4)",
             )
             .unwrap();
@@ -1811,6 +1883,18 @@ mod tests {
 
         drop(manager);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn completed_description_preserves_file_wrapper() {
+        assert_eq!(
+            QQChatContextManager::image_context_with_description(
+                "[文件 example.png；2.00 MB ![图片](attachment://img_A1b2C3d4)]",
+                "img_A1b2C3d4",
+                "![一张梗图](attachment://img_A1b2C3d4)",
+            ),
+            "[文件 example.png；2.00 MB ![一张梗图](attachment://img_A1b2C3d4)]"
+        );
     }
 
     #[test]

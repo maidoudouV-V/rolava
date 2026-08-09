@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
-use image::{DynamicImage, GenericImageView};
+use image::{DynamicImage, GenericImageView, ImageFormat};
 use rand::{distributions::Alphanumeric, Rng};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
@@ -17,27 +17,25 @@ use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
-use crate::repository::db_manager::{NewReceivedImage, QQChatContextManager, ReceivedImageRecord};
+use crate::repository::db_manager::{
+    NewReceivedImage, QQChatContextManager, ReceivedImageRecord, ReferencedMessage,
+};
 use crate::transport::message::IncomingMessage;
 
-const IMAGE_DESCRIPTION_PROMPT: &str = r#"你是QQ群聊天机器人中的图片内容转写模块。你的任务是把用户发来的图片描述成一段简短文本，供另一个AI角色理解上下文。
+const IMAGE_DESCRIPTION_PROMPT: &str = r#"你是QQ群聊天机器人的图片转写模块。请将图片转成一段简短文本，供另一个AI理解聊天上下文。
 
 要求：
-1. 只描述图片中能直接看到的内容，不要编造、不要猜测图片外的信息。
-2. 描述要包含主体、场景、动作、表情、文字、情绪或用途等关键信息。
-3. 输出优先控制在80字以内，复杂图片最多120字，简单图片简单描述，复杂图片抓住细节。
-4. 如果图片里有文字，提取影响理解的关键文字，不要全文OCR。
-5. 如果图片是表情包/梗图，描述画面、关键文字、情绪和可能的聊天语气。
-6. 如果图片是截图，概括截图类型、关键内容和明显的界面状态，不要逐条复述。
-7. 不要使用“这张图片显示了”“图片中可以看到”等废话开头。
-8. 不要解释你的判断过程。
-9. 不要输出Markdown。
-10. 如果图片内容不清晰，就说明“不清晰”，并描述能辨认出的部分。
-11. 输出必须只有一段，不要换行。
+1. 概括主体、场景、动作、表情、关键文字和情绪；不要全文OCR。
+2. 如果是表情包或梗图，必须简要说明笑点、反差、讽刺或隐含意思，以及通常表达的聊天态度；不确定时用“可能”表达。
+3. 普通图片不要强行解读。可作有助理解语气的有限推断，但不要编造人物身份、事件背景或图片外的事实。
+4. 如果是截图，只概括类型、关键内容和明显状态。内容不清晰时，说明不清晰并描述可辨认部分。
+5. 尽量控制在120字内，不要使用废话开头，不要输出Markdown、换行或判断过程。
 
-现在直接描述图片内容"#;
+现在直接描述图片"#;
 
 const IMAGE_READ_FAILED_TEXT: &str = "[图片消息 读取失败]";
+const REPLY_MESSAGE_PLACEHOLDER: &str = "[回复消息]";
+const REPLY_PREVIEW_MAX_CHARS: usize = 16;
 /// 模型请求图片只按像素缩小，最长边不超过 1920px。
 const VISION_IMAGE_MAX_SIDE: u32 = 1920;
 /// 图片发生缩放时使用固定 JPEG 质量，不再按体积逐级降质。
@@ -91,46 +89,177 @@ impl MessageEnricher {
     /// 增强单条消息；图片先下载入库，描述任务必须等聊天消息写入后再调度。
     pub async fn enrich(&self, mut message: IncomingMessage) -> EnrichedIncomingMessage {
         let mut pending_image_descriptions = Vec::new();
-        let image_indexes: Vec<usize> = message
+        self.enrich_reply_parts(&mut message);
+
+        let image_parts = message
             .content
             .parts
             .iter()
             .enumerate()
             .filter_map(|(index, part)| {
                 if part.kind == "image" {
-                    Some(index)
+                    Some((index, false, "[图片]".to_string()))
+                } else if part.kind == "file" && Self::is_image_file_part(&part.data) {
+                    let placeholder = part
+                        .data
+                        .get("context_text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("[文件]")
+                        .to_string();
+                    Some((index, true, placeholder))
                 } else {
                     None
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        for image_index in image_indexes {
+        for (image_index, is_file, placeholder) in image_parts {
             let image_data = message.content.parts[image_index].data.clone();
             let replacement = match self.enrich_image_part(&image_data).await {
                 Ok(Some(image)) => {
-                    if let Some(part) = message.content.parts.get_mut(image_index) {
-                        Self::attach_image_info(&mut part.data, &image);
+                    let image_context = if is_file {
+                        Self::wrap_file_context(&placeholder, &image.context_text())
+                    } else {
+                        image.context_text()
+                    };
+                    let part = &mut message.content.parts[image_index];
+                    if is_file {
+                        part.kind = "image".to_string();
                     }
+                    Self::attach_image_info(&mut part.data, &image, &image_context);
                     if image.needs_description {
                         pending_image_descriptions.push(image.image_id.clone());
                     }
-                    image.context_text()
+                    image_context
                 }
-                Ok(None) => IMAGE_READ_FAILED_TEXT.to_string(),
+                Ok(None) => Self::image_enrichment_failure_text(is_file, &placeholder),
                 Err(err) => {
                     warn!(error = %err, "图片增强失败");
-                    IMAGE_READ_FAILED_TEXT.to_string()
+                    Self::image_enrichment_failure_text(is_file, &placeholder)
                 }
             };
 
             message.content.text =
-                Self::replace_next_image_placeholder(&message.content.text, &replacement);
+                Self::replace_next_placeholder(&message.content.text, &placeholder, &replacement);
         }
 
         EnrichedIncomingMessage {
             message,
             pending_image_descriptions,
+        }
+    }
+
+    /// 将 reply 段的平台消息 ID 还原为同一会话中的原消息摘要。
+    fn enrich_reply_parts(&self, message: &mut IncomingMessage) {
+        for reply_index in 0..message.content.parts.len() {
+            if message.content.parts[reply_index].kind != "reply" {
+                continue;
+            }
+            let reply_data = message.content.parts[reply_index].data.clone();
+            let replacement = match Self::resolve_reply_context(
+                &self.db_manager,
+                &message.source,
+                &message.conversation.id,
+                &reply_data,
+            ) {
+                Ok(context_text) => context_text,
+                Err(err) => {
+                    warn!(error = %err, "还原回复原消息失败");
+                    REPLY_MESSAGE_PLACEHOLDER.to_string()
+                }
+            };
+            if let Value::Object(map) = &mut message.content.parts[reply_index].data {
+                map.insert(
+                    "context_text".to_string(),
+                    Value::String(replacement.clone()),
+                );
+            }
+            message.content.text = Self::replace_next_placeholder(
+                &message.content.text,
+                REPLY_MESSAGE_PLACEHOLDER,
+                &replacement,
+            );
+        }
+    }
+
+    fn resolve_reply_context(
+        db_manager: &QQChatContextManager,
+        source: &str,
+        source_conversation_id: &str,
+        reply_data: &Value,
+    ) -> Result<String> {
+        let Some(reply_id) = Self::json_value_string(reply_data.get("id")) else {
+            return Ok(REPLY_MESSAGE_PLACEHOLDER.to_string());
+        };
+        let original =
+            db_manager.get_referenced_message(source, source_conversation_id, &reply_id)?;
+        Ok(Self::reply_context_text(&reply_id, original.as_ref()))
+    }
+
+    fn reply_context_text(reply_id: &str, original: Option<&ReferencedMessage>) -> String {
+        let Some(original) = original else {
+            return format!("[reply ID：{}]", reply_id);
+        };
+        let content = original
+            .content_text
+            .as_deref()
+            .map(Self::reply_content_preview)
+            .filter(|content| !content.is_empty());
+        let sender = original.sender_display_name.trim();
+
+        match (sender.is_empty(), content) {
+            (false, Some(content)) => format!("[reply {}：{}]", sender, content),
+            (true, Some(content)) => format!("[reply：{}]", content),
+            (false, None) => format!("[reply {}：ID {}]", sender, reply_id),
+            (true, None) => format!("[reply ID：{}]", reply_id),
+        }
+    }
+
+    fn reply_content_preview(content: &str) -> String {
+        let content = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        if content.chars().count() <= REPLY_PREVIEW_MAX_CHARS {
+            return content;
+        }
+        let mut preview = content
+            .chars()
+            .take(REPLY_PREVIEW_MAX_CHARS)
+            .collect::<String>();
+        preview.push('…');
+        preview
+    }
+
+    fn json_value_string(value: Option<&Value>) -> Option<String> {
+        match value? {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        }
+        .filter(|value| !value.trim().is_empty())
+    }
+
+    /// 文件段只根据明确的图片扩展名进入图片处理，不对其他文件推断类型。
+    fn is_image_file_part(file_data: &Value) -> bool {
+        file_data
+            .get("file")
+            .and_then(Value::as_str)
+            .and_then(Self::image_format_from_path)
+            .and_then(Self::image_mime_type)
+            .is_some()
+    }
+
+    fn image_enrichment_failure_text(is_file: bool, placeholder: &str) -> String {
+        if is_file {
+            Self::wrap_file_context(placeholder, IMAGE_READ_FAILED_TEXT)
+        } else {
+            IMAGE_READ_FAILED_TEXT.to_string()
+        }
+    }
+
+    fn wrap_file_context(file_placeholder: &str, image_context: &str) -> String {
+        if let Some(file_prefix) = file_placeholder.strip_suffix(']') {
+            format!("{} {}]", file_prefix, image_context)
+        } else {
+            format!("[文件 {}]", image_context)
         }
     }
 
@@ -204,12 +333,10 @@ impl MessageEnricher {
             image.description
         };
 
-        let placeholder_text = EnrichedImage::context_text_for(image_id, "");
         let described_text = EnrichedImage::context_text_for(image_id, &description);
         let updated_messages = db_manager.complete_received_image_description(
             image_id,
             &description,
-            &placeholder_text,
             &described_text,
         )?;
         info!(image_id, updated_messages, "后台图片描述已写回数据库");
@@ -302,7 +429,7 @@ impl MessageEnricher {
             anyhow::bail!("下载图片返回错误状态 {}: {}", resp.status(), image_url);
         }
 
-        let mime_type = resp
+        let response_mime_type = resp
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
@@ -314,6 +441,9 @@ impl MessageEnricher {
         if bytes.is_empty() {
             anyhow::bail!("下载到空图片: {}", image_url);
         }
+        let mime_type = response_mime_type
+            .filter(|mime_type| mime_type.starts_with("image/"))
+            .or_else(|| Self::detect_image_mime_type(&bytes).map(str::to_string));
 
         Ok(DownloadedImage {
             bytes,
@@ -525,7 +655,7 @@ impl MessageEnricher {
     }
 
     /// 给结构化图片片段补充本地索引信息，便于后续按图片 ID 找回原图。
-    fn attach_image_info(image_data: &mut Value, image: &EnrichedImage) {
+    fn attach_image_info(image_data: &mut Value, image: &EnrichedImage, context_text: &str) {
         if let Value::Object(map) = image_data {
             map.insert(
                 "image_id".to_string(),
@@ -543,13 +673,17 @@ impl MessageEnricher {
                 "description".to_string(),
                 Value::String(image.description.clone()),
             );
+            map.insert(
+                "context_text".to_string(),
+                Value::String(context_text.to_string()),
+            );
         }
     }
 
-    /// 替换下一处图片占位符；异常情况下把图片引用追加到消息末尾。
-    fn replace_next_image_placeholder(text: &str, replacement: &str) -> String {
-        if let Some(index) = text.find("[图片]") {
-            let placeholder_len = "[图片]".len();
+    /// 替换下一处富内容占位符；异常情况下把解析结果追加到消息末尾。
+    fn replace_next_placeholder(text: &str, placeholder: &str, replacement: &str) -> String {
+        if let Some(index) = text.find(placeholder) {
+            let placeholder_len = placeholder.len();
             format!(
                 "{}{}{}",
                 &text[..index],
@@ -581,20 +715,29 @@ impl MessageEnricher {
         }
     }
 
-    fn mime_type_from_path(path: &str) -> &'static str {
-        match Path::new(path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("jpg") | Some("jpeg") => "image/jpeg",
-            Some("png") => "image/png",
-            Some("gif") => "image/gif",
-            Some("webp") => "image/webp",
-            Some("bmp") => "image/bmp",
-            _ => "image/jpeg",
+    fn detect_image_mime_type(bytes: &[u8]) -> Option<&'static str> {
+        Self::image_mime_type(image::guess_format(bytes).ok()?)
+    }
+
+    fn image_format_from_path(path: &str) -> Option<ImageFormat> {
+        ImageFormat::from_extension(Path::new(path).extension()?.to_str()?)
+    }
+
+    fn image_mime_type(format: ImageFormat) -> Option<&'static str> {
+        match format {
+            ImageFormat::Jpeg => Some("image/jpeg"),
+            ImageFormat::Png => Some("image/png"),
+            ImageFormat::Gif => Some("image/gif"),
+            ImageFormat::WebP => Some("image/webp"),
+            ImageFormat::Bmp => Some("image/bmp"),
+            _ => None,
         }
+    }
+
+    fn mime_type_from_path(path: &str) -> &'static str {
+        Self::image_format_from_path(path)
+            .and_then(Self::image_mime_type)
+            .unwrap_or("image/jpeg")
     }
 
     /// 清理模型输出，保证插入聊天记录时是一行短文本。
@@ -646,8 +789,85 @@ impl From<ReceivedImageRecord> for EnrichedImage {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnrichedImage, MessageEnricher, VISION_IMAGE_MAX_SIDE};
+    use super::{
+        EnrichedImage, MessageEnricher, REPLY_MESSAGE_PLACEHOLDER, REPLY_PREVIEW_MAX_CHARS,
+        VISION_IMAGE_MAX_SIDE,
+    };
+    use crate::repository::db_manager::{NewChatMessage, QQChatContextManager};
     use image::{DynamicImage, GenericImageView, RgbImage};
+    use serde_json::json;
+
+    #[test]
+    fn reply_context_resolves_original_message_and_keeps_current_text() {
+        let path = std::env::temp_dir().join(format!(
+            "rolava-reply-test-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        manager
+            .write_message(&NewChatMessage {
+                source: "onebot".to_string(),
+                source_conversation_id: "720206567".to_string(),
+                conversation_kind: "group".to_string(),
+                conversation_title: None,
+                conversation_metadata_json: "{}".to_string(),
+                source_message_id: Some("2026419509".to_string()),
+                sender_id: "10001".to_string(),
+                sender_display_name: "小明".to_string(),
+                sender_nickname: None,
+                sender_role: None,
+                content_text: "原始消息内容".to_string(),
+                message_type: "text".to_string(),
+                content_parts_json: "[]".to_string(),
+                metadata_json: "{}".to_string(),
+                event_timestamp: 1,
+            })
+            .unwrap();
+
+        let context = MessageEnricher::resolve_reply_context(
+            &manager,
+            "onebot",
+            "720206567",
+            &json!({"id": "2026419509"}),
+        )
+        .unwrap();
+        assert_eq!(context, "[reply 小明：原始消息内容]");
+        assert_eq!(
+            MessageEnricher::replace_next_placeholder(
+                "[回复消息] 吃饱了撑的",
+                REPLY_MESSAGE_PLACEHOLDER,
+                &context,
+            ),
+            "[reply 小明：原始消息内容] 吃饱了撑的"
+        );
+
+        drop(manager);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reply_preview_collapses_whitespace_and_truncates_by_characters() {
+        assert_eq!(
+            MessageEnricher::reply_content_preview("第一行\n  第二行"),
+            "第一行 第二行"
+        );
+
+        let long_content = "长".repeat(REPLY_PREVIEW_MAX_CHARS + 5);
+        let preview = MessageEnricher::reply_content_preview(&long_content);
+        assert_eq!(preview.chars().count(), REPLY_PREVIEW_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn only_explicit_image_file_extensions_enter_image_pipeline() {
+        assert!(MessageEnricher::is_image_file_part(&json!({
+            "file": "Image_1785858162735_686.PNG"
+        })));
+        assert!(!MessageEnricher::is_image_file_part(&json!({
+            "file": "2026-08-01 12-25-48.mp4"
+        })));
+    }
 
     #[test]
     fn image_context_uses_markdown_attachment_reference() {
@@ -682,6 +902,28 @@ mod tests {
         assert_eq!(
             image.context_text(),
             r"![截图包含 \[确定\] 和 C:\\temp](attachment://img_A1b2C3d4)"
+        );
+    }
+
+    #[test]
+    fn file_image_context_wraps_one_image_reference() {
+        let mut image = EnrichedImage {
+            image_id: "img_A1b2C3d4".to_string(),
+            content_hash: String::new(),
+            local_path: String::new(),
+            description: String::new(),
+            needs_description: false,
+        };
+        let file_context = "[文件 Image_1785858162735_686.png；30.71 MB]";
+
+        assert_eq!(
+            MessageEnricher::wrap_file_context(file_context, &image.context_text()),
+            "[文件 Image_1785858162735_686.png；30.71 MB ![图片](attachment://img_A1b2C3d4)]"
+        );
+        image.description = "一张测试图片".to_string();
+        assert_eq!(
+            MessageEnricher::wrap_file_context(file_context, &image.context_text()),
+            "[文件 Image_1785858162735_686.png；30.71 MB ![一张测试图片](attachment://img_A1b2C3d4)]"
         );
     }
 

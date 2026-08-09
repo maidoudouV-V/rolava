@@ -7,6 +7,7 @@ mod get_scheduled_task;
 mod registry;
 mod remember;
 mod send_message;
+mod send_qq_expression;
 mod update_scheduled_task;
 mod wait_for_reply;
 
@@ -19,6 +20,7 @@ pub use get_scheduled_task::{GetScheduledTaskArgs, GetScheduledTaskTool};
 pub use registry::ToolRegistry;
 pub use remember::{RememberArgs, RememberTool};
 pub use send_message::{SendMessageArgs, SendMessageTool};
+pub use send_qq_expression::{SendQqExpressionArgs, SendQqExpressionTool};
 pub use update_scheduled_task::{UpdateScheduledTaskArgs, UpdateScheduledTaskTool};
 pub use wait_for_reply::{WaitForReplyArgs, WaitForReplyTool};
 
