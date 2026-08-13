@@ -9,13 +9,12 @@ on:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    # 在与生产运行镜像相同的 Debian 版本中编译，避免产物依赖更高版本的 glibc。
+    container: rust:bookworm
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal
 
       - name: Build release
         run: cargo build --release
