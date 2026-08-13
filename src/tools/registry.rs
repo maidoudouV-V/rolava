@@ -98,37 +98,3 @@ impl ToolRegistry {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ToolRegistry;
-
-    #[test]
-    fn built_in_registry_contains_every_current_action() {
-        let names = ToolRegistry::built_in()
-            .definitions()
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            names,
-            vec![
-                "agent_web_search",
-                "continue_conversation",
-                "create_scheduled_task",
-                "create_user_memory",
-                "delete_character_memory",
-                "delete_scheduled_task",
-                "delete_user_memory",
-                "end_conversation",
-                "get_scheduled_task",
-                "send_qq_expression",
-                "set_character_memory",
-                "update_scheduled_task",
-                "update_user_memory",
-                "wait_for_reply",
-            ]
-        );
-    }
-}

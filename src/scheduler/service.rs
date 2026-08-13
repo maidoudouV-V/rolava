@@ -271,6 +271,7 @@ mod tests {
 
     use super::SchedulerService;
 
+    // 验证到期的一次性任务会触发会话并被移除。
     #[test]
     fn due_one_time_task_is_removed_and_routed() {
         let path = std::env::temp_dir().join(format!(

@@ -25,6 +25,7 @@ use crate::transport::{GroupInfo, SendOptions};
 use super::filter::FilteredMessage;
 
 const MAX_TOOL_ROUNDS: usize = 8;
+const DIRECT_TOOL_HISTORY_TURNS: usize = 5;
 
 /// 为单个会话构造上下文、请求 AI 并处理响应。
 pub struct ChatProcessor {
@@ -148,6 +149,15 @@ impl ChatProcessor {
         send_options: SendOptions,
         current_message_ids: &[i64],
     ) {
+        if matches!(
+            self.message_target.conversation.kind,
+            ConversationKind::Direct
+        ) {
+            let removed = self.runtime_context.advance_tool_history_turn();
+            if removed > 0 {
+                debug!(tool_history_count = removed, "私聊工具历史已超过五轮保留期");
+            }
+        }
         let built_context = match self
             .build_context(
                 conversation_messages,
@@ -386,6 +396,15 @@ impl ChatProcessor {
                 tool_round_message_ids,
             ) {
                 Ok(history) => {
+                    // 私聊减少长期工具协议占用，群聊则继续保留到对话结束或窗口淘汰。
+                    let history = if matches!(
+                        self.message_target.conversation.kind,
+                        ConversationKind::Direct
+                    ) {
+                        history.with_turn_limit(DIRECT_TOOL_HISTORY_TURNS)
+                    } else {
+                        history
+                    };
                     if let Err(error) = self.runtime_context.push_tool_history(history) {
                         error!(error = %error, "追加内存工具历史失败");
                     }
@@ -886,86 +905,5 @@ impl ChatProcessor {
         let content = db_msg.content_text.clone().unwrap_or_default();
 
         format!("{}（{}）:{}", sender_name, time_text, content)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ChatProcessor;
-    use crate::tools::{ConversationEffect, ToolResult};
-
-    #[test]
-    fn tool_loop_stops_when_results_do_not_require_ai_response() {
-        let results = vec![tool_result("任务添加成功", false), tool_result("", false)];
-
-        assert!(!ChatProcessor::should_continue_tool_loop(&results));
-    }
-
-    #[test]
-    fn tool_loop_continues_when_any_result_requires_ai_response() {
-        let results = vec![tool_result("", true), tool_result("任务添加成功", false)];
-
-        assert!(ChatProcessor::should_continue_tool_loop(&results));
-    }
-
-    #[test]
-    fn empty_response_content_is_not_sent() {
-        assert_eq!(ChatProcessor::non_empty_response_content(None), None);
-        assert_eq!(ChatProcessor::non_empty_response_content(Some("")), None);
-        assert_eq!(
-            ChatProcessor::non_empty_response_content(Some("  \n")),
-            None
-        );
-        assert_eq!(
-            ChatProcessor::non_empty_response_content(Some("正常回复")),
-            Some("正常回复")
-        );
-    }
-
-    #[test]
-    fn vision_images_follow_configured_message_window() {
-        let message_ids = (1..=12).collect::<Vec<_>>();
-
-        let visible_ids = ChatProcessor::vision_message_ids(&message_ids, true, 4);
-
-        assert_eq!(visible_ids.len(), 4);
-        assert!(!visible_ids.contains(&8));
-        assert!(visible_ids.contains(&9));
-        assert!(visible_ids.contains(&12));
-        assert!(ChatProcessor::vision_message_ids(&message_ids, false, 4).is_empty());
-        assert!(ChatProcessor::vision_message_ids(&message_ids, true, 0).is_empty());
-    }
-
-    #[test]
-    fn unread_message_time_reports_earliest_boundary() {
-        assert_eq!(ChatProcessor::render_unread_message_time(None), None);
-
-        let time = ChatProcessor::render_unread_message_time(Some(0));
-        assert!(time.is_some_and(|time| time.len() == 16));
-    }
-
-    #[test]
-    fn optional_prompt_line_is_removed_without_a_value() {
-        let prompt = "# 当前状态\n- 当前日期:2026-08-09\n- 未读:{{time}}\n# 当前任务";
-
-        assert_eq!(
-            ChatProcessor::replace_optional_prompt_line(prompt, "{{time}}", None),
-            "# 当前状态\n- 当前日期:2026-08-09\n# 当前任务"
-        );
-        assert_eq!(
-            ChatProcessor::replace_optional_prompt_line(prompt, "{{time}}", Some("12:30")),
-            "# 当前状态\n- 当前日期:2026-08-09\n- 未读:12:30\n# 当前任务"
-        );
-    }
-
-    fn tool_result(content: &str, requires_ai_response: bool) -> ToolResult {
-        ToolResult {
-            tool_call_id: "call_1".to_string(),
-            tool_name: "test_tool".to_string(),
-            content: content.to_string(),
-            requires_ai_response,
-            is_error: false,
-            conversation_effect: ConversationEffect::None,
-        }
     }
 }

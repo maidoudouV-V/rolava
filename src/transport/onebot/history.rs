@@ -163,6 +163,7 @@ fn value_as_i64(value: &Value) -> Option<i64> {
 mod tests {
     use super::{OneBotGroupHistoryDataDto, OneBotHistoryApiResponse};
 
+    // 验证字符串类型的消息序号可解析并参与排序。
     #[test]
     fn parses_group_history_response_with_string_message_sequence() {
         let response: OneBotHistoryApiResponse<OneBotGroupHistoryDataDto> = serde_json::from_str(

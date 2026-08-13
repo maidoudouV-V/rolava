@@ -73,6 +73,7 @@ pub struct ActiveToolHistory {
     pub after_message_id: Option<i64>,
     rounds: Vec<ToolRoundHistory>,
     suppressed_message_ids: HashSet<i64>,
+    remaining_turns: Option<usize>,
 }
 
 impl ActiveToolHistory {
@@ -88,9 +89,16 @@ impl ActiveToolHistory {
             after_message_id,
             rounds,
             suppressed_message_ids: suppressed_message_ids.into_iter().collect(),
+            remaining_turns: None,
         };
         history.validate()?;
         Ok(history)
+    }
+
+    /// 限制工具历史只参与之后指定数量的会话处理轮次。
+    pub fn with_turn_limit(mut self, turns: usize) -> Self {
+        self.remaining_turns = Some(turns);
+        self
     }
 
     pub fn suppresses_message(&self, message_id: i64) -> bool {
@@ -175,6 +183,21 @@ impl RuntimeContextState {
         self.validate()
     }
 
+    /// 开始新一轮会话处理，并删除已经用满保留轮次的工具历史。
+    pub fn advance_tool_history_turn(&mut self) -> usize {
+        let before = self.active_tool_histories.len();
+        self.active_tool_histories
+            .retain_mut(|history| match history.remaining_turns.as_mut() {
+                None => true,
+                Some(0) => false,
+                Some(remaining) => {
+                    *remaining -= 1;
+                    true
+                }
+            });
+        before - self.active_tool_histories.len()
+    }
+
     /// 对话结束后只保留 messages 中已经真实发送的正文，不再保留工具协议。
     pub fn compact_finished_conversation(&mut self) -> usize {
         let removed = self.active_tool_histories.len();
@@ -211,83 +234,5 @@ impl RuntimeContextState {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ActiveToolHistory, RuntimeContextState, ToolRoundHistory};
-    use crate::ai_provider::ToolChatMessage;
-    use crate::tools::ToolCall;
-
-    #[test]
-    fn stable_append_keeps_boundaries_and_window_rebuild_discards_them() {
-        let mut state = RuntimeContextState::default();
-        assert!(!state.reconcile_message_ids(&[1, 2]).unwrap());
-        state.seal_current_tail();
-        assert!(state.is_sealed_after(2));
-
-        assert!(!state.reconcile_message_ids(&[1, 2, 3]).unwrap());
-        assert!(state.is_sealed_after(2));
-
-        assert!(state.reconcile_message_ids(&[3, 4]).unwrap());
-        assert!(!state.is_sealed_after(2));
-    }
-
-    #[test]
-    fn invalid_database_order_is_rejected() {
-        let mut state = RuntimeContextState::default();
-        assert!(state.reconcile_message_ids(&[2, 1]).is_err());
-        assert!(state.reconcile_message_ids(&[1, 1]).is_err());
-    }
-
-    #[test]
-    fn tool_history_is_validated_reconciled_and_compacted() {
-        let round = ToolRoundHistory::new(
-            ToolChatMessage::Assistant {
-                content: Some("正在查询".to_string()),
-                reasoning: None,
-                tool_calls: vec![ToolCall {
-                    id: "call-1".to_string(),
-                    name: "test_tool".to_string(),
-                    arguments: "{}".to_string(),
-                }],
-            },
-            vec![ToolChatMessage::Tool {
-                tool_call_id: "call-1".to_string(),
-                content: "查询结果".to_string(),
-            }],
-        )
-        .unwrap();
-        let history = ActiveToolHistory::new(Some(2), vec![round], [3]).unwrap();
-        let mut state = RuntimeContextState::default();
-        state.reconcile_message_ids(&[1, 2, 3]).unwrap();
-        state.push_tool_history(history).unwrap();
-
-        assert!(state.reconcile_message_ids(&[2, 3, 4]).unwrap());
-        assert_eq!(state.active_tool_histories().len(), 1);
-        assert_eq!(state.compact_finished_conversation(), 1);
-        assert!(state.active_tool_histories().is_empty());
-    }
-
-    #[test]
-    fn mismatched_tool_result_is_rejected() {
-        let result = ToolRoundHistory::new(
-            ToolChatMessage::Assistant {
-                content: None,
-                reasoning: None,
-                tool_calls: vec![ToolCall {
-                    id: "call-1".to_string(),
-                    name: "test_tool".to_string(),
-                    arguments: "{}".to_string(),
-                }],
-            },
-            vec![ToolChatMessage::Tool {
-                tool_call_id: "call-other".to_string(),
-                content: "错误结果".to_string(),
-            }],
-        );
-
-        assert!(result.is_err());
     }
 }

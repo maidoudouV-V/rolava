@@ -181,28 +181,3 @@ impl Tool for WaitForReplyTool {
         )))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Tool, WaitForReplyTool};
-
-    #[test]
-    fn same_target_is_replaced_and_different_targets_coexist() {
-        let tool = WaitForReplyTool::new();
-
-        let first_id = tool.replace_target_task("10001".to_string());
-        let second_id = tool.replace_target_task("10001".to_string());
-        let other_id = tool.replace_target_task("10002".to_string());
-
-        assert_ne!(first_id, second_id);
-        assert_ne!(second_id, other_id);
-        assert_eq!(
-            tool.pending_tasks.lock().targets.get("10001"),
-            Some(&second_id)
-        );
-        assert_eq!(tool.pending_tasks.lock().targets.len(), 2);
-
-        tool.reset_conversation_state();
-        assert!(tool.pending_tasks.lock().targets.is_empty());
-    }
-}

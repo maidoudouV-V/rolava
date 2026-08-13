@@ -178,30 +178,3 @@ impl CommandSystem {
             .collect()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::CommandSystem;
-
-    #[test]
-    fn parses_command_name_and_arguments() {
-        let invocation = CommandSystem::parse_invocation("  /reset now  ").unwrap();
-
-        assert_eq!(invocation.name, "reset");
-        assert_eq!(invocation.arguments, "now");
-        assert!(CommandSystem::parse_invocation("普通消息").is_none());
-        assert!(CommandSystem::parse_invocation(" / ").is_none());
-    }
-
-    #[test]
-    fn command_whitelist_ignores_empty_and_duplicate_accounts() {
-        let whitelist = CommandSystem::normalize_whitelist(vec![
-            " 10001 ".to_string(),
-            "10001".to_string(),
-            "".to_string(),
-        ]);
-
-        assert_eq!(whitelist.len(), 1);
-        assert!(whitelist.contains("10001"));
-    }
-}

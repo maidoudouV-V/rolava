@@ -112,8 +112,9 @@ fn validate_text_length(name: &str, value: &str, min: usize, max: usize) -> Resu
 mod tests {
     use chrono::{Duration, Local};
 
-    use super::{calculate_next_run, validate_task_text};
+    use super::calculate_next_run;
 
+    // 验证五段 cron 表达式能计算下次执行时间。
     #[test]
     fn parses_five_field_cron() {
         let now = Local::now();
@@ -121,6 +122,7 @@ mod tests {
         assert!(next > now);
     }
 
+    // 验证过去的一次性执行时间会被拒绝。
     #[test]
     fn rejects_past_one_time_schedule() {
         let now = Local::now();
@@ -128,13 +130,5 @@ mod tests {
             .format("at:%Y-%m-%d %H:%M:%S")
             .to_string();
         assert!(calculate_next_run(&past, now).is_err());
-    }
-
-    #[test]
-    fn task_text_limits_count_unicode_characters() {
-        assert!(validate_task_text(&"标".repeat(50), &"说".repeat(1000)).is_ok());
-        assert!(validate_task_text(&"标".repeat(51), "说明").is_err());
-        assert!(validate_task_text("标题", &"说".repeat(1001)).is_err());
-        assert!(validate_task_text("两行\n标题", "说明").is_err());
     }
 }

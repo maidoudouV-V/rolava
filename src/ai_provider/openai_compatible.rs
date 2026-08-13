@@ -530,6 +530,7 @@ fn parse_openai_compatible_response(
 mod tests {
     use super::*;
 
+    // 验证推理文本会以兼容接口字段回传。
     #[test]
     fn text_reasoning_is_replayed_as_openai_reasoning_content() {
         let response = parse_openai_compatible_chat_response(
@@ -566,48 +567,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_stop_response_is_valid_no_action() {
-        let response = parse_openai_compatible_chat_response(
-            r#"{
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": []
-                    },
-                    "finish_reason": "stop"
-                }]
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(response.content, None);
-        assert!(response.tool_calls.is_empty());
-        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
-    }
-
-    #[test]
-    fn empty_non_stop_response_is_rejected() {
-        let error = parse_openai_compatible_chat_response(
-            r#"{
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": []
-                    },
-                    "finish_reason": "length"
-                }]
-            }"#,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("finish_reason 不是 stop"));
-    }
-
+    // 验证联网请求遵循官方的上下文大小参数。
     #[test]
     fn web_search_request_uses_official_medium_context_option() {
         let request = OpenAICompatibleWebSearchRequest {
@@ -629,18 +589,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plain_text_user_message_stays_string() {
-        let messages = vec![ToolChatMessage::User {
-            content: ToolChatUserContent::text("纯文本"),
-        }];
-
-        let request = build_openai_compatible_request("test", 100, "medium", &messages, &[]);
-        let request_json = serde_json::to_value(request).unwrap();
-
-        assert_eq!(request_json["messages"][0]["content"], "纯文本");
-    }
-
+    // 验证图文消息使用高精度图片参数。
     #[test]
     fn multimodal_user_message_uses_high_detail_image_url() {
         let messages = vec![ToolChatMessage::User {

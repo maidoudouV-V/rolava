@@ -147,6 +147,7 @@ mod tests {
     use super::ResourceCleanupService;
     use crate::repository::db_manager::{NewReceivedImage, QQChatContextManager};
 
+    // 验证过期图片会同时删除本地文件和数据库记录。
     #[tokio::test]
     async fn expired_image_file_and_database_record_are_deleted() {
         let root = std::env::temp_dir().join(format!(

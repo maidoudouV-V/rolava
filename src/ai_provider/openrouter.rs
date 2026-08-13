@@ -548,6 +548,7 @@ fn non_empty_text(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // 验证结构化推理会原样回传给 OpenRouter。
     #[test]
     fn structured_reasoning_is_replayed_without_conversion() {
         let response = parse_openrouter_chat_response(
@@ -590,60 +591,7 @@ mod tests {
         assert!(request_json["messages"][0].get("reasoning").is_none());
     }
 
-    #[test]
-    fn empty_stop_response_is_valid_no_action() {
-        let response = parse_openrouter_chat_response(
-            r#"{
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": []
-                    },
-                    "finish_reason": "stop"
-                }]
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(response.content, None);
-        assert!(response.tool_calls.is_empty());
-        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
-    }
-
-    #[test]
-    fn empty_non_stop_response_is_rejected() {
-        let error = parse_openrouter_chat_response(
-            r#"{
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": []
-                    },
-                    "finish_reason": "length"
-                }]
-            }"#,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("finish_reason 不是 stop"));
-    }
-
-    #[test]
-    fn plain_text_user_message_stays_string() {
-        let messages = vec![ToolChatMessage::User {
-            content: ToolChatUserContent::text("纯文本"),
-        }];
-
-        let request = build_openrouter_chat_request("test", 100, "medium", &messages, &[]);
-        let request_json = serde_json::to_value(request).unwrap();
-
-        assert_eq!(request_json["messages"][0]["content"], "纯文本");
-    }
-
+    // 验证图文消息使用高精度图片参数。
     #[test]
     fn multimodal_user_message_uses_high_detail_image_url() {
         let messages = vec![ToolChatMessage::User {

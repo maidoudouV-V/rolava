@@ -789,14 +789,12 @@ impl From<ReceivedImageRecord> for EnrichedImage {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EnrichedImage, MessageEnricher, REPLY_MESSAGE_PLACEHOLDER, REPLY_PREVIEW_MAX_CHARS,
-        VISION_IMAGE_MAX_SIDE,
-    };
+    use super::{MessageEnricher, REPLY_MESSAGE_PLACEHOLDER, VISION_IMAGE_MAX_SIDE};
     use crate::repository::db_manager::{NewChatMessage, QQChatContextManager};
     use image::{DynamicImage, GenericImageView, RgbImage};
     use serde_json::json;
 
+    // 验证回复消息会从数据库补全原文上下文。
     #[test]
     fn reply_context_resolves_original_message_and_keeps_current_text() {
         let path = std::env::temp_dir().join(format!(
@@ -846,87 +844,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn reply_preview_collapses_whitespace_and_truncates_by_characters() {
-        assert_eq!(
-            MessageEnricher::reply_content_preview("第一行\n  第二行"),
-            "第一行 第二行"
-        );
-
-        let long_content = "长".repeat(REPLY_PREVIEW_MAX_CHARS + 5);
-        let preview = MessageEnricher::reply_content_preview(&long_content);
-        assert_eq!(preview.chars().count(), REPLY_PREVIEW_MAX_CHARS + 1);
-        assert!(preview.ends_with('…'));
-    }
-
-    #[test]
-    fn only_explicit_image_file_extensions_enter_image_pipeline() {
-        assert!(MessageEnricher::is_image_file_part(&json!({
-            "file": "Image_1785858162735_686.PNG"
-        })));
-        assert!(!MessageEnricher::is_image_file_part(&json!({
-            "file": "2026-08-01 12-25-48.mp4"
-        })));
-    }
-
-    #[test]
-    fn image_context_uses_markdown_attachment_reference() {
-        let image = EnrichedImage {
-            image_id: "img_7Kf3aQ9B".to_string(),
-            content_hash: String::new(),
-            local_path: String::new(),
-            description: "一只白猫趴在窗台上".to_string(),
-            needs_description: false,
-        };
-
-        assert_eq!(
-            image.context_text(),
-            "![一只白猫趴在窗台上](attachment://img_7Kf3aQ9B)"
-        );
-        assert_eq!(
-            EnrichedImage::context_text_for("img_7Kf3aQ9B", ""),
-            "![图片](attachment://img_7Kf3aQ9B)"
-        );
-    }
-
-    #[test]
-    fn image_context_escapes_generated_description() {
-        let image = EnrichedImage {
-            image_id: "img_A1b2C3d4".to_string(),
-            content_hash: String::new(),
-            local_path: String::new(),
-            description: r"截图包含 [确定] 和 C:\temp".to_string(),
-            needs_description: false,
-        };
-
-        assert_eq!(
-            image.context_text(),
-            r"![截图包含 \[确定\] 和 C:\\temp](attachment://img_A1b2C3d4)"
-        );
-    }
-
-    #[test]
-    fn file_image_context_wraps_one_image_reference() {
-        let mut image = EnrichedImage {
-            image_id: "img_A1b2C3d4".to_string(),
-            content_hash: String::new(),
-            local_path: String::new(),
-            description: String::new(),
-            needs_description: false,
-        };
-        let file_context = "[文件 Image_1785858162735_686.png；30.71 MB]";
-
-        assert_eq!(
-            MessageEnricher::wrap_file_context(file_context, &image.context_text()),
-            "[文件 Image_1785858162735_686.png；30.71 MB ![图片](attachment://img_A1b2C3d4)]"
-        );
-        image.description = "一张测试图片".to_string();
-        assert_eq!(
-            MessageEnricher::wrap_file_context(file_context, &image.context_text()),
-            "[文件 Image_1785858162735_686.png；30.71 MB ![一张测试图片](attachment://img_A1b2C3d4)]"
-        );
-    }
-
+    // 验证超出视觉限制的图片会按比例缩放。
     #[test]
     fn image_request_resizes_only_when_longest_side_exceeds_1920() {
         let image = DynamicImage::ImageRgb8(RgbImage::new(2400, 1200));

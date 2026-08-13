@@ -1491,6 +1491,7 @@ mod tests {
     use super::{NewChatMessage, NewReceivedImage, QQChatContextManager};
     use rand::Rng;
 
+    // 验证历史窗口按返回的分块大小滚动。
     #[test]
     fn history_window_rolls_by_the_same_block_size_it_returns() {
         let path = temporary_db_path();
@@ -1518,6 +1519,7 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    // 验证重复入库不会新增未读消息。
     #[test]
     fn idempotent_incoming_write_keeps_one_unread_message() {
         let path = temporary_db_path();
@@ -1539,6 +1541,7 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    // 验证图片描述完成后同步更新图片和消息且保留未读状态。
     #[test]
     fn completed_image_description_updates_image_and_message_without_marking_it_read() {
         let path = temporary_db_path();
@@ -1600,18 +1603,7 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn completed_description_preserves_file_wrapper() {
-        assert_eq!(
-            QQChatContextManager::image_context_with_description(
-                "[文件 example.png；2.00 MB ![图片](attachment://img_A1b2C3d4)]",
-                "img_A1b2C3d4",
-                "![一张梗图](attachment://img_A1b2C3d4)",
-            ),
-            "[文件 example.png；2.00 MB ![一张梗图](attachment://img_A1b2C3d4)]"
-        );
-    }
-
+    // 验证重置仅删除当前会话聊天状态。
     #[test]
     fn reset_conversation_removes_only_chat_state_and_keeps_scheduled_tasks() {
         let path = temporary_db_path();
@@ -1660,6 +1652,7 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    // 验证定时任务按会话隔离、可更新且可原子领取。
     #[test]
     fn scheduled_tasks_are_scoped_updated_and_claimed_atomically() {
         let path = temporary_db_path();

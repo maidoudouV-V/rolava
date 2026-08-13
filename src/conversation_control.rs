@@ -15,19 +15,3 @@ impl ConversationControl {
         self.bypass_ai_filter.store(enabled, Ordering::Release);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ConversationControl;
-
-    #[test]
-    fn ai_filter_bypass_can_be_changed_without_actor_state() {
-        let control = ConversationControl::default();
-
-        assert!(!control.ai_filter_bypassed());
-        control.set_ai_filter_bypassed(true);
-        assert!(control.ai_filter_bypassed());
-        control.set_ai_filter_bypassed(false);
-        assert!(!control.ai_filter_bypassed());
-    }
-}

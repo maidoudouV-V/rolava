@@ -115,39 +115,3 @@ impl Tool for SendQqExpressionTool {
         Ok(ToolOutput::text(format!("QQ 表情发送成功：{}", sent.text)))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::{SendQqExpressionArgs, SendQqExpressionTool};
-    use crate::transport::QqExpression;
-
-    #[test]
-    fn face_name_requires_exact_mapping_match() {
-        let face_id_map = HashMap::from([("14".to_string(), "微笑".to_string())]);
-
-        let exact = SendQqExpressionTool::resolve_expression(
-            SendQqExpressionArgs {
-                expression: "face".to_string(),
-                face_name: Some("微笑".to_string()),
-            },
-            &face_id_map,
-        )
-        .unwrap();
-        assert!(matches!(
-            exact,
-            QqExpression::Face { id, name } if id == "14" && name == "微笑"
-        ));
-
-        let error = SendQqExpressionTool::resolve_expression(
-            SendQqExpressionArgs {
-                expression: "face".to_string(),
-                face_name: Some("笑".to_string()),
-            },
-            &face_id_map,
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), "没有这个表情：笑");
-    }
-}

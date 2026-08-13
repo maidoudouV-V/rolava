@@ -1788,6 +1788,7 @@ mod tests {
     use std::collections::HashMap;
     use tokio::time::Duration;
 
+    // 验证指向机器人的群戳一戳可解析为会话触发。
     #[test]
     fn target_bot_poke_notice_resolves_group_conversation() {
         let event: OneBotEventDto = serde_json::from_value(json!({
@@ -1814,6 +1815,7 @@ mod tests {
         assert!(matches!(target.conversation.kind, ConversationKind::Group));
     }
 
+    // 验证戳一戳其他目标不会触发机器人会话。
     #[test]
     fn poke_notice_for_another_target_is_ignored() {
         let event: OneBotEventDto = serde_json::from_value(json!({
@@ -1834,6 +1836,7 @@ mod tests {
         assert!(notice.poke_trigger_target().is_none());
     }
 
+    // 验证骰子表情按 OneBot 消息段格式发送。
     #[test]
     fn outgoing_dice_uses_onebot_message_segment() {
         let (expression_type, data, context_text) =
@@ -1847,6 +1850,7 @@ mod tests {
         assert_eq!(context_text, "[QQ表情:骰子]");
     }
 
+    // 验证表情上下文优先使用平台文本并回退到 ID 映射。
     #[test]
     fn face_context_prefers_platform_text_then_uses_id_map() {
         let face_id_map = HashMap::from([
@@ -1881,6 +1885,7 @@ mod tests {
         );
     }
 
+    // 验证未知表情 ID 使用通用上下文文本。
     #[test]
     fn face_context_uses_generic_fallback_for_unknown_id() {
         let face = OneBotMessageSegmentDto {
@@ -1898,6 +1903,7 @@ mod tests {
         );
     }
 
+    // 验证骰子点数存在和缺失时的上下文格式。
     #[test]
     fn dice_context_keeps_point_and_omits_missing_result() {
         let segments = vec![
@@ -1922,6 +1928,7 @@ mod tests {
         );
     }
 
+    // 验证包剪锤结果映射及未知值回退。
     #[test]
     fn rps_context_maps_results_and_omits_unknown_result() {
         let expected = [
@@ -1941,6 +1948,7 @@ mod tests {
         }
     }
 
+    // 验证互动表情类型映射及通用回退。
     #[test]
     fn poke_context_maps_supported_types_and_uses_generic_fallback() {
         let expected = [
@@ -1969,6 +1977,7 @@ mod tests {
         }
     }
 
+    // 验证文件上下文仅保留名称和可读大小。
     #[test]
     fn file_context_uses_only_name_and_human_readable_size() {
         let video_file = OneBotMessageSegmentDto {
@@ -1999,6 +2008,7 @@ mod tests {
         assert!(!video_file.file_context_text().contains("类型"));
     }
 
+    // 验证小程序卡片会生成去重后的上下文文本。
     #[test]
     fn json_miniapp_context_is_wrapped_and_deduplicated() {
         let card = json!({
@@ -2022,6 +2032,7 @@ mod tests {
         );
     }
 
+    // 验证分享卡片保留来源标签且不重复标题。
     #[test]
     fn json_share_context_keeps_source_tag_without_repeating_title() {
         let card = json!({
@@ -2045,6 +2056,7 @@ mod tests {
         );
     }
 
+    // 验证位置卡片保留名称、地址和坐标。
     #[test]
     fn json_location_context_keeps_name_address_and_coordinates() {
         let card = json!({
@@ -2069,6 +2081,7 @@ mod tests {
         );
     }
 
+    // 验证分段发送会跳过连续空行。
     #[test]
     fn text_segments_skip_consecutive_and_blank_lines() {
         let segments =
@@ -2077,6 +2090,7 @@ mod tests {
         assert_eq!(segments, vec!["第一段", "第二段", "第三段"]);
     }
 
+    // 验证关闭分段时保留原始文本。
     #[test]
     fn text_segments_preserve_original_text_when_disabled() {
         let text = "第一段\n\n第二段";
@@ -2085,6 +2099,7 @@ mod tests {
         assert!(OneBotMessageSender::text_segments(" \n\r\n ", false).is_empty());
     }
 
+    // 验证跟进消息延迟按长度累加并有上限。
     #[test]
     fn followup_segment_delay_adds_per_character_time_and_caps_at_six_seconds() {
         assert_eq!(
