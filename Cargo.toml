@@ -18,11 +18,17 @@ r2d2_sqlite = "0.31.0"
 parking_lot = "0.12.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "limit"] }
 async-trait = "0.1"
 toml = "0.8"
+toml_edit = { version = "0.22", features = ["serde"] }
 rand = "0.8"
 base64 = "0.22"
 sha2 = "0.10"
+subtle = "2.6"
+tokio-util = "0.7"
+libc = "0.2"
+tempfile = "3"
 image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 tracing = { version = "0.1", features = ["max_level_trace"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

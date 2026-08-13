@@ -48,6 +48,28 @@ pub struct ConversationRecord {
     pub last_message_at: i64,
 }
 
+/// 管理页面会话列表所需的只读摘要。
+#[derive(Debug, Clone)]
+pub struct AdminConversationSummary {
+    pub conversation: ConversationRecord,
+    pub latest_sender_name: Option<String>,
+    pub latest_content: Option<String>,
+    pub latest_message_at: Option<i64>,
+    pub unread_count: u64,
+}
+
+/// 管理后台概览统计，不包含内部队列等实现状态。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdminDatabaseStats {
+    pub conversations: u64,
+    pub group_conversations: u64,
+    pub direct_conversations: u64,
+    pub messages_today: u64,
+    pub user_memories: u64,
+    pub character_memories: u64,
+    pub scheduled_tasks: u64,
+}
+
 /// 一条聊天记录。
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -139,6 +161,12 @@ pub struct ReceivedImageRecord {
     pub local_path: String,
     /// 图片内容简短描述。
     pub description: String,
+}
+
+/// 管理页面读取图片内容所需的最小资源信息。
+pub struct AdminImageResource {
+    pub local_path: String,
+    pub mime_type: Option<String>,
 }
 
 /// 一条待写入的接收图片记录。
@@ -559,6 +587,130 @@ impl QQChatContextManager {
         } else {
             Ok(None)
         }
+    }
+
+    /// 使用内部稳定 ID 读取会话，避免管理 API 暴露组合主键规则。
+    pub fn get_conversation_by_id(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Option<ConversationRecord>> {
+        let connection = self.conn_pool.get()?;
+        connection
+            .query_row(
+                "SELECT id, source, source_conversation_id, kind, title,
+                        metadata_json, created_at, last_message_at
+                 FROM conversations WHERE id = ?1",
+                params![conversation_id],
+                ConversationRecord::from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// 按最近活动顺序读取稳定游标分页的会话目录。
+    pub fn list_admin_conversations(
+        &self,
+        kind: Option<&str>,
+        cursor: Option<(i64, i64)>,
+        limit: u32,
+    ) -> Result<Vec<AdminConversationSummary>> {
+        let connection = self.conn_pool.get()?;
+        let (cursor_time, cursor_id) = cursor.unwrap_or((i64::MAX, i64::MAX));
+        let kind = kind.filter(|value| matches!(*value, "group" | "direct"));
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.source, c.source_conversation_id, c.kind, c.title,
+                    c.metadata_json, c.created_at, c.last_message_at,
+                    latest.sender_display_name, latest.content_text, latest.event_timestamp,
+                    COALESCE(SUM(CASE WHEN m.is_read = 0 THEN 1 ELSE 0 END), 0)
+             FROM conversations c
+             LEFT JOIN messages latest ON latest.id = (
+                 SELECT id FROM messages WHERE conversation_id = c.id ORDER BY id DESC LIMIT 1
+             )
+             LEFT JOIN messages m ON m.conversation_id = c.id
+             WHERE (?1 IS NULL OR c.kind = ?1)
+               AND (c.last_message_at < ?2 OR (c.last_message_at = ?2 AND c.id < ?3))
+             GROUP BY c.id
+             ORDER BY c.last_message_at DESC, c.id DESC
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![kind, cursor_time, cursor_id, limit.clamp(1, 100)],
+            |row| {
+                Ok(AdminConversationSummary {
+                    conversation: ConversationRecord {
+                        id: row.get(0)?,
+                        source: row.get(1)?,
+                        source_conversation_id: row.get(2)?,
+                        kind: row.get(3)?,
+                        title: row.get(4)?,
+                        metadata_json: row.get(5)?,
+                        created_at: row.get(6)?,
+                        last_message_at: row.get(7)?,
+                    },
+                    latest_sender_name: row.get(8)?,
+                    latest_content: row.get(9)?,
+                    latest_message_at: row.get(10)?,
+                    unread_count: row.get(11)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 读取会话详情中的消息页，返回顺序为从旧到新。
+    pub fn get_admin_conversation_messages(
+        &self,
+        conversation_id: i64,
+        before_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<ChatMessage>> {
+        let connection = self.conn_pool.get()?;
+        let mut statement = connection.prepare(
+            "SELECT m.id, m.conversation_id, c.source, c.source_conversation_id, c.kind,
+                    m.source_message_id, m.sender_id, m.sender_display_name, m.sender_nickname,
+                    m.sender_role, m.content_text, m.message_type, m.content_parts_json,
+                    m.metadata_json, m.is_read, m.event_timestamp, m.created_at
+             FROM messages m
+             INNER JOIN conversations c ON c.id = m.conversation_id
+             WHERE m.conversation_id = ?1 AND (?2 IS NULL OR m.id < ?2)
+             ORDER BY m.id DESC LIMIT ?3",
+        )?;
+        let mut messages = statement
+            .query_map(
+                params![conversation_id, before_id, limit.clamp(1, 100)],
+                ChatMessage::from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
+    pub fn admin_database_stats(&self, today_start_timestamp: i64) -> Result<AdminDatabaseStats> {
+        let connection = self.conn_pool.get()?;
+        connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM conversations),
+                   (SELECT COUNT(*) FROM conversations WHERE kind = 'group'),
+                   (SELECT COUNT(*) FROM conversations WHERE kind = 'direct'),
+                   (SELECT COUNT(*) FROM messages WHERE event_timestamp >= ?1),
+                   (SELECT COUNT(*) FROM user_memories),
+                   (SELECT COUNT(*) FROM character_memories),
+                   (SELECT COUNT(*) FROM scheduled_tasks)",
+                params![today_start_timestamp],
+                |row| {
+                    Ok(AdminDatabaseStats {
+                        conversations: row.get(0)?,
+                        group_conversations: row.get(1)?,
+                        direct_conversations: row.get(2)?,
+                        messages_today: row.get(3)?,
+                        user_memories: row.get(4)?,
+                        character_memories: row.get(5)?,
+                        scheduled_tasks: row.get(6)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
     /// 原子清空单个会话的聊天记录，保留会话目录及其定时任务。
@@ -1198,6 +1350,23 @@ impl QQChatContextManager {
             )
             .optional()?;
         Ok(record)
+    }
+
+    pub fn get_admin_image_resource(&self, image_id: &str) -> Result<Option<AdminImageResource>> {
+        self.conn_pool
+            .get()?
+            .query_row(
+                "SELECT local_path, mime_type FROM received_images WHERE image_id = ?1",
+                params![image_id],
+                |row| {
+                    Ok(AdminImageResource {
+                        local_path: row.get(0)?,
+                        mime_type: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// 判断图片短 ID 是否已经存在，避免随机 ID 碰撞。

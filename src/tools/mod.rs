@@ -24,7 +24,7 @@ pub use delete_scheduled_task::DeleteScheduledTaskTool;
 pub use delete_user_memory::DeleteUserMemoryTool;
 pub use end_conversation::EndConversationTool;
 pub use get_scheduled_task::GetScheduledTaskTool;
-pub use registry::ToolRegistry;
+pub use registry::{OptionalToolDefinition, ToolRegistry};
 pub use send_qq_expression::SendQqExpressionTool;
 pub use set_character_memory::SetCharacterMemoryTool;
 pub use update_scheduled_task::UpdateScheduledTaskTool;

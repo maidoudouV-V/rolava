@@ -150,6 +150,7 @@ impl ConversationDispatcher {
             processor,
             self.command_system.clone(),
             conversation_control,
+            &self.tool_services.app_config.app.enabled_actions,
         );
         let actor_span = info_span!("conversation", conversation_key);
         tokio::spawn(actor.run().instrument(actor_span));

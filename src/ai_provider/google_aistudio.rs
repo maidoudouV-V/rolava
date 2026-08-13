@@ -17,7 +17,7 @@ pub struct GoogleAIStudioProvider {
     api_key: String,
     base_url: String,
     model: String,
-    max_tokens: i32,
+    max_tokens: Option<i32>,
 }
 
 impl GoogleAIStudioProvider {
@@ -25,7 +25,7 @@ impl GoogleAIStudioProvider {
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         model: impl Into<String>,
-        max_tokens: i32,
+        max_tokens: Option<i32>,
     ) -> Self {
         let base_url = base_url.into();
         let base_url = if base_url.trim().is_empty() {
@@ -74,8 +74,8 @@ struct GeminiUrlContext {}
 
 #[derive(Serialize)]
 struct GeminiGenerationConfig {
-    #[serde(rename = "maxOutputTokens")]
-    max_output_tokens: i32,
+    #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_mime_type: Option<&'static str>,
     #[serde(rename = "mediaResolution", skip_serializing_if = "Option::is_none")]

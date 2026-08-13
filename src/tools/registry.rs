@@ -11,6 +11,18 @@ use super::{
     WaitForReplyTool,
 };
 
+/// 管理后台可配置的工具信息；固定启用的内部工具不会出现在这里。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OptionalToolDefinition {
+    pub name: &'static str,
+    pub display_name: &'static str,
+    pub description: &'static str,
+}
+
+const WEB_SEARCH_MODULE: &str = "agent_web_search";
+const MEMORY_MODULE: &str = "memory";
+const SCHEDULED_TASKS_MODULE: &str = "scheduled_tasks";
+
 /// 已注册工具的稳定有序集合。
 #[derive(Default)]
 pub struct ToolRegistry {
@@ -22,25 +34,65 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// 注册当前动作系统包含的全部工具，供模型请求生成 tools 定义。
-    pub fn built_in() -> Self {
+    /// 注册固定工具以及配置中明确启用的可选工具。
+    pub fn built_in(enabled_optional_tools: &[String]) -> Self {
         let mut registry = Self::new();
         // registry.register(super::SendMessageTool).unwrap();
-        registry.register(AgentWebSearchTool).unwrap();
+        if Self::is_enabled(enabled_optional_tools, WEB_SEARCH_MODULE) {
+            registry.register(AgentWebSearchTool).unwrap();
+        }
         registry.register(SendQqExpressionTool).unwrap();
-        registry.register(SetCharacterMemoryTool).unwrap();
-        registry.register(CreateUserMemoryTool).unwrap();
-        registry.register(UpdateUserMemoryTool).unwrap();
+        if Self::is_enabled(enabled_optional_tools, MEMORY_MODULE) {
+            // 一个模块开关统一控制角色记忆和用户记忆的全部维护工具。
+            registry.register(SetCharacterMemoryTool).unwrap();
+            registry.register(DeleteCharacterMemoryTool).unwrap();
+            registry.register(CreateUserMemoryTool).unwrap();
+            registry.register(UpdateUserMemoryTool).unwrap();
+            registry.register(DeleteUserMemoryTool).unwrap();
+        }
         registry.register(WaitForReplyTool::new()).unwrap();
-        registry.register(CreateScheduledTaskTool).unwrap();
-        registry.register(GetScheduledTaskTool).unwrap();
-        registry.register(UpdateScheduledTaskTool).unwrap();
-        registry.register(DeleteScheduledTaskTool).unwrap();
-        registry.register(DeleteCharacterMemoryTool).unwrap();
-        registry.register(DeleteUserMemoryTool).unwrap();
+        if Self::is_enabled(enabled_optional_tools, SCHEDULED_TASKS_MODULE) {
+            registry.register(CreateScheduledTaskTool).unwrap();
+            registry.register(GetScheduledTaskTool).unwrap();
+            registry.register(UpdateScheduledTaskTool).unwrap();
+            registry.register(DeleteScheduledTaskTool).unwrap();
+        }
         registry.register(ContinueConversationTool).unwrap();
         registry.register(EndConversationTool).unwrap();
         registry
+    }
+
+    /// 返回允许用户开关的功能模块，供配置校验和管理页面共同使用。
+    pub fn optional_definitions() -> Vec<OptionalToolDefinition> {
+        vec![
+            OptionalToolDefinition {
+                name: WEB_SEARCH_MODULE,
+                display_name: "网络搜索",
+                description: "让主模型在需要实时信息时查询互联网。",
+            },
+            OptionalToolDefinition {
+                name: MEMORY_MODULE,
+                display_name: "记忆",
+                description: "允许主模型维护角色记忆和用户记忆。",
+            },
+            OptionalToolDefinition {
+                name: SCHEDULED_TASKS_MODULE,
+                display_name: "定时任务",
+                description: "允许主模型创建和管理当前会话的定时任务。",
+            },
+        ]
+    }
+
+    pub fn is_optional_tool(name: &str) -> bool {
+        Self::optional_definitions()
+            .iter()
+            .any(|definition| definition.name == name)
+    }
+
+    fn is_enabled(enabled_optional_tools: &[String], module: &str) -> bool {
+        enabled_optional_tools
+            .iter()
+            .any(|name| name.trim() == module)
     }
 
     pub fn register<T>(&mut self, tool: T) -> Result<()>
@@ -95,6 +147,44 @@ impl ToolRegistry {
                 is_error: true,
                 conversation_effect: super::ConversationEffect::None,
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolRegistry;
+
+    #[test]
+    fn optional_modules_register_only_their_own_tools() {
+        let disabled = ToolRegistry::built_in(&[]);
+        assert!(disabled.get("agent_web_search").is_none());
+        assert!(disabled.get("set_character_memory").is_none());
+        assert!(disabled.get("create_scheduled_task").is_none());
+        assert!(disabled.get("continue_conversation").is_some());
+
+        let enabled = ToolRegistry::built_in(&[
+            "agent_web_search".to_string(),
+            "memory".to_string(),
+            "scheduled_tasks".to_string(),
+        ]);
+        assert!(enabled.get("agent_web_search").is_some());
+        for name in [
+            "set_character_memory",
+            "delete_character_memory",
+            "create_user_memory",
+            "update_user_memory",
+            "delete_user_memory",
+        ] {
+            assert!(enabled.get(name).is_some(), "未注册记忆工具 {name}");
+        }
+        for name in [
+            "create_scheduled_task",
+            "get_scheduled_task",
+            "update_scheduled_task",
+            "delete_scheduled_task",
+        ] {
+            assert!(enabled.get(name).is_some(), "未注册定时任务工具 {name}");
         }
     }
 }

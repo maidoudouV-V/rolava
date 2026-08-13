@@ -39,12 +39,13 @@ impl ConversationActor {
         processor: ChatProcessor,
         commands: Arc<CommandSystem>,
         conversation_control: Arc<ConversationControl>,
+        enabled_optional_tools: &[String],
     ) -> Self {
         Self {
             event_rx,
             filter,
             processor,
-            tools: ToolRegistry::built_in(),
+            tools: ToolRegistry::built_in(enabled_optional_tools),
             commands,
             conversation_control,
         }

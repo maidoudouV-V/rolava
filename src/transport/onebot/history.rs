@@ -7,6 +7,7 @@ use std::time::Duration;
 use tracing::trace;
 
 use super::{OneBotGroupMessageDto, OneBotHttpServer, OneBotMessageDto, OneBotMessageEnvelopeDto};
+use crate::runtime_state::{RuntimeGroupInfo, RuntimeGroupMember};
 use crate::transport::message::IncomingMessage;
 
 const HISTORY_API_TIMEOUT: Duration = Duration::from_secs(15);
@@ -23,11 +24,30 @@ struct OneBotHistoryApiResponse<T> {
 #[derive(Deserialize)]
 struct OneBotLoginInfoDto {
     user_id: i64,
+    #[serde(default)]
+    nickname: String,
 }
 
 #[derive(Deserialize)]
 struct OneBotGroupInfoDto {
     group_id: i64,
+    #[serde(default)]
+    group_name: String,
+    #[serde(default)]
+    member_count: u64,
+    #[serde(default)]
+    max_member_count: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct OneBotGroupMemberDto {
+    user_id: i64,
+    #[serde(default)]
+    nickname: String,
+    #[serde(default)]
+    card: String,
+    #[serde(default)]
+    role: String,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +82,8 @@ impl OneBotHttpServer {
     pub async fn fetch_login_user_id(&self) -> Result<i64> {
         let response: OneBotLoginInfoDto =
             self.call_history_api("get_login_info", json!({})).await?;
+        self.runtime_state.set_bot_id(response.user_id.to_string());
+        self.runtime_state.set_bot_name(response.nickname);
         Ok(response.user_id)
     }
 
@@ -69,7 +91,34 @@ impl OneBotHttpServer {
     pub async fn fetch_group_ids(&self) -> Result<Vec<i64>> {
         let groups: Vec<OneBotGroupInfoDto> =
             self.call_history_api("get_group_list", json!({})).await?;
-        Ok(groups.into_iter().map(|group| group.group_id).collect())
+        Ok(groups
+            .into_iter()
+            .map(|group| {
+                self.runtime_state.update_group(RuntimeGroupInfo {
+                    group_id: group.group_id.to_string(),
+                    name: group.group_name,
+                    member_count: group.member_count,
+                    max_member_count: group.max_member_count,
+                });
+                group.group_id
+            })
+            .collect())
+    }
+
+    /// 查询群成员列表；缓存策略由管理服务决定，此处只负责平台协议转换。
+    pub async fn fetch_group_members(&self, group_id: i64) -> Result<Vec<RuntimeGroupMember>> {
+        let members: Vec<OneBotGroupMemberDto> = self
+            .call_history_api("get_group_member_list", json!({ "group_id": group_id }))
+            .await?;
+        Ok(members
+            .into_iter()
+            .map(|member| RuntimeGroupMember {
+                user_id: member.user_id.to_string(),
+                nickname: member.nickname,
+                card: member.card,
+                role: member.role,
+            })
+            .collect())
     }
 
     /// 获取指定群的最近历史，并复用实时上报的标准消息转换流程。

@@ -2,11 +2,12 @@ use crate::ai_provider::{
     google_aistudio::GoogleAIStudioProvider, openai_compatible::OpenAICompatibleProvider,
     openrouter::OpenRouterProvider, AIProvider,
 };
+use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
-use serde::Deserialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_AI_REQUEST_RETRY_COUNT: u32 = 1;
 const DEFAULT_AI_REQUEST_TIMEOUT_SECONDS: u64 = 0;
@@ -25,9 +26,18 @@ struct TomlConfig {
     /// 日志配置。
     #[serde(default)]
     logging: LoggingSection,
+    /// 管理后台认证配置。
+    #[serde(default)]
+    admin: AdminSection,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy, Default)]
+#[derive(Deserialize, Debug, Default)]
+pub struct AdminSection {
+    /// 管理 API 使用的 bearer token；空值会在启动时自动生成。
+    pub token: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Error,
@@ -72,9 +82,6 @@ pub struct AppSection {
     pub chat_model_name: String,
     /// 消息过滤模型名称。
     pub filter_model_name: String,
-    /// 是否启用 AI 前置消息过滤。
-    #[serde(default = "default_enable_ai_filter")]
-    pub enable_ai_filter: bool,
     /// 联网搜索模型名称。
     pub web_search_model_name: String,
     /// 后台图片描述模型名称；为空时关闭图片描述功能。
@@ -87,7 +94,7 @@ pub struct AppSection {
     pub ai_request_timeout_seconds: u64,
     /// 接收到的图片本地保存目录。
     pub received_image_dir: String,
-    /// 启用的可选动作列表；会话控制工具固定启用。
+    /// 启用的可选工具列表；固定工具不需要写入。
     pub enabled_actions: Vec<String>,
     /// 私聊白名单 QQ 号，空数组表示放行所有私聊。
     pub direct_whitelist: Vec<String>,
@@ -96,8 +103,6 @@ pub struct AppSection {
     /// 命令执行账号白名单；空数组表示所有账号都不能执行命令。
     #[serde(default)]
     pub command_whitelist: Vec<String>,
-    /// 是否按换行符拆分并逐段发送回复文本。
-    pub split_reply_on_newlines: bool,
     /// 模拟回复时总随机等待的最大秒数。
     pub reply_delay_random_max_secs: f64,
 }
@@ -120,10 +125,6 @@ fn default_vision_image_message_window() -> usize {
     DEFAULT_VISION_IMAGE_MESSAGE_WINDOW
 }
 
-fn default_enable_ai_filter() -> bool {
-    true
-}
-
 #[derive(Deserialize, Debug)]
 pub struct ServerSection {
     /// 本服务监听地址
@@ -138,7 +139,7 @@ pub struct ServerSection {
     pub onebot_token: String,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ProviderConfig {
     /// 服务商名称，用作唯一标识
     pub name: String,
@@ -150,7 +151,7 @@ pub struct ProviderConfig {
     pub base_url: String,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ModelConfig {
     /// 模型配置名称，用作应用内唯一标识
     pub name: String,
@@ -158,16 +159,22 @@ pub struct ModelConfig {
     pub provider: String,
     /// 远端 API 接受的模型 ID
     pub model: String,
-    /// 最大输出 token 数。
-    pub max_tokens: i32,
-    /// 推理强度，必填，如 none、minimal、low、medium、high、xhigh
+    /// 最大输出 token 数；未配置时使用供应商或模型默认值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
+    /// 推理强度；auto 表示不指定，由供应商或模型自动决定。
+    #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: String,
     /// 是否启用模型的图像输入能力；未配置时默认禁用。
     #[serde(default)]
     pub vision: ModelFeatureState,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+fn default_reasoning_effort() -> String {
+    "auto".to_string()
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelFeatureState {
     Enable,
@@ -178,6 +185,13 @@ pub enum ModelFeatureState {
 impl ModelFeatureState {
     pub fn is_enabled(self) -> bool {
         self == Self::Enable
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enable => "enable",
+            Self::Disable => "disable",
+        }
     }
 }
 
@@ -194,12 +208,18 @@ pub struct AppConfig {
     pub server: ServerSection,
     /// 按模型配置名称索引的 AI 模型实例
     pub ai_models: HashMap<String, Box<dyn AIProvider + Send + Sync>>,
+    /// 原始 Provider 配置，供管理后台编辑和重新写入。
+    pub providers: Vec<ProviderConfig>,
+    /// 原始模型配置，供管理后台编辑和重新写入。
+    pub models: Vec<ModelConfig>,
     /// 按模型配置名称索引的能力声明。
     pub model_capabilities: HashMap<String, ModelCapabilities>,
     /// 提示词配置
     pub prompt_config: PromptConfig,
     /// 日志输出配置。
     pub logging: LoggingSection,
+    /// 管理后台认证配置。
+    pub admin: AdminSection,
     /// QQ 经典表情 ID 到名称的映射。
     pub face_id_map: HashMap<String, String>,
 }
@@ -214,13 +234,33 @@ impl AppConfig {
             providers,
             models,
             logging,
+            admin,
         } = toml::from_str(&toml_str)?;
 
+        let enabled_tools = app
+            .enabled_actions
+            .iter()
+            .map(|name| name.trim())
+            .collect::<HashSet<_>>();
+        if enabled_tools.len() != app.enabled_actions.len() {
+            anyhow::bail!("启用的可选工具不能为空或重复");
+        }
+        if let Some(name) = enabled_tools
+            .iter()
+            .find(|name| !ToolRegistry::is_optional_tool(name))
+        {
+            anyhow::bail!("未知的可选工具：{}", name);
+        }
+        if enabled_tools.contains("agent_web_search") && app.web_search_model_name.trim().is_empty()
+        {
+            anyhow::bail!("启用网络搜索前必须配置联网搜索模型");
+        }
+
         let mut provider_configs = HashMap::new();
-        for provider_config in providers {
+        for provider_config in &providers {
             let provider_name = provider_config.name.clone();
             if provider_configs
-                .insert(provider_name.clone(), provider_config)
+                .insert(provider_name.clone(), provider_config.clone())
                 .is_some()
             {
                 anyhow::bail!("服务商配置名称重复：{}", provider_name);
@@ -229,7 +269,7 @@ impl AppConfig {
 
         let mut ai_models = HashMap::<String, Box<dyn AIProvider + Send + Sync>>::new();
         let mut model_capabilities = HashMap::new();
-        for model_config in models {
+        for model_config in &models {
             model_capabilities.insert(
                 model_config.name.clone(),
                 ModelCapabilities {
@@ -250,21 +290,21 @@ impl AppConfig {
                 "openai_compatible" => Box::new(OpenAICompatibleProvider::new(
                     provider_config.key.clone(),
                     provider_config.base_url.clone(),
-                    model_config.model,
+                    model_config.model.clone(),
                     model_config.max_tokens,
-                    model_config.reasoning_effort,
+                    model_config.reasoning_effort.clone(),
                 )),
                 "openrouter" => Box::new(OpenRouterProvider::new(
                     provider_config.key.clone(),
                     provider_config.base_url.clone(),
-                    model_config.model,
+                    model_config.model.clone(),
                     model_config.max_tokens,
-                    model_config.reasoning_effort,
+                    model_config.reasoning_effort.clone(),
                 )),
                 "google_aistudio" => Box::new(GoogleAIStudioProvider::new(
                     provider_config.key.clone(),
                     provider_config.base_url.clone(),
-                    model_config.model,
+                    model_config.model.clone(),
                     model_config.max_tokens,
                 )),
                 _ => {
@@ -274,7 +314,7 @@ impl AppConfig {
                     ))
                 }
             };
-            let model_name = model_config.name;
+            let model_name = model_config.name.clone();
             if ai_models.insert(model_name.clone(), model).is_some() {
                 anyhow::bail!("模型配置名称重复：{}", model_name);
             }
@@ -291,7 +331,8 @@ impl AppConfig {
             }
         }
 
-        let prompt_config = PromptConfig::new(&app)?;
+        let prompt_dir = Self::resolve_configured_path(config_path, &app.prompt_dir);
+        let prompt_config = PromptConfig::new(&prompt_dir)?;
         // 表情映射与主配置放在同一目录，启动时加载一次供所有消息转换复用。
         let face_id_map_path = config_path
             .parent()
@@ -313,9 +354,12 @@ impl AppConfig {
             app,
             server,
             ai_models,
+            providers,
+            models,
             model_capabilities,
             prompt_config,
             logging,
+            admin,
             face_id_map,
         })
     }
@@ -325,6 +369,18 @@ impl AppConfig {
             .get(&self.app.chat_model_name)
             .is_some_and(|capabilities| capabilities.vision.is_enabled())
     }
+
+    /// 相对路径优先相对当前工作目录，管理后台候选配置位于临时文件时也能保持原语义。
+    fn resolve_configured_path(config_path: &Path, configured_path: &str) -> PathBuf {
+        let path = Path::new(configured_path);
+        if path.is_absolute() || path.exists() {
+            return path.to_path_buf();
+        }
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path)
+    }
 }
 
 pub struct PromptConfig {
@@ -332,49 +388,60 @@ pub struct PromptConfig {
     pub character_prompt: String,
     pub instruction_prompt: String,
     pub filter_prompt: String,
+    pub image_description_prompt: String,
+    pub web_search_agent_prompt: String,
+    pub scheduled_task_prompt: String,
+    pub scheduled_task_recovery_prompt: String,
+    pub wait_for_reply_timeout_prompt: String,
 }
 impl PromptConfig {
-    pub fn new(app: &AppSection) -> Result<Self> {
-        let prompt_dir = Path::new(&app.prompt_dir);
-        let system_template = fs::read_to_string(prompt_dir.join("system.md"))?;
-        let enabled_actions_prompt = Self::load_enabled_action_prompts(app, prompt_dir)?;
+    pub fn new(prompt_dir: &Path) -> Result<Self> {
         let character_prompt = fs::read_to_string(prompt_dir.join("character.md"))?;
         let filter_template = fs::read_to_string(prompt_dir.join("filter.md"))?;
         let new_config = Self {
-            system_prompt: system_template
-                .replace("{{enabled_actions}}", enabled_actions_prompt.trim()),
+            system_prompt: fs::read_to_string(prompt_dir.join("system.md"))?,
             character_prompt: character_prompt.clone(),
             instruction_prompt: fs::read_to_string(prompt_dir.join("instruction.md"))?,
             filter_prompt: filter_template.replace("{{character_prompt}}", character_prompt.trim()),
+            image_description_prompt: fs::read_to_string(
+                prompt_dir.join("internal/image_description.md"),
+            )?,
+            web_search_agent_prompt: fs::read_to_string(
+                prompt_dir.join("internal/web_search_agent.md"),
+            )?,
+            scheduled_task_prompt: fs::read_to_string(
+                prompt_dir.join("internal/scheduled_task.md"),
+            )?,
+            scheduled_task_recovery_prompt: fs::read_to_string(
+                prompt_dir.join("internal/scheduled_task_recovery.md"),
+            )?,
+            wait_for_reply_timeout_prompt: fs::read_to_string(
+                prompt_dir.join("internal/wait_for_reply_timeout.md"),
+            )?,
         };
         Ok(new_config)
     }
+}
 
-    /// 按配置读取可选动作提示词，文件名必须与动作名一致。
-    fn load_enabled_action_prompts(app: &AppSection, prompt_dir: &Path) -> Result<String> {
-        let mut action_prompts = Vec::new();
-        for action_name in &app.enabled_actions {
-            let action_name = action_name.trim();
-            if action_name.is_empty() {
-                continue;
-            }
-            if action_name.contains('/') || action_name.contains('\\') || action_name.contains("..")
-            {
-                anyhow::bail!("可选动作名称不合法：{}", action_name);
-            }
-
-            let action_prompt_path = prompt_dir
-                .join("actions")
-                .join(format!("{}.md", action_name));
-            let action_prompt = fs::read_to_string(&action_prompt_path).with_context(|| {
-                format!(
-                    "读取可选动作提示词失败：{}",
-                    action_prompt_path.to_string_lossy()
-                )
-            })?;
-            action_prompts.push(action_prompt.trim().to_string());
+/// 单次扫描提示词模板，插入值不会被再次当作占位符解析。
+pub fn render_prompt_template(template: &str, values: &[(&str, &str)]) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    while let Some(start) = remaining.find("{{") {
+        rendered.push_str(&remaining[..start]);
+        let after_start = &remaining[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            rendered.push_str(&remaining[start..]);
+            return rendered;
+        };
+        let name = &after_start[..end];
+        if let Some((_, value)) = values.iter().find(|(key, _)| *key == name) {
+            rendered.push_str(value);
+        } else {
+            rendered.push_str(&remaining[start..start + 2 + end + 2]);
         }
-
-        Ok(action_prompts.join("\n\n"))
+        remaining = &after_start[end + 2..];
     }
+    rendered.push_str(remaining);
+    rendered
 }

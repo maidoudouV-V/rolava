@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+use crate::config::render_prompt_template;
 use crate::conversation_trigger::{ConversationTrigger, RoutedConversationTrigger};
 use crate::repository::db_manager::QQChatContextManager;
 use crate::transport::message::{Conversation, ConversationKind, MessageTarget};
@@ -22,17 +23,23 @@ pub struct SchedulerService {
     db_manager: Arc<QQChatContextManager>,
     trigger_tx: mpsc::UnboundedSender<RoutedConversationTrigger>,
     schedule_changed: Notify,
+    scheduled_task_prompt: String,
+    scheduled_task_recovery_prompt: String,
 }
 
 impl SchedulerService {
     pub fn new(
         db_manager: Arc<QQChatContextManager>,
         trigger_tx: mpsc::UnboundedSender<RoutedConversationTrigger>,
+        scheduled_task_prompt: impl Into<String>,
+        scheduled_task_recovery_prompt: impl Into<String>,
     ) -> Self {
         Self {
             db_manager,
             trigger_tx,
             schedule_changed: Notify::new(),
+            scheduled_task_prompt: scheduled_task_prompt.into(),
+            scheduled_task_recovery_prompt: scheduled_task_recovery_prompt.into(),
         }
     }
 
@@ -206,24 +213,25 @@ impl SchedulerService {
             .timestamp_opt(task.next_run_at, 0)
             .single()
             .context("定时任务的下一次执行时间无效")?;
-        let prompt = if recovered_after_restart {
-            format!(
-                "# 系统定时任务触发\n\n任务 ID：{}\n任务名称：{}\n计划触发时间：{}\n当前时间：{}\n延迟说明：程序启动时发现此任务已经超过计划触发时间，现在进行补充触发。任务原本要处理的情况可能已经变化或失去时效。\n\n任务说明：\n{}\n\n处理要求：\n请结合任务说明、当前时间和当前会话上下文，自行判断现在最合适的处理方式。不要因为任务已触发就机械执行已经过时的内容。",
-                task.id,
-                task.title,
-                scheduled_time.format("%Y-%m-%d %H:%M:%S"),
-                current_time.format("%Y-%m-%d %H:%M:%S"),
-                task.instruction,
-            )
+        let template = if recovered_after_restart {
+            &self.scheduled_task_recovery_prompt
         } else {
-            format!(
-                "# 系统定时任务触发\n\n任务 ID：{}\n任务名称：{}\n计划触发时间：{}\n\n任务说明：\n{}",
-                task.id,
-                task.title,
-                scheduled_time.format("%Y-%m-%d %H:%M:%S"),
-                task.instruction,
-            )
+            &self.scheduled_task_prompt
         };
+        let scheduled_time_text = scheduled_time.format("%Y-%m-%d %H:%M:%S").to_string();
+        let current_time_text = current_time.format("%Y-%m-%d %H:%M:%S").to_string();
+        let prompt = render_prompt_template(
+            template,
+            &[
+                ("task_id", &task.id),
+                ("task_title", &task.title),
+                ("scheduled_time", &scheduled_time_text),
+                ("current_time", &current_time_text),
+                ("task_instruction", &task.instruction),
+            ],
+        )
+        .trim()
+        .to_string();
 
         Ok(RoutedConversationTrigger {
             target: MessageTarget {
@@ -312,7 +320,12 @@ mod tests {
             )
             .unwrap();
         let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel();
-        let scheduler = SchedulerService::new(db_manager.clone(), trigger_tx);
+        let scheduler = SchedulerService::new(
+            db_manager.clone(),
+            trigger_tx,
+            include_str!("../../prompt/internal/scheduled_task.md"),
+            include_str!("../../prompt/internal/scheduled_task_recovery.md"),
+        );
 
         scheduler.process_due_tasks(true).unwrap();
 

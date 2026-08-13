@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, info_span, trace, Instrument};
 
+use crate::config::render_prompt_template;
 use crate::conversation_trigger::ConversationTrigger;
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
@@ -120,60 +121,71 @@ impl Tool for WaitForReplyTool {
         let db_manager = context.services.db_manager.clone();
         let trigger_sender = context.conversation.trigger_sender.clone();
         let task_target = target.clone();
+        let timeout_prompt = context
+            .services
+            .app_config
+            .prompt_config
+            .wait_for_reply_timeout_prompt
+            .clone();
 
         info!(target = %target, timeout_seconds, "已创建等待回复任务");
         trace!(target = %target, reason = %reason, "等待回复完整原因");
 
         let task_span = info_span!("wait_for_reply", target = %target, timeout_seconds);
-        tokio::spawn(async move {
-            sleep(Duration::from_secs(timeout_seconds)).await;
+        tokio::spawn(
+            async move {
+                sleep(Duration::from_secs(timeout_seconds)).await;
 
-            if pending_tasks.lock().targets.get(&task_target) != Some(&task_id) {
-                return;
-            }
-
-            let replied = db_manager.has_sender_message_after(
-                &source,
-                &conversation_id,
-                &task_target,
-                after_message_id,
-            );
-
-            let is_current = {
-                let mut pending = pending_tasks.lock();
-                if pending.targets.get(&task_target) != Some(&task_id) {
-                    false
-                } else {
-                    pending.targets.remove(&task_target);
-                    true
+                if pending_tasks.lock().targets.get(&task_target) != Some(&task_id) {
+                    return;
                 }
-            };
-            if !is_current {
-                return;
-            }
 
-            match replied {
-                Ok(true) => {
-                    info!("目标已在等待期间回复，不再触发模型");
-                }
-                Ok(false) => {
-                    let user_prompt = format!(
-                        "# 系统提示\n等待 QQ {} 回复的任务已到期，对方在等待期间没有发送消息。等待原因：{}",
-                        task_target, reason
-                    );
-                    if let Err(error) = trigger_sender.send_trigger(ConversationTrigger {
-                        user_prompt,
-                    }) {
-                        error!(error = %error, "等待回复到期后触发会话失败");
+                let replied = db_manager.has_sender_message_after(
+                    &source,
+                    &conversation_id,
+                    &task_target,
+                    after_message_id,
+                );
+
+                let is_current = {
+                    let mut pending = pending_tasks.lock();
+                    if pending.targets.get(&task_target) != Some(&task_id) {
+                        false
                     } else {
-                        info!("等待回复到期，已触发会话");
+                        pending.targets.remove(&task_target);
+                        true
+                    }
+                };
+                if !is_current {
+                    return;
+                }
+
+                match replied {
+                    Ok(true) => {
+                        info!("目标已在等待期间回复，不再触发模型");
+                    }
+                    Ok(false) => {
+                        let user_prompt = render_prompt_template(
+                            &timeout_prompt,
+                            &[("user_id", &task_target), ("reason", &reason)],
+                        )
+                        .trim()
+                        .to_string();
+                        if let Err(error) =
+                            trigger_sender.send_trigger(ConversationTrigger { user_prompt })
+                        {
+                            error!(error = %error, "等待回复到期后触发会话失败");
+                        } else {
+                            info!("等待回复到期，已触发会话");
+                        }
+                    }
+                    Err(error) => {
+                        error!(error = %error, "检查目标是否在等待期间回复失败");
                     }
                 }
-                Err(error) => {
-                    error!(error = %error, "检查目标是否在等待期间回复失败");
-                }
             }
-        }.instrument(task_span));
+            .instrument(task_span),
+        );
 
         Ok(ToolOutput::text(format!(
             "等待 QQ {} 回复的任务添加成功",

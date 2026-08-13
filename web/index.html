@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Rolava Studio</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b8b62'/%3E%3Ctext x='16' y='22' text-anchor='middle' fill='white' font-family='Arial' font-size='17' font-weight='700'%3ER%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/admin/assets/app.css">
+  <script src="/admin/assets/lucide.min.js" defer></script>
+  <script type="module" src="/admin/assets/app.js"></script>
+</head>
+<body>
+  <div class="login-screen" id="login-screen">
+    <form class="login-panel" id="login-form">
+      <span class="brand-mark">R</span>
+      <div><p class="eyebrow">ROLAVA STUDIO</p><h1>连接你的机器人</h1></div>
+      <p>输入 <code>meta.toml</code> 中的管理 Token。Token 只保存在当前浏览器会话。</p>
+      <label>管理 Token<input id="login-token" type="password" autocomplete="current-password" required></label>
+      <p class="form-error" id="login-error" hidden></p>
+      <button class="button primary full" type="submit"><i data-lucide="log-in"></i>进入管理后台</button>
+    </form>
+  </div>
+
+  <div class="app-shell" id="app-shell" hidden>
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">R</span><div><strong>Rolava</strong></div></div>
+      <nav class="nav">
+        <p>工作区</p>
+        <button class="nav-button active" data-page="overview"><i data-lucide="sparkles"></i>概览</button>
+        <button class="nav-button" data-page="conversations"><i data-lucide="messages-square"></i>会话管理</button>
+        <p>机器人设置</p>
+        <button class="nav-button" data-page="connection"><i data-lucide="waypoints"></i>连接配置</button>
+        <button class="nav-button" data-page="models"><i data-lucide="brain-circuit"></i>模型服务</button>
+        <button class="nav-button" data-page="behavior"><i data-lucide="sliders-horizontal"></i>消息行为</button>
+        <button class="nav-button" data-page="prompts"><i data-lucide="file-pen-line"></i>角色与提示词</button>
+        <button class="nav-button" data-page="access"><i data-lucide="shield-check"></i>权限与工具</button>
+      </nav>
+      <div class="sidebar-status"><span class="status-dot" id="sidebar-dot"></span><div><strong id="sidebar-bot">等待状态</strong><small id="sidebar-bot-id">OneBot</small></div></div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-button mobile-menu" id="mobile-menu" title="打开导航"><i data-lucide="menu"></i></button>
+        <div><span class="live-pill"><span></span>本地管理</span><strong id="page-name">概览</strong></div>
+        <div class="topbar-actions">
+          <span class="save-state" id="save-state"></span>
+          <button class="button" id="save-config-only" hidden><i data-lucide="save"></i>保存</button>
+          <button class="button primary" id="save-config" hidden><i data-lucide="save"></i>保存并重启</button>
+          <button class="icon-button" id="logout" title="退出登录"><i data-lucide="log-out"></i></button>
+        </div>
+      </header>
+
+      <div class="content">
+        <section class="page active" id="page-overview">
+          <div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1>机器人工作台</h1><p>查看 Rolava 当前的连接状态和业务数据。</p></div><button class="button" data-open-page="conversations"><i data-lucide="messages-square"></i>查看会话</button></div>
+          <div class="hero-status">
+            <div class="hero-copy"><span class="pulse-orbit"><i data-lucide="bot"></i></span><div><small class="companion-label"><i data-lucide="sparkles"></i>AI companion</small><h2 id="hero-status">正在读取角色名称</h2><p id="hero-detail">等待 worker 响应</p></div></div>
+            <div class="capabilities"><span><i data-lucide="message-circle"></i>主对话</span><span><i data-lucide="filter"></i>智能过滤</span><span><i data-lucide="image"></i>图片理解</span><span><i data-lucide="globe-2"></i>联网搜索</span></div>
+          </div>
+          <div class="metric-grid">
+            <article><span class="metric-icon mint"><i data-lucide="messages-square"></i></span><div><small>全部会话</small><strong id="metric-conversations">-</strong><p id="metric-conversation-kinds">等待数据</p></div></article>
+            <article><span class="metric-icon blue"><i data-lucide="message-circle-more"></i></span><div><small>今日消息</small><strong id="metric-messages">-</strong><p>数据库已接收消息</p></div></article>
+            <article><span class="metric-icon coral"><i data-lucide="brain"></i></span><div><small>保存记忆</small><strong id="metric-memories">-</strong><p>用户与角色记忆</p></div></article>
+            <article><span class="metric-icon amber"><i data-lucide="calendar-clock"></i></span><div><small>定时任务</small><strong id="metric-tasks">-</strong><p>当前运行中的任务</p></div></article>
+          </div>
+          <section class="section-block"><div class="section-header"><div><h2>最近会话</h2><p>最近有消息活动的聊天</p></div></div><div class="recent-list" id="recent-conversations"><div class="empty">正在加载会话</div></div></section>
+        </section>
+
+        <section class="page" id="page-conversations">
+          <div class="page-heading"><div><p class="eyebrow">CONVERSATIONS</p><h1>会话管理</h1><p>聊天记录只读，记忆与定时任务可直接维护。</p></div></div>
+          <div class="conversation-workspace">
+            <aside class="conversation-panel">
+              <div class="segmented" id="conversation-filters"><button class="active" data-kind="all">全部 <span>-</span></button><button data-kind="group">群聊 <span>-</span></button><button data-kind="direct">私聊 <span>-</span></button></div>
+              <div class="conversation-list" id="conversation-list"><div class="empty">正在加载</div></div>
+              <button class="text-button load-more" id="load-conversations" hidden>加载更多</button>
+            </aside>
+            <section class="conversation-detail" id="conversation-detail">
+              <div class="empty detail-empty"><i data-lucide="message-square-dashed"></i><strong>选择一个会话</strong><span>查看最新消息、记忆和定时任务</span></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="page config-page" id="page-connection">
+          <div class="page-heading"><div><p class="eyebrow">CONNECTION</p><h1>连接配置</h1><p>设置 OneBot 上报入口与出站 API。</p></div><button class="button" id="test-onebot"><i data-lucide="plug-zap"></i>测试 OneBot</button></div>
+          <section class="section-block"><div class="section-header"><div><h2>入站服务</h2><p>OneBot 向 Rolava 上报事件的监听地址</p></div></div><div class="form-grid"><label>监听地址<input id="server-host"></label><label>监听端口<input id="server-port" type="number" min="1" max="65535"></label><label class="wide">访问密钥<input id="server-token" type="password" placeholder="留空保留当前密钥"></label></div></section>
+          <section class="section-block"><div class="section-header"><div><h2>OneBot API</h2><p>Rolava 发送消息及读取平台资料的接口</p></div></div><div class="form-grid"><label class="wide">API 地址<input id="onebot-api" type="url"></label><label class="wide">访问 Token<input id="onebot-token" type="password" placeholder="留空保留当前 Token"></label></div></section>
+        </section>
+
+        <section class="page config-page" id="page-models">
+          <div class="page-heading"><div><p class="eyebrow">MODELS</p><h1>模型服务</h1><p>服务商负责连接，模型负责能力和生成参数。</p></div></div>
+          <section class="section-block"><div class="section-header"><div><h2>用途分配</h2><p>为每项机器人能力选择模型；未选择前置过滤模型即关闭过滤</p></div></div><div class="assignment-grid"><label>主聊天模型<select id="chat-model"></select></label><label>前置过滤模型<select id="filter-model"></select></label><label>联网搜索模型<select id="web-model"></select></label><label>图片描述模型<select id="visual-model"></select></label></div></section>
+          <section class="section-block"><div class="section-header"><div><h2>Providers</h2><p>密钥留空时不会覆盖已有值</p></div><button class="button small" id="add-provider"><i data-lucide="plus"></i>添加</button></div><div class="table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>Base URL</th><th>密钥</th><th></th></tr></thead><tbody id="provider-rows"></tbody></table></div></section>
+          <section class="section-block"><div class="section-header"><div><h2>Models</h2><p>打开模型 ID 选择器会从对应 Provider 读取可用模型</p></div><button class="button small" id="add-model"><i data-lucide="plus"></i>添加</button></div><div class="table-wrap"><table><thead><tr><th>配置名</th><th>模型 ID</th><th>Provider</th><th>输出上限</th><th>思考</th><th>图像</th><th></th></tr></thead><tbody id="model-rows"></tbody></table></div></section>
+        </section>
+
+        <section class="page config-page" id="page-behavior">
+          <div class="page-heading"><div><p class="eyebrow">BEHAVIOR</p><h1>消息行为</h1><p>控制进入主模型的条件、上下文范围和回复节奏。</p></div></div>
+          <section class="section-block"><div class="section-header"><div><h2>上下文与请求</h2></div></div><div class="form-grid three"><label>最大历史消息数<input id="max-history" type="number" min="1"></label><label>图片保留轮次<input id="image-window" type="number" min="0"></label><label>失败重试次数<input id="retry-count" type="number" min="0"></label><label>请求超时（秒）<input id="request-timeout" type="number" min="0"></label><label>随机回复延时上限（秒）<input id="reply-delay" type="number" min="0" step="0.1"></label></div></section>
+          <aside class="info-strip"><i data-lucide="split"></i><div><strong>回复固定按换行分段发送</strong><p>第二段起会叠加模拟打字时间，单段总延时不会超过 6 秒。</p></div></aside>
+        </section>
+
+        <section class="page" id="page-prompts">
+          <div class="page-heading"><div><p class="eyebrow">PROMPTS</p><h1>角色与提示词</h1><p>维护机器人实际加载的 Markdown 提示词。</p></div></div>
+          <div class="prompt-layout"><aside class="prompt-list" id="prompt-list"><div class="empty">正在加载</div></aside><section class="prompt-editor"><header><div><strong id="prompt-title">选择提示词</strong><small id="prompt-meta">Markdown</small></div><button class="button primary small" id="save-prompt" disabled><i data-lucide="save"></i>保存并重启</button></header><textarea id="prompt-content" spellcheck="false" disabled></textarea><div class="placeholder-help"><strong>固定占位符</strong><div><code>{{character_prompt}}</code><span>角色卡正文</span></div><div><code>{{scene}}</code><span>会话类型、群名称与成员数量</span></div><div><code>{{recent_active_users}}</code><span>最近活跃用户及其记忆</span></div><div><code>{{character_memories}}</code><span>当前会话角色记忆</span></div><div><code>{{scheduled_tasks}}</code><span>当前会话运行中的定时任务</span></div><div><code>{{unread_since}}</code><span>本轮未读消息开始时间</span></div></div></section></div>
+        </section>
+
+        <section class="page config-page" id="page-access">
+          <div class="page-heading"><div><p class="eyebrow">ACCESS</p><h1>权限与工具</h1><p>限制允许接入的会话、命令账号和可选工具。</p></div></div>
+          <section class="section-block"><div class="section-header"><div><h2>访问白名单</h2><p>每行填写一个 QQ 号或群号；空私聊/群聊名单表示全部放行</p></div></div><div class="form-grid three"><label>私聊白名单<textarea id="direct-whitelist" rows="7"></textarea></label><label>群聊白名单<textarea id="group-whitelist" rows="7"></textarea></label><label>命令白名单<textarea id="command-whitelist" rows="7"></textarea></label></div></section>
+          <section class="section-block"><div class="section-header"><div><h2>可选工具</h2><p>固定运行所需的内部工具不会在此展示</p></div></div><div class="optional-tool-list" id="tool-list"><div class="empty">正在加载</div></div></section>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <dialog class="entity-dialog" id="entity-dialog"><form method="dialog"><header><div><p class="eyebrow" id="dialog-eyebrow">EDIT</p><h2 id="dialog-title">编辑</h2></div><button class="icon-button" value="cancel" title="关闭"><i data-lucide="x"></i></button></header><div class="dialog-fields" id="dialog-fields"></div><p class="form-error" id="dialog-error" hidden></p><footer><button class="button" value="cancel">取消</button><button class="button primary" id="dialog-submit" value="default">保存</button></footer></form></dialog>
+  <dialog class="model-picker" id="model-picker"><header><div><p class="eyebrow">MODEL CATALOG</p><h2>选择模型</h2></div><button class="icon-button" id="close-model-picker" type="button" title="关闭"><i data-lucide="x"></i></button></header><div class="model-picker-search"><i data-lucide="search"></i><input id="model-picker-query" type="search" placeholder="搜索模型名称或 ID" autocomplete="off"></div><p class="model-picker-status" id="model-picker-status">正在读取模型列表</p><div class="model-picker-results" id="model-picker-results"></div></dialog>
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <div class="restart-screen" id="restart-screen" hidden><span class="spinner"></span><h2>正在重启 Rolava</h2><p id="restart-message">配置已保存，等待服务重新上线。</p></div>
+</body>
+</html>

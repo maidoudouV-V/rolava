@@ -18,6 +18,85 @@ const INITIAL_MEMBER_MESSAGE_SCAN: usize = 10;
 const MAX_ACTIVE_MEMORY_USERS: usize = 20;
 const MEMORY_ID_RANDOM_CHARS: usize = 8;
 
+/// 不依赖 Actor 活跃成员状态的用户记忆领域服务。
+pub struct UserMemoryService {
+    db_manager: Arc<QQChatContextManager>,
+}
+
+impl UserMemoryService {
+    pub fn new(db_manager: Arc<QQChatContextManager>) -> Self {
+        Self { db_manager }
+    }
+
+    pub fn create(
+        &self,
+        source: &str,
+        bot_id: &str,
+        user_id: &str,
+        content: &str,
+    ) -> Result<String> {
+        let user_id = user_id.trim();
+        let content = content.trim();
+        if user_id.is_empty() || content.is_empty() {
+            anyhow::bail!("QQ 号和记忆内容不能为空");
+        }
+        let memory_id = self.generate_memory_id()?;
+        self.db_manager
+            .insert_user_memory(&memory_id, source, bot_id, user_id, content)?;
+        Ok(memory_id)
+    }
+
+    pub fn update(
+        &self,
+        source: &str,
+        bot_id: &str,
+        user_id: &str,
+        memory_id: &str,
+        content: &str,
+    ) -> Result<()> {
+        let content = content.trim();
+        if content.is_empty() {
+            anyhow::bail!("记忆内容不能为空");
+        }
+        if !self.db_manager.update_user_memory(
+            source,
+            bot_id,
+            user_id.trim(),
+            memory_id.trim(),
+            content,
+        )? {
+            anyhow::bail!("找不到指定的用户记忆");
+        }
+        Ok(())
+    }
+
+    pub fn delete(&self, source: &str, bot_id: &str, user_id: &str, memory_id: &str) -> Result<()> {
+        if !self
+            .db_manager
+            .delete_user_memory(source, bot_id, user_id.trim(), memory_id.trim())?
+        {
+            anyhow::bail!("找不到指定的用户记忆");
+        }
+        Ok(())
+    }
+
+    fn generate_memory_id(&self) -> Result<String> {
+        let mut rng = rand::thread_rng();
+        for _ in 0..20 {
+            let suffix = (&mut rng)
+                .sample_iter(Alphanumeric)
+                .take(MEMORY_ID_RANDOM_CHARS)
+                .map(char::from)
+                .collect::<String>();
+            let memory_id = format!("mem_{}", suffix);
+            if !self.db_manager.user_memory_id_exists(&memory_id)? {
+                return Ok(memory_id);
+            }
+        }
+        anyhow::bail!("生成用户记忆 ID 连续碰撞")
+    }
+}
+
 /// 单个会话当前需要注入提示词的用户。
 #[derive(Clone)]
 struct ActiveMemoryUser {
@@ -40,6 +119,7 @@ pub struct UserMemorySession {
     db_manager: Arc<QQChatContextManager>,
     active_users: Mutex<Vec<ActiveMemoryUser>>,
     member_profile_client: OneBotMemberProfileClient,
+    memory_service: UserMemoryService,
 }
 
 impl UserMemorySession {
@@ -49,11 +129,13 @@ impl UserMemorySession {
         db_manager: Arc<QQChatContextManager>,
     ) -> Self {
         let member_profile_client = OneBotMemberProfileClient::new(target.clone(), app_config);
+        let memory_service = UserMemoryService::new(db_manager.clone());
         Self {
             target,
             db_manager,
             active_users: Mutex::new(Vec::new()),
             member_profile_client,
+            memory_service,
         }
     }
 
@@ -142,9 +224,7 @@ impl UserMemorySession {
         if content.is_empty() {
             anyhow::bail!("记忆内容不能为空");
         }
-        let memory_id = self.generate_memory_id()?;
-        self.db_manager.insert_user_memory(
-            &memory_id,
+        let memory_id = self.memory_service.create(
             &self.target.source,
             &self.target.bot_id,
             user_id,
@@ -165,16 +245,13 @@ impl UserMemorySession {
         if content.is_empty() {
             anyhow::bail!("记忆内容不能为空");
         }
-        let updated = self.db_manager.update_user_memory(
+        self.memory_service.update(
             &self.target.source,
             &self.target.bot_id,
             user_id,
             memory_id,
             content,
         )?;
-        if !updated {
-            anyhow::bail!("找不到 QQ {} 的用户记忆 {}", user_id, memory_id);
-        }
         Ok(format!("用户记忆 {} 修改成功", memory_id))
     }
 
@@ -186,15 +263,8 @@ impl UserMemorySession {
         if memory_id.is_empty() {
             anyhow::bail!("用户记忆 ID 不能为空");
         }
-        let deleted = self.db_manager.delete_user_memory(
-            &self.target.source,
-            &self.target.bot_id,
-            user_id,
-            memory_id,
-        )?;
-        if !deleted {
-            anyhow::bail!("找不到 QQ {} 的用户记忆 {}", user_id, memory_id);
-        }
+        self.memory_service
+            .delete(&self.target.source, &self.target.bot_id, user_id, memory_id)?;
         Ok(format!("用户记忆 {} 删除成功", memory_id))
     }
 
@@ -412,22 +482,6 @@ impl UserMemorySession {
             anyhow::bail!("QQ {} 不在当前最近活跃用户中", user_id);
         }
         Ok(())
-    }
-
-    fn generate_memory_id(&self) -> Result<String> {
-        let mut rng = rand::thread_rng();
-        for _ in 0..20 {
-            let suffix = (&mut rng)
-                .sample_iter(Alphanumeric)
-                .take(MEMORY_ID_RANDOM_CHARS)
-                .map(char::from)
-                .collect::<String>();
-            let memory_id = format!("mem_{}", suffix);
-            if !self.db_manager.user_memory_id_exists(&memory_id)? {
-                return Ok(memory_id);
-            }
-        }
-        anyhow::bail!("生成用户记忆 ID 连续碰撞")
     }
 
     fn non_empty(value: String) -> Option<String> {

@@ -13,6 +13,14 @@ pub struct UserMemoryRecord {
     pub content: String,
 }
 
+/// 管理页面批量读取时携带所属 QQ 号。
+#[derive(Debug, Clone)]
+pub struct OwnedUserMemoryRecord {
+    pub user_id: String,
+    pub memory_id: String,
+    pub content: String,
+}
+
 impl QQChatContextManager {
     /// 判断模型可见的用户记忆 ID 是否已经存在。
     pub fn user_memory_id_exists(&self, memory_id: &str) -> Result<bool> {
@@ -113,6 +121,43 @@ impl QQChatContextManager {
                 Ok(UserMemoryRecord {
                     memory_id: row.get(0)?,
                     content: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(records)
+    }
+
+    /// 批量读取一组群成员已有的记忆，避免逐成员查询数据库。
+    pub fn get_user_memories_for_users(
+        &self,
+        source: &str,
+        bot_id: &str,
+        user_ids: &[String],
+    ) -> Result<Vec<OwnedUserMemoryRecord>> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", user_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT user_id, memory_id, content FROM user_memories
+             WHERE source = ? AND bot_id = ? AND user_id IN ({})
+             ORDER BY user_id ASC, id DESC",
+            placeholders
+        );
+        let mut values = Vec::<rusqlite::types::Value>::with_capacity(user_ids.len() + 2);
+        values.push(source.to_string().into());
+        values.push(bot_id.to_string().into());
+        values.extend(user_ids.iter().cloned().map(Into::into));
+        let connection = self.conn_pool.get()?;
+        let mut statement = connection.prepare(&sql)?;
+        let records = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                Ok(OwnedUserMemoryRecord {
+                    user_id: row.get(0)?,
+                    memory_id: row.get(1)?,
+                    content: row.get(2)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

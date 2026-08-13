@@ -227,7 +227,7 @@ impl ConversationFilter {
     }
 
     fn ai_filter_enabled_for(&self, messages: &[FilteredMessage]) -> bool {
-        self.app_config.app.enable_ai_filter
+        !self.app_config.app.filter_model_name.trim().is_empty()
             && messages.first().is_some_and(|message| {
                 matches!(message.message.conversation.kind, ConversationKind::Group)
             })

@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::conversation_trigger::{ConversationTrigger, RoutedConversationTrigger};
 use crate::repository::db_manager::{NewChatMessage, QQChatContextManager};
+use crate::runtime_state::{RuntimeGroupInfo, RuntimeState};
 use crate::transport::message::{
     Conversation, ConversationKind, IncomingMessage, MessageContent, MessagePart, MessageTarget,
     Participant,
@@ -10,7 +11,8 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::{routing::post, Json, Router};
+use axum::response::Redirect;
+use axum::{routing::get, Json, Router};
 use chrono::Utc;
 use parking_lot::Mutex;
 use rand::Rng;
@@ -22,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 mod history;
@@ -30,6 +33,10 @@ const RAW_MESSAGE_CHANNEL_CAPACITY: usize = 128;
 const FOLLOWUP_SEGMENT_DELAY_PER_CHAR_MS: u64 = 100;
 const FOLLOWUP_SEGMENT_MAX_DELAY: Duration = Duration::from_secs(6);
 const QQ_RANDOM_EXPRESSION_ANIMATION_DELAY: Duration = Duration::from_secs(3);
+
+async fn admin_redirect() -> Redirect {
+    Redirect::temporary("/admin")
+}
 
 /// OneBot 原始上报事件 DTO。
 /// 直接对应 OneBot 的 HTTP 上报 JSON，通过 `post_type` 区分事件大类。
@@ -913,12 +920,16 @@ pub struct OneBotMessageSender {
     onebot_api_url: String,
     onebot_token: Option<String>,
     db_manager: Arc<QQChatContextManager>,
-    split_reply_on_newlines: bool,
+    runtime_state: Arc<RuntimeState>,
     reply_delay_random_max_secs: f64,
 }
 
 impl OneBotMessageSender {
-    pub fn new(config: &AppConfig, db_manager: Arc<QQChatContextManager>) -> Self {
+    pub fn new(
+        config: &AppConfig,
+        db_manager: Arc<QQChatContextManager>,
+        runtime_state: Arc<RuntimeState>,
+    ) -> Self {
         Self {
             client: Client::new(),
             onebot_api_url: config.server.onebot_api.clone(),
@@ -928,7 +939,7 @@ impl OneBotMessageSender {
                 Some(config.server.onebot_token.clone())
             },
             db_manager,
-            split_reply_on_newlines: config.app.split_reply_on_newlines,
+            runtime_state,
             reply_delay_random_max_secs: config.app.reply_delay_random_max_secs,
         }
     }
@@ -1163,14 +1174,7 @@ impl OneBotMessageSender {
             .find(|segment| segment.type_ == expression_type))
     }
 
-    fn text_segments(text: &str, split_on_newlines: bool) -> Vec<&str> {
-        if !split_on_newlines {
-            return (!text.trim().is_empty())
-                .then_some(text)
-                .into_iter()
-                .collect();
-        }
-
+    fn text_segments(text: &str) -> Vec<&str> {
         text.lines()
             .map(str::trim)
             .filter(|segment| !segment.is_empty())
@@ -1244,9 +1248,17 @@ impl MessageSender for OneBotMessageSender {
         if result.retcode != 0 {
             bail!("OneBot get_group_info 返回错误码 {}", result.retcode);
         }
-        Ok(result.data.map(|group| GroupInfo {
-            name: group.group_name,
-            member_count: group.member_count,
+        Ok(result.data.map(|group| {
+            self.runtime_state.update_group(RuntimeGroupInfo {
+                group_id: target.conversation.id.clone(),
+                name: group.group_name.clone(),
+                member_count: group.member_count,
+                max_member_count: None,
+            });
+            GroupInfo {
+                name: group.group_name,
+                member_count: group.member_count,
+            }
         }))
     }
 
@@ -1259,7 +1271,7 @@ impl MessageSender for OneBotMessageSender {
         if target.source != "onebot" {
             bail!("OneBot 发送器不支持消息来源：{}", target.source);
         }
-        let segments = Self::text_segments(text, self.split_reply_on_newlines);
+        let segments = Self::text_segments(text);
         if segments.is_empty() {
             bail!("不能发送空消息");
         }
@@ -1297,7 +1309,7 @@ impl MessageSender for OneBotMessageSender {
         if target.source != "onebot" {
             bail!("OneBot 发送器不支持消息来源：{}", target.source);
         }
-        let segments = Self::text_segments(text, self.split_reply_on_newlines);
+        let segments = Self::text_segments(text);
         if segments.is_empty() {
             bail!("不能发送空消息");
         }
@@ -1417,11 +1429,14 @@ pub struct OneBotHttpServer {
     onebot_token: Option<String>,
     /// 启动时加载的 QQ 经典表情名称映射。
     face_id_map: HashMap<String, String>,
+    /// 管理页面和平台组件共享的短期运行状态。
+    runtime_state: Arc<RuntimeState>,
 }
 
 #[derive(Clone)]
 struct OneBotHttpState {
     event_tx: mpsc::Sender<OneBotEventDto>,
+    server: Arc<OneBotHttpServer>,
 }
 
 impl OneBotHttpServer {
@@ -1430,6 +1445,7 @@ impl OneBotHttpServer {
         config: &AppConfig,
         message_tx: mpsc::Sender<IncomingMessage>,
         trigger_tx: mpsc::UnboundedSender<RoutedConversationTrigger>,
+        runtime_state: Arc<RuntimeState>,
     ) -> Self {
         Self {
             listener_ip: config.server.server_host.clone(),
@@ -1450,6 +1466,7 @@ impl OneBotHttpServer {
                 Some(config.server.onebot_token.clone())
             },
             face_id_map: config.face_id_map.clone(),
+            runtime_state,
         }
     }
 
@@ -1720,27 +1737,43 @@ impl OneBotHttpServer {
     }
 
     /// 启动接收 OneBot 上报的 HTTP 服务。
-    pub async fn run(&self, ready_tx: oneshot::Sender<()>) {
+    pub async fn run(
+        &self,
+        ready_tx: oneshot::Sender<()>,
+        admin_router: Router,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
         let listener_ip = self.listener_ip.clone();
         let listener_port = self.listener_port;
         let listener = tokio::net::TcpListener::bind(format!("{}:{}", listener_ip, listener_port))
             .await
-            .unwrap();
+            .with_context(|| {
+                format!("绑定 HTTP 监听地址 {}:{} 失败", listener_ip, listener_port)
+            })?;
         let log_out = format!("HTTP 服务已启动: http://{}:{}/", listener_ip, listener_port);
         let (raw_event_tx, mut raw_event_rx) =
             mpsc::channel::<OneBotEventDto>(RAW_MESSAGE_CHANNEL_CAPACITY);
         let server = Arc::new(self.clone());
         let shared_state = Arc::new(OneBotHttpState {
             event_tx: raw_event_tx,
+            server: server.clone(),
         });
         let app = Router::new()
-            .route("/", post(on_event))
-            .with_state(shared_state);
+            // 浏览器 GET 进入管理后台，OneBot POST 回调继续使用同一个根路径。
+            .route("/", get(admin_redirect).post(on_event))
+            .with_state(shared_state)
+            .merge(admin_router);
         info!(address = %log_out, "OneBot HTTP 服务已启动");
         let _ = ready_tx.send(());
 
+        let forward_shutdown = shutdown.clone();
         let forward_events = async move {
-            while let Some(event) = raw_event_rx.recv().await {
+            loop {
+                let event = tokio::select! {
+                    _ = forward_shutdown.cancelled() => break,
+                    event = raw_event_rx.recv() => event,
+                };
+                let Some(event) = event else { break };
                 match event {
                     OneBotEventDto::Message(message) => {
                         let incoming_message = message.into_incoming_message(&server).await;
@@ -1755,18 +1788,50 @@ impl OneBotHttpServer {
             }
         };
 
+        let serve =
+            axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
         tokio::select! {
-            result = axum::serve(listener, app) => result.unwrap(),
+            result = serve => result.context("HTTP 服务运行失败")?,
             _ = forward_events => warn!("OneBot 事件转发任务已停止"),
         }
+        Ok(())
     }
 }
 
 async fn on_event(
     State(state): State<Arc<OneBotHttpState>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(event): Json<OneBotEventDto>,
 ) -> StatusCode {
+    if !state.server.verify_request_token(&headers) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    match &event {
+        OneBotEventDto::Message(message) => {
+            state
+                .server
+                .runtime_state
+                .record_event(message.time, message.self_id);
+        }
+        OneBotEventDto::Notice(notice) => {
+            state
+                .server
+                .runtime_state
+                .record_event(notice.time, notice.self_id);
+        }
+        OneBotEventDto::Meta(meta) => {
+            state
+                .server
+                .runtime_state
+                .record_event(meta.time, meta.self_id);
+            if let Some(status) = &meta.status {
+                state
+                    .server
+                    .runtime_state
+                    .set_onebot_online(status.online && status.good);
+            }
+        }
+    }
     if matches!(event, OneBotEventDto::Meta(_)) {
         return StatusCode::OK;
     }
@@ -2085,18 +2150,9 @@ mod tests {
     #[test]
     fn text_segments_skip_consecutive_and_blank_lines() {
         let segments =
-            OneBotMessageSender::text_segments("  第一段  \n\n  \r\n第二段\r\n\r\n第三段  ", true);
+            OneBotMessageSender::text_segments("  第一段  \n\n  \r\n第二段\r\n\r\n第三段  ");
 
         assert_eq!(segments, vec!["第一段", "第二段", "第三段"]);
-    }
-
-    // 验证关闭分段时保留原始文本。
-    #[test]
-    fn text_segments_preserve_original_text_when_disabled() {
-        let text = "第一段\n\n第二段";
-
-        assert_eq!(OneBotMessageSender::text_segments(text, false), vec![text]);
-        assert!(OneBotMessageSender::text_segments(" \n\r\n ", false).is_empty());
     }
 
     // 验证跟进消息延迟按长度累加并有上限。

@@ -21,7 +21,7 @@ pub struct OpenAICompatibleProvider {
     api_key: String,
     base_url: String,
     model: String,
-    max_tokens: i32,
+    max_tokens: Option<i32>,
     reasoning_effort: String,
 }
 
@@ -30,7 +30,7 @@ impl OpenAICompatibleProvider {
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         model: impl Into<String>,
-        max_tokens: i32,
+        max_tokens: Option<i32>,
         reasoning_effort: impl Into<String>,
     ) -> Self {
         Self {
@@ -49,8 +49,10 @@ impl OpenAICompatibleProvider {
 struct OpenAICompatibleChatRequest<'a> {
     model: &'a str,
     messages: Vec<OpenAICompatibleToolMessage<'a>>,
-    max_tokens: i32,
-    reasoning_effort: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAICompatibleToolDefinition<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,7 +132,8 @@ struct OpenAICompatibleRequestFunctionCall<'a> {
 struct OpenAICompatibleVisionRequest<'a> {
     model: &'a str,
     messages: Vec<OpenAICompatibleVisionMessage<'a>>,
-    max_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<i32>,
     reasoning_effort: &'a str,
 }
 
@@ -216,7 +219,7 @@ struct OpenAICompatibleUsage {
 
 fn build_openai_compatible_request<'a>(
     model: &'a str,
-    max_tokens: i32,
+    max_tokens: Option<i32>,
     reasoning_effort: &'a str,
     messages: &'a [ToolChatMessage],
     tools: &'a [ToolDefinition],
@@ -281,7 +284,7 @@ fn build_openai_compatible_request<'a>(
         model,
         messages,
         max_tokens,
-        reasoning_effort,
+        reasoning_effort: (reasoning_effort != "auto").then_some(reasoning_effort),
         tools,
         tool_choice,
     }
@@ -558,7 +561,7 @@ mod tests {
             Some("原始推理文本")
         );
         let messages = vec![response.assistant_message()];
-        let request = build_openai_compatible_request("test", 100, "medium", &messages, &[]);
+        let request = build_openai_compatible_request("test", Some(100), "medium", &messages, &[]);
         let request_json = serde_json::to_value(request).unwrap();
 
         assert_eq!(
@@ -603,7 +606,7 @@ mod tests {
             ]),
         }];
 
-        let request = build_openai_compatible_request("test", 100, "medium", &messages, &[]);
+        let request = build_openai_compatible_request("test", Some(100), "medium", &messages, &[]);
         let request_json = serde_json::to_value(request).unwrap();
 
         assert_eq!(request_json["messages"][0]["content"][0]["type"], "text");
@@ -615,6 +618,18 @@ mod tests {
             request_json["messages"][0]["content"][1]["image_url"]["detail"],
             "high"
         );
+    }
+
+    #[test]
+    fn automatic_defaults_are_omitted_from_request() {
+        let messages = vec![ToolChatMessage::User {
+            content: ToolChatUserContent::text("test"),
+        }];
+        let request = build_openai_compatible_request("test", None, "auto", &messages, &[]);
+        let request_json = serde_json::to_value(request).unwrap();
+
+        assert!(request_json.get("max_tokens").is_none());
+        assert!(request_json.get("reasoning_effort").is_none());
     }
 }
 

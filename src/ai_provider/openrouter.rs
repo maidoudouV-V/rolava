@@ -19,7 +19,7 @@ pub struct OpenRouterProvider {
     api_key: String,
     base_url: String,
     model: String,
-    max_tokens: i32,
+    max_tokens: Option<i32>,
     reasoning_effort: String,
 }
 
@@ -28,7 +28,7 @@ impl OpenRouterProvider {
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         model: impl Into<String>,
-        max_tokens: i32,
+        max_tokens: Option<i32>,
         reasoning_effort: impl Into<String>,
     ) -> Self {
         Self {
@@ -47,7 +47,8 @@ impl OpenRouterProvider {
 struct OpenRouterChatRequest<'a> {
     model: &'a str,
     messages: Vec<OpenRouterChatMessage<'a>>,
-    max_completion_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<i32>,
     reasoning: OpenRouterReasoning<'a>,
     response_format: OpenRouterResponseFormat,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,7 +59,8 @@ struct OpenRouterChatRequest<'a> {
 
 #[derive(Serialize)]
 struct OpenRouterReasoning<'a> {
-    effort: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<&'a str>,
     summary: &'static str,
 }
 
@@ -139,7 +141,8 @@ struct OpenRouterRequestFunctionCall<'a> {
 struct OpenRouterVisionRequest<'a> {
     model: &'a str,
     messages: Vec<OpenRouterVisionMessage<'a>>,
-    max_completion_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<i32>,
     reasoning: OpenRouterReasoning<'a>,
 }
 
@@ -211,7 +214,7 @@ struct OpenRouterUsage {
 
 fn build_openrouter_chat_request<'a>(
     model: &'a str,
-    max_tokens: i32,
+    max_tokens: Option<i32>,
     reasoning_effort: &'a str,
     messages: &'a [ToolChatMessage],
     tools: &'a [ToolDefinition],
@@ -280,7 +283,7 @@ fn build_openrouter_chat_request<'a>(
         messages,
         max_completion_tokens: max_tokens,
         reasoning: OpenRouterReasoning {
-            effort: reasoning_effort,
+            effort: (reasoning_effort != "auto").then_some(reasoning_effort),
             summary: "auto",
         },
         response_format: OpenRouterResponseFormat {
@@ -376,7 +379,7 @@ impl AIProvider for OpenRouterProvider {
             }],
             max_completion_tokens: self.max_tokens,
             reasoning: OpenRouterReasoning {
-                effort: VISION_REASONING_EFFORT,
+                effort: Some(VISION_REASONING_EFFORT),
                 summary: "auto",
             },
         };
@@ -581,7 +584,7 @@ mod tests {
         let expected_details =
             response.raw_response["choices"][0]["message"]["reasoning_details"].clone();
         let messages = vec![response.assistant_message()];
-        let request = build_openrouter_chat_request("test", 100, "medium", &messages, &[]);
+        let request = build_openrouter_chat_request("test", Some(100), "medium", &messages, &[]);
         let request_json = serde_json::to_value(request).unwrap();
 
         assert_eq!(
@@ -605,7 +608,7 @@ mod tests {
             ]),
         }];
 
-        let request = build_openrouter_chat_request("test", 100, "medium", &messages, &[]);
+        let request = build_openrouter_chat_request("test", Some(100), "medium", &messages, &[]);
         let request_json = serde_json::to_value(request).unwrap();
 
         assert_eq!(request_json["messages"][0]["content"][0]["type"], "text");
@@ -617,5 +620,18 @@ mod tests {
             request_json["messages"][0]["content"][1]["image_url"]["detail"],
             "high"
         );
+    }
+
+    #[test]
+    fn automatic_defaults_keep_summary_without_forcing_limits() {
+        let messages = vec![ToolChatMessage::User {
+            content: ToolChatUserContent::text("test"),
+        }];
+        let request = build_openrouter_chat_request("test", None, "auto", &messages, &[]);
+        let request_json = serde_json::to_value(request).unwrap();
+
+        assert!(request_json.get("max_completion_tokens").is_none());
+        assert!(request_json["reasoning"].get("effort").is_none());
+        assert_eq!(request_json["reasoning"]["summary"], "auto");
     }
 }

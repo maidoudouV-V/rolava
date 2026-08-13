@@ -217,6 +217,52 @@ impl QQChatContextManager {
         Ok(changed != 0)
     }
 
+    /// 管理后台使用稳定内部 ID 修改标题、内容和期限，并重置到期展示状态。
+    pub fn update_character_memory_by_id(
+        &self,
+        source: &str,
+        bot_id: &str,
+        source_conversation_id: &str,
+        memory_id: i64,
+        title: &str,
+        content: &str,
+        expires_at: i64,
+    ) -> Result<bool> {
+        let changed = self.conn_pool.get()?.execute(
+            "UPDATE character_memories
+             SET title = ?5, content = ?6, expires_at = ?7,
+                 expired_seen_at = NULL, updated_at = ?8
+             WHERE source = ?1 AND bot_id = ?2
+               AND source_conversation_id = ?3 AND id = ?4",
+            params![
+                source,
+                bot_id,
+                source_conversation_id,
+                memory_id,
+                title,
+                content,
+                expires_at,
+                Utc::now().timestamp(),
+            ],
+        )?;
+        Ok(changed != 0)
+    }
+
+    pub fn delete_character_memory_by_id(
+        &self,
+        source: &str,
+        bot_id: &str,
+        source_conversation_id: &str,
+        memory_id: i64,
+    ) -> Result<bool> {
+        let changed = self.conn_pool.get()?.execute(
+            "DELETE FROM character_memories
+             WHERE source = ?1 AND bot_id = ?2 AND source_conversation_id = ?3 AND id = ?4",
+            params![source, bot_id, source_conversation_id, memory_id],
+        )?;
+        Ok(changed != 0)
+    }
+
     /// 删除此前已经向主模型展示过“即将遗忘”的到期记忆。
     pub fn delete_seen_expired_character_memories(
         &self,

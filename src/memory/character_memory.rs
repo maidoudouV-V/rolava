@@ -6,11 +6,11 @@ use chrono::Utc;
 use crate::repository::db_manager::QQChatContextManager;
 use crate::transport::message::MessageTarget;
 
-const MAX_CHARACTER_MEMORIES: usize = 50;
-const MAX_TITLE_CHARS: usize = 50;
-const MAX_CONTENT_CHARS: usize = 1000;
-const MAX_RETENTION_DAYS: u16 = 365;
-const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+pub const MAX_CHARACTER_MEMORIES: usize = 50;
+pub const MAX_TITLE_CHARS: usize = 50;
+pub const MAX_CONTENT_CHARS: usize = 1000;
+pub const MAX_RETENTION_DAYS: u16 = 365;
+pub const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
 /// 管理单个会话独立持有的角色记忆。
 pub struct CharacterMemorySession {
@@ -146,7 +146,7 @@ impl CharacterMemorySession {
             .mark_expired_character_memories_seen(displayed_expired_ids, Utc::now().timestamp())
     }
 
-    fn validate_title(title: &str) -> Result<()> {
+    pub fn validate_title(title: &str) -> Result<()> {
         if title.is_empty() {
             anyhow::bail!("角色记忆标题不能为空");
         }
@@ -159,7 +159,7 @@ impl CharacterMemorySession {
         Ok(())
     }
 
-    fn validate_content(content: &str) -> Result<()> {
+    pub fn validate_content(content: &str) -> Result<()> {
         if content.is_empty() {
             anyhow::bail!("角色记忆内容不能为空");
         }

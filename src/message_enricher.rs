@@ -22,17 +22,6 @@ use crate::repository::db_manager::{
 };
 use crate::transport::message::IncomingMessage;
 
-const IMAGE_DESCRIPTION_PROMPT: &str = r#"你是QQ群聊天机器人的图片转写模块。请将图片转成一段简短文本，供另一个AI理解聊天上下文。
-
-要求：
-1. 概括主体、场景、动作、表情、关键文字和情绪；不要全文OCR。
-2. 如果是表情包或梗图，必须简要说明笑点、反差、讽刺或隐含意思，以及通常表达的聊天态度；不确定时用“可能”表达。
-3. 普通图片不要强行解读。可作有助理解语气的有限推断，但不要编造人物身份、事件背景或图片外的事实。
-4. 如果是截图，只概括类型、关键内容和明显状态。内容不清晰时，说明不清晰并描述可辨认部分。
-5. 尽量控制在120字内，不要使用废话开头，不要输出Markdown、换行或判断过程。
-
-现在直接描述图片"#;
-
 const IMAGE_READ_FAILED_TEXT: &str = "[图片消息 读取失败]";
 const REPLY_MESSAGE_PLACEHOLDER: &str = "[回复消息]";
 const REPLY_PREVIEW_MAX_CHARS: usize = 16;
@@ -493,7 +482,10 @@ impl MessageEnricher {
             match Self::run_ai_request_with_timeout(
                 app_config,
                 "图片识别 API 请求",
-                visual_provider.describe_image(&image_data_url, IMAGE_DESCRIPTION_PROMPT),
+                visual_provider.describe_image(
+                    &image_data_url,
+                    app_config.prompt_config.image_description_prompt.trim(),
+                ),
             )
             .await
             {
