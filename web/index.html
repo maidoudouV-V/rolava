@@ -6,9 +6,9 @@
   <meta name="color-scheme" content="light">
   <title>Rolava Studio</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b8b62'/%3E%3Ctext x='16' y='22' text-anchor='middle' fill='white' font-family='Arial' font-size='17' font-weight='700'%3ER%3C/text%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/admin/assets/app.css">
-  <script src="/admin/assets/lucide.min.js" defer></script>
-  <script type="module" src="/admin/assets/app.js"></script>
+  <link rel="stylesheet" href="./assets/app.css">
+  <script src="./assets/lucide.min.js" defer></script>
+  <script type="module" src="./assets/app.js"></script>
 </head>
 <body>
   <div class="login-screen" id="login-screen">
@@ -102,7 +102,7 @@
 
         <section class="page" id="page-prompts">
           <div class="page-heading"><div><p class="eyebrow">PROMPTS</p><h1>角色与提示词</h1><p>维护机器人实际加载的 Markdown 提示词。</p></div></div>
-          <div class="prompt-layout"><aside class="prompt-list" id="prompt-list"><div class="empty">正在加载</div></aside><section class="prompt-editor"><header><div><strong id="prompt-title">选择提示词</strong><small id="prompt-meta">Markdown</small></div><button class="button primary small" id="save-prompt" disabled><i data-lucide="save"></i>保存并重启</button></header><textarea id="prompt-content" spellcheck="false" disabled></textarea><div class="placeholder-help"><strong>固定占位符</strong><div><code>{{character_prompt}}</code><span>角色卡正文</span></div><div><code>{{scene}}</code><span>会话类型、群名称与成员数量</span></div><div><code>{{recent_active_users}}</code><span>最近活跃用户及其记忆</span></div><div><code>{{character_memories}}</code><span>当前会话角色记忆</span></div><div><code>{{scheduled_tasks}}</code><span>当前会话运行中的定时任务</span></div><div><code>{{unread_since}}</code><span>本轮未读消息开始时间</span></div></div></section></div>
+          <div class="prompt-layout"><aside class="prompt-list" id="prompt-list"><div class="empty">正在加载</div></aside><section class="prompt-editor"><header><div><strong id="prompt-title">选择提示词</strong><small id="prompt-meta">Markdown</small></div><button class="button primary small" id="save-prompt" disabled><i data-lucide="save"></i>保存并重启</button></header><label class="sr-only" for="prompt-content">提示词内容</label><textarea id="prompt-content" spellcheck="false" disabled></textarea><div class="placeholder-help"><strong>固定占位符</strong><div><code>{{character_prompt}}</code><span>角色卡正文</span></div><div><code>{{scene}}</code><span>会话类型、群名称与成员数量</span></div><div><code>{{recent_active_users}}</code><span>最近活跃用户及其记忆</span></div><div><code>{{character_memories}}</code><span>当前会话角色记忆</span></div><div><code>{{scheduled_tasks}}</code><span>当前会话运行中的定时任务</span></div><div><code>{{unread_since}}</code><span>本轮未读消息开始时间</span></div></div></section></div>
         </section>
 
         <section class="page config-page" id="page-access">
@@ -114,8 +114,8 @@
     </main>
   </div>
 
-  <dialog class="entity-dialog" id="entity-dialog"><form method="dialog"><header><div><p class="eyebrow" id="dialog-eyebrow">EDIT</p><h2 id="dialog-title">编辑</h2></div><button class="icon-button" value="cancel" title="关闭"><i data-lucide="x"></i></button></header><div class="dialog-fields" id="dialog-fields"></div><p class="form-error" id="dialog-error" hidden></p><footer><button class="button" value="cancel">取消</button><button class="button primary" id="dialog-submit" value="default">保存</button></footer></form></dialog>
-  <dialog class="model-picker" id="model-picker"><header><div><p class="eyebrow">MODEL CATALOG</p><h2>选择模型</h2></div><button class="icon-button" id="close-model-picker" type="button" title="关闭"><i data-lucide="x"></i></button></header><div class="model-picker-search"><i data-lucide="search"></i><input id="model-picker-query" type="search" placeholder="搜索模型名称或 ID" autocomplete="off"></div><p class="model-picker-status" id="model-picker-status">正在读取模型列表</p><div class="model-picker-results" id="model-picker-results"></div></dialog>
+  <dialog class="entity-dialog" id="entity-dialog"><form method="dialog"><header><div><p class="eyebrow" id="dialog-eyebrow">EDIT</p><h2 id="dialog-title">编辑</h2></div><button class="icon-button" type="button" data-dialog-cancel title="关闭"><i data-lucide="x"></i></button></header><div class="dialog-fields" id="dialog-fields"></div><p class="form-error" id="dialog-error" hidden></p><footer><button class="button" type="button" data-dialog-cancel>取消</button><button class="button primary" id="dialog-submit" value="default">保存</button></footer></form></dialog>
+  <dialog class="model-picker" id="model-picker"><header><div><p class="eyebrow">MODEL CATALOG</p><h2>选择模型</h2></div><button class="icon-button" id="close-model-picker" type="button" title="关闭"><i data-lucide="x"></i></button></header><div class="model-picker-search"><i data-lucide="search"></i><label class="sr-only" for="model-picker-query">搜索模型名称或 ID</label><input id="model-picker-query" type="search" placeholder="搜索模型名称或 ID" autocomplete="off"></div><p class="model-picker-status" id="model-picker-status">正在读取模型列表</p><div class="model-picker-results" id="model-picker-results"></div></dialog>
   <div class="toast-region" id="toast-region" aria-live="polite"></div>
   <div class="restart-screen" id="restart-screen" hidden><span class="spinner"></span><h2>正在重启 Rolava</h2><p id="restart-message">配置已保存，等待服务重新上线。</p></div>
 </body>

@@ -140,7 +140,7 @@ pub fn ensure_admin_token(config_path: &Path) -> Result<String> {
     Ok(token)
 }
 
-pub fn write_admin_config(config_path: &Path, update: AdminConfigUpdate) -> Result<()> {
+pub fn write_admin_config(config_path: &Path, update: AdminConfigUpdate) -> Result<AppConfig> {
     validate_update(&update)?;
     let source = fs::read_to_string(config_path)?;
     let mut document = source
@@ -156,11 +156,12 @@ pub fn write_admin_config(config_path: &Path, update: AdminConfigUpdate) -> Resu
         NamedTempFile::new_in(config_path.parent().unwrap_or_else(|| Path::new(".")))?;
     candidate.write_all(document.to_string().as_bytes())?;
     candidate.flush()?;
-    AppConfig::new(candidate.path().to_string_lossy().as_ref()).context("新配置校验失败")?;
+    let config =
+        AppConfig::new(candidate.path().to_string_lossy().as_ref()).context("新配置校验失败")?;
     candidate
         .persist(config_path)
         .map_err(|error| error.error)?;
-    Ok(())
+    Ok(config)
 }
 
 #[derive(Debug, Serialize)]

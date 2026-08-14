@@ -14,17 +14,12 @@ export class PromptController {
 
   async load() {
     const response = await api.get("/prompts");
-    const groups = new Map();
-    for (const item of response.items) {
-      if (!groups.has(item.category)) groups.set(item.category, []);
-      groups.get(item.category).push(item);
-    }
-    const labels = { core: "核心提示词", internal: "运行时提示词", action: "动作提示词" };
-    document.getElementById("prompt-list").innerHTML = Array.from(groups).map(([category, items]) => `
-      <p class="prompt-category">${labels[category] || category}</p>
+    const items = response.items.filter(item => item.category === "core");
+    document.getElementById("prompt-list").innerHTML = `
+      <p class="prompt-category">核心提示词</p>
       ${items.map(item => `<button class="prompt-button" data-prompt-id="${escapeHtml(item.id)}">${escapeHtml(item.name)}</button>`).join("")}
-    `).join("");
-    const first = response.items[0];
+    `;
+    const first = items[0];
     if (first) await this.select(first.id);
   }
 
@@ -34,9 +29,7 @@ export class PromptController {
       this.current = promptId;
       document.querySelectorAll(".prompt-button").forEach(button => button.classList.toggle("active", button.dataset.promptId === promptId));
       document.getElementById("prompt-title").textContent = document.querySelector(`[data-prompt-id="${CSS.escape(promptId)}"]`)?.textContent || promptId;
-      document.getElementById("prompt-meta").textContent = promptId.startsWith("action:")
-        ? "动作提示词"
-        : promptId.startsWith("internal:") ? "运行时提示词" : "核心提示词";
+      document.getElementById("prompt-meta").textContent = "核心提示词";
       const editor = document.getElementById("prompt-content");
       editor.value = response.content;
       editor.disabled = false;
@@ -50,7 +43,7 @@ export class PromptController {
     button.disabled = true;
     try {
       await api.put(`/prompts/${encodeURIComponent(this.current)}`, { content: document.getElementById("prompt-content").value });
-      this.onRestart(window.location.port || (location.protocol === "https:" ? 443 : 80));
+      this.onRestart();
     } catch (error) {
       button.disabled = false;
       toast(error.message, true);

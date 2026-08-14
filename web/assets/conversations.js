@@ -74,7 +74,12 @@ export class ConversationsController {
         <section class="tab-panel" data-panel="characters">${this.characterMemoriesHtml()}</section>
         <section class="tab-panel" data-panel="tasks">${this.tasksHtml()}</section>
       </div>`;
-    this.bindDetailEvents(); refreshIcons();
+    this.bindDetailEvents();
+    refreshIcons();
+    requestAnimationFrame(() => {
+      const body = document.querySelector("#conversation-detail .detail-body");
+      if (body) body.scrollTop = body.scrollHeight;
+    });
   }
 
   messagesHtml() {

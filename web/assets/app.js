@@ -152,16 +152,10 @@ function formatDuration(seconds) {
   return `${minutes} 分钟`;
 }
 
-async function restart(nextPort) {
+async function restart() {
   dirty = false;
   document.getElementById("restart-screen").hidden = false;
-  const currentPort = Number(location.port || (location.protocol === "https:" ? 443 : 80));
-  if (Number(nextPort) !== currentPort) {
-    const target = `${location.protocol}//${location.hostname}:${nextPort}/admin`;
-    document.getElementById("restart-message").textContent = `监听端口将切换到 ${nextPort}，稍后打开新地址并重新登录。`;
-    setTimeout(() => location.assign(target), 2200);
-    return;
-  }
+  document.getElementById("restart-message").textContent = "配置已保存，正在等待服务重新上线。";
   await new Promise(resolve => setTimeout(resolve, 900));
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {

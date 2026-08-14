@@ -19,10 +19,11 @@ use crate::transport::onebot::OneBotHttpServer;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{Local, Timelike, Utc};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -37,7 +38,7 @@ const GROUP_MEMBER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
 pub struct AdminState {
-    pub app_config: Arc<AppConfig>,
+    app_config: Arc<RwLock<Arc<AppConfig>>>,
     pub config_path: PathBuf,
     pub db_manager: Arc<QQChatContextManager>,
     pub scheduler: Arc<SchedulerService>,
@@ -60,7 +61,7 @@ impl AdminState {
     ) -> Self {
         Self {
             user_memory: Arc::new(UserMemoryService::new(db_manager.clone())),
-            app_config,
+            app_config: Arc::new(RwLock::new(app_config)),
             config_path,
             db_manager,
             scheduler,
@@ -69,6 +70,15 @@ impl AdminState {
             restart,
             started_at: Utc::now().timestamp(),
         }
+    }
+
+    /// 管理后台使用可替换快照，普通保存后刷新页面也能读取最新配置。
+    fn app_config(&self) -> Arc<AppConfig> {
+        self.app_config.read().clone()
+    }
+
+    fn replace_app_config(&self, config: AppConfig) {
+        *self.app_config.write() = Arc::new(config);
     }
 }
 
@@ -118,9 +128,14 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .with_state(state);
 
     Router::new()
-        .route("/admin", get(admin_index))
+        .route("/admin", get(admin_path_redirect))
+        .route("/admin/", get(admin_index))
         .nest_service("/admin/assets", ServeDir::new("web/assets"))
         .nest("/api/admin", api)
+}
+
+async fn admin_path_redirect() -> Redirect {
+    Redirect::temporary("/admin/")
 }
 
 async fn admin_index() -> Result<Html<String>, ApiError> {
@@ -133,8 +148,9 @@ async fn require_admin(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    let app_config = state.app_config();
     if bearer_token(&headers)
-        .is_some_and(|token| constant_time_equals(token, &state.app_config.admin.token))
+        .is_some_and(|token| constant_time_equals(token, &app_config.admin.token))
     {
         return next.run(request).await;
     }
@@ -198,8 +214,9 @@ async fn status(State(state): State<Arc<AdminState>>) -> Result<Json<StatusRespo
 }
 
 async fn get_config(State(state): State<Arc<AdminState>>) -> Json<Value> {
+    let app_config = state.app_config();
     Json(json!({
-        "config": AdminConfigView::from_config(&state.app_config),
+        "config": AdminConfigView::from_config(&app_config),
         "optional_tools": ToolRegistry::optional_definitions(),
     }))
 }
@@ -216,7 +233,9 @@ async fn put_config(
     Json(update): Json<AdminConfigUpdate>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let path = state.config_path.clone();
-    tokio::task::spawn_blocking(move || write_admin_config(&path, update)).await??;
+    let app_config =
+        tokio::task::spawn_blocking(move || write_admin_config(&path, update)).await??;
+    state.replace_app_config(app_config);
     if query.restart.unwrap_or(true) {
         schedule_restart(&state.restart);
         return Ok((StatusCode::ACCEPTED, Json(json!({ "restarting": true }))));
@@ -234,10 +253,11 @@ async fn test_onebot(
     State(state): State<Arc<AdminState>>,
     Json(request): Json<TestOneBotRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let app_config = state.app_config();
     let token = request
         .onebot_token
         .filter(|token| !token.is_empty())
-        .unwrap_or_else(|| state.app_config.server.onebot_token.clone());
+        .unwrap_or_else(|| app_config.server.onebot_token.clone());
     let mut http_request = reqwest::Client::new()
         .post(format!(
             "{}/get_login_info",
@@ -348,6 +368,7 @@ async fn provider_models(
 }
 
 fn resolve_provider_key(state: &AdminState, provider: &AdminProviderConfig) -> String {
+    let app_config = state.app_config();
     provider
         .key
         .as_ref()
@@ -355,8 +376,7 @@ fn resolve_provider_key(state: &AdminState, provider: &AdminProviderConfig) -> S
         .cloned()
         .or_else(|| {
             let original_name = provider.original_name.as_deref().unwrap_or(&provider.name);
-            state
-                .app_config
+            app_config
                 .providers
                 .iter()
                 .find(|saved| saved.name == original_name)
@@ -519,18 +539,18 @@ fn infer_model_vision(model: &Value) -> Option<bool> {
 }
 
 async fn prompts(State(state): State<Arc<AdminState>>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        json!({ "items": list_prompt_files(&state.app_config)? }),
-    ))
+    let app_config = state.app_config();
+    Ok(Json(json!({ "items": list_prompt_files(&app_config)? })))
 }
 
 async fn get_prompt(
     State(state): State<Arc<AdminState>>,
     Path(prompt_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    let app_config = state.app_config();
     Ok(Json(json!({
         "id": prompt_id,
-        "content": read_prompt(&state.app_config, &prompt_id)?,
+        "content": read_prompt(&app_config, &prompt_id)?,
     })))
 }
 
@@ -544,7 +564,8 @@ async fn put_prompt(
     Path(prompt_id): Path<String>,
     Json(update): Json<PromptUpdate>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    write_prompt(&state.app_config, &prompt_id, &update.content)?;
+    let app_config = state.app_config();
+    write_prompt(&app_config, &prompt_id, &update.content)?;
     schedule_restart(&state.restart);
     Ok((StatusCode::ACCEPTED, Json(json!({ "restarting": true }))))
 }

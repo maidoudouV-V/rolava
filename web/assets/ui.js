@@ -59,19 +59,16 @@ export function openDialog({ title, eyebrow = "EDIT", fields, submitText = "ä¿å
   refreshIcons();
 
   return new Promise(resolve => {
+    const cancelButtons = dialog.querySelectorAll("[data-dialog-cancel]");
     const close = () => {
       dialog.removeEventListener("close", onClose);
       form.removeEventListener("submit", onSubmit);
+      cancelButtons.forEach(button => button.removeEventListener("click", onCancel));
     };
     const onClose = () => { close(); resolve(null); };
+    const onCancel = () => dialog.close();
     const onSubmit = event => {
       event.preventDefault();
-      if (event.submitter?.value === "cancel") {
-        close();
-        dialog.close();
-        resolve(null);
-        return;
-      }
       if (!form.reportValidity()) return;
       const values = Object.fromEntries(new FormData(form));
       close();
@@ -80,6 +77,7 @@ export function openDialog({ title, eyebrow = "EDIT", fields, submitText = "ä¿å
     };
     dialog.addEventListener("close", onClose);
     form.addEventListener("submit", onSubmit);
+    cancelButtons.forEach(button => button.addEventListener("click", onCancel));
     dialog.showModal();
   });
 }

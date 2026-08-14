@@ -269,7 +269,7 @@ export class ConfigController {
   async save(restartAfterSave) {
     const update = this.buildUpdate();
     await api.put(`/config?restart=${restartAfterSave}`, update);
-    if (restartAfterSave) this.onRestart(update.server.server_port);
+    if (restartAfterSave) this.onRestart();
   }
 
   async testOneBot() {

@@ -20,6 +20,7 @@ use reqwest::header::AUTHORIZATION;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -35,7 +36,7 @@ const FOLLOWUP_SEGMENT_MAX_DELAY: Duration = Duration::from_secs(6);
 const QQ_RANDOM_EXPRESSION_ANIMATION_DELAY: Duration = Duration::from_secs(3);
 
 async fn admin_redirect() -> Redirect {
-    Redirect::temporary("/admin")
+    Redirect::temporary("/admin/")
 }
 
 /// OneBot 原始上报事件 DTO。
@@ -1476,21 +1477,92 @@ impl OneBotHttpServer {
             return true;
         };
         let Some(auth_value) = headers.get(AUTHORIZATION) else {
+            Self::log_request_token_failure("missing_authorization", expected_token, None, None);
             return false;
         };
         let Ok(auth_value) = auth_value.to_str() else {
+            Self::log_request_token_failure("invalid_header_encoding", expected_token, None, None);
             return false;
         };
         let mut auth_parts = auth_value.split_whitespace();
         let Some(scheme) = auth_parts.next() else {
+            Self::log_request_token_failure("empty_authorization", expected_token, None, None);
             return false;
         };
         let Some(token) = auth_parts.next() else {
+            Self::log_request_token_failure("missing_token", expected_token, Some(scheme), None);
             return false;
         };
-        scheme.eq_ignore_ascii_case("Bearer")
-            && token == expected_token
-            && auth_parts.next().is_none()
+        if !scheme.eq_ignore_ascii_case("Bearer") {
+            Self::log_request_token_failure(
+                "invalid_scheme",
+                expected_token,
+                Some(scheme),
+                Some(token),
+            );
+            return false;
+        }
+        if auth_parts.next().is_some() {
+            Self::log_request_token_failure(
+                "invalid_authorization_format",
+                expected_token,
+                Some(scheme),
+                Some(token),
+            );
+            return false;
+        }
+        if token != expected_token {
+            Self::log_request_token_failure(
+                "token_mismatch",
+                expected_token,
+                Some(scheme),
+                Some(token),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// 只记录足够排查鉴权问题的信息，避免把完整密钥写入持久日志。
+    fn log_request_token_failure(
+        reason: &str,
+        expected_token: &str,
+        scheme: Option<&str>,
+        received_token: Option<&str>,
+    ) {
+        let received_masked = received_token.map(Self::mask_token);
+        let received_fingerprint = received_token.map(Self::token_fingerprint);
+        warn!(
+            reason,
+            scheme = scheme.unwrap_or("<missing>"),
+            received_token = received_masked.as_deref().unwrap_or("<missing>"),
+            received_length = received_token.map_or(-1_i64, |token| token.len() as i64),
+            received_fingerprint = received_fingerprint.as_deref().unwrap_or("<missing>"),
+            expected_token = %Self::mask_token(expected_token),
+            expected_length = expected_token.len(),
+            expected_fingerprint = %Self::token_fingerprint(expected_token),
+            "OneBot HTTP 上报鉴权失败"
+        );
+    }
+
+    fn mask_token(token: &str) -> String {
+        let characters = token.chars().collect::<Vec<_>>();
+        match characters.as_slice() {
+            [] => "<empty>".to_string(),
+            [_] => "*".to_string(),
+            [_, _] => "**".to_string(),
+            [first, middle @ .., last] => {
+                format!("{}{}{}", first, "*".repeat(middle.len()), last)
+            }
+        }
+    }
+
+    fn token_fingerprint(token: &str) -> String {
+        Sha256::digest(token.as_bytes())[..6]
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     /// 缓存普通用户展示名，作为群内缓存缺失时的兜底。
