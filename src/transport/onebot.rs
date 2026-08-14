@@ -9,18 +9,20 @@ use crate::transport::message::{
 use crate::transport::{GroupInfo, MessageSender, QqExpression, SendOptions, SentMessage};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Redirect;
-use axum::{routing::get, Json, Router};
+use axum::{routing::get, Router};
 use chrono::Utc;
+use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use rand::Rng;
 use reqwest::header::AUTHORIZATION;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha1::Sha1;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -1422,8 +1424,8 @@ pub struct OneBotHttpServer {
     onebot_api_url: String,
     /// 群成员展示名缓存，key 使用 group_id:user_id 或 user_id。
     member_name_cache: Arc<Mutex<HashMap<String, String>>>,
-    /// 校验上报请求使用的服务端 token。
-    token: Option<String>,
+    /// 校验 OneBot HTTP 上报签名使用的服务端密钥。
+    server_token: Option<String>,
     /// 发送 OneBot HTTP 请求的客户端。
     client: Client,
     /// 调用 OneBot HTTP API 使用的对端 token。
@@ -1456,7 +1458,7 @@ impl OneBotHttpServer {
             onebot_api_url: config.server.onebot_api.clone(),
             member_name_cache: Arc::new(Mutex::new(HashMap::new())),
             client: Client::new(),
-            token: if config.server.server_token.is_empty() {
+            server_token: if config.server.server_token.is_empty() {
                 None
             } else {
                 Some(config.server.server_token.clone())
@@ -1471,98 +1473,59 @@ impl OneBotHttpServer {
         }
     }
 
-    /// 校验上报请求头里的 bearer token 是否匹配当前服务端配置。
-    fn verify_request_token(&self, headers: &HeaderMap) -> bool {
-        let Some(expected_token) = &self.token else {
+    /// 按 OneBot HTTP POST 约定校验原始请求体的 HMAC-SHA1 签名。
+    fn verify_request_signature(&self, headers: &HeaderMap, body: &[u8]) -> bool {
+        let Some(server_token) = &self.server_token else {
             return true;
         };
-        let Some(auth_value) = headers.get(AUTHORIZATION) else {
-            Self::log_request_token_failure("missing_authorization", expected_token, None, None);
+        let Some(signature) = headers
+            .get("x-signature")
+            .and_then(|value| value.to_str().ok())
+        else {
+            warn!("OneBot HTTP 上报缺少签名");
             return false;
         };
-        let Ok(auth_value) = auth_value.to_str() else {
-            Self::log_request_token_failure("invalid_header_encoding", expected_token, None, None);
+        let Some(signature) = signature.strip_prefix("sha1=") else {
+            warn!("OneBot HTTP 上报签名格式错误");
             return false;
         };
-        let mut auth_parts = auth_value.split_whitespace();
-        let Some(scheme) = auth_parts.next() else {
-            Self::log_request_token_failure("empty_authorization", expected_token, None, None);
+        let Some(signature) = Self::decode_sha1_signature(signature) else {
+            warn!("OneBot HTTP 上报签名格式错误");
             return false;
         };
-        let Some(token) = auth_parts.next() else {
-            Self::log_request_token_failure("missing_token", expected_token, Some(scheme), None);
-            return false;
-        };
-        if !scheme.eq_ignore_ascii_case("Bearer") {
-            Self::log_request_token_failure(
-                "invalid_scheme",
-                expected_token,
-                Some(scheme),
-                Some(token),
-            );
-            return false;
-        }
-        if auth_parts.next().is_some() {
-            Self::log_request_token_failure(
-                "invalid_authorization_format",
-                expected_token,
-                Some(scheme),
-                Some(token),
-            );
-            return false;
-        }
-        if token != expected_token {
-            Self::log_request_token_failure(
-                "token_mismatch",
-                expected_token,
-                Some(scheme),
-                Some(token),
-            );
+
+        let mut mac = Hmac::<Sha1>::new_from_slice(server_token.as_bytes())
+            .expect("HMAC-SHA1 接受任意长度的密钥");
+        mac.update(body);
+        if mac.verify_slice(&signature).is_err() {
+            warn!("OneBot HTTP 上报签名不匹配");
             return false;
         }
         true
     }
 
-    /// 只记录足够排查鉴权问题的信息，避免把完整密钥写入持久日志。
-    fn log_request_token_failure(
-        reason: &str,
-        expected_token: &str,
-        scheme: Option<&str>,
-        received_token: Option<&str>,
-    ) {
-        let received_masked = received_token.map(Self::mask_token);
-        let received_fingerprint = received_token.map(Self::token_fingerprint);
-        warn!(
-            reason,
-            scheme = scheme.unwrap_or("<missing>"),
-            received_token = received_masked.as_deref().unwrap_or("<missing>"),
-            received_length = received_token.map_or(-1_i64, |token| token.len() as i64),
-            received_fingerprint = received_fingerprint.as_deref().unwrap_or("<missing>"),
-            expected_token = %Self::mask_token(expected_token),
-            expected_length = expected_token.len(),
-            expected_fingerprint = %Self::token_fingerprint(expected_token),
-            "OneBot HTTP 上报鉴权失败"
-        );
-    }
-
-    fn mask_token(token: &str) -> String {
-        let characters = token.chars().collect::<Vec<_>>();
-        match characters.as_slice() {
-            [] => "<empty>".to_string(),
-            [_] => "*".to_string(),
-            [_, _] => "**".to_string(),
-            [first, middle @ .., last] => {
-                format!("{}{}{}", first, "*".repeat(middle.len()), last)
-            }
+    fn decode_sha1_signature(value: &str) -> Option<[u8; 20]> {
+        let value = value.as_bytes();
+        if value.len() != 40 {
+            return None;
         }
+
+        let mut decoded = [0_u8; 20];
+        for (index, pair) in value.chunks_exact(2).enumerate() {
+            let high = Self::decode_hex_digit(pair[0])?;
+            let low = Self::decode_hex_digit(pair[1])?;
+            decoded[index] = (high << 4) | low;
+        }
+        Some(decoded)
     }
 
-    fn token_fingerprint(token: &str) -> String {
-        Sha256::digest(token.as_bytes())[..6]
-            .iter()
-            .map(|byte| format!("{:02x}", byte))
-            .collect::<Vec<_>>()
-            .join("")
+    fn decode_hex_digit(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        }
     }
 
     /// 缓存普通用户展示名，作为群内缓存缺失时的兜底。
@@ -1873,11 +1836,18 @@ impl OneBotHttpServer {
 async fn on_event(
     State(state): State<Arc<OneBotHttpState>>,
     headers: HeaderMap,
-    Json(event): Json<OneBotEventDto>,
+    body: Bytes,
 ) -> StatusCode {
-    if !state.server.verify_request_token(&headers) {
+    if !state.server.verify_request_signature(&headers, &body) {
         return StatusCode::UNAUTHORIZED;
     }
+    let event = match serde_json::from_slice::<OneBotEventDto>(&body) {
+        Ok(event) => event,
+        Err(error) => {
+            warn!(error = %error, "OneBot HTTP 上报内容无法解析");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
     match &event {
         OneBotEventDto::Message(message) => {
             state

@@ -131,7 +131,7 @@ pub struct ServerSection {
     pub server_host: String,
     /// 本服务监听端口
     pub server_port: u16,
-    /// 本服务 访问密钥
+    /// OneBot HTTP 上报签名密钥
     pub server_token: String,
     /// OneBot 服务地址
     pub onebot_api: String,
