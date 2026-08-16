@@ -196,6 +196,16 @@ pub trait AIProvider {
         tools: &[ToolDefinition],
     ) -> Result<ToolChatResponse>;
 
+    /// 带会话标识的聊天请求。支持该参数的 Provider 可借此保持同一上游会话的缓存粘性。
+    async fn chat_completions_with_session(
+        &self,
+        messages: &[ToolChatMessage],
+        tools: &[ToolDefinition],
+        _session_id: Option<&str>,
+    ) -> Result<ToolChatResponse> {
+        self.chat_completions(messages, tools).await
+    }
+
     async fn describe_image(&self, _image_data_url: &str, _prompt: &str) -> Result<String> {
         anyhow::bail!("当前服务商不支持图片描述")
     }

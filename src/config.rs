@@ -386,6 +386,7 @@ impl AppConfig {
 pub struct PromptConfig {
     pub system_prompt: String,
     pub character_prompt: String,
+    pub reply_rules_prompt: String,
     pub instruction_prompt: String,
     pub filter_prompt: String,
     pub image_description_prompt: String,
@@ -397,10 +398,11 @@ pub struct PromptConfig {
 impl PromptConfig {
     pub fn new(prompt_dir: &Path) -> Result<Self> {
         let character_prompt = fs::read_to_string(prompt_dir.join("character.md"))?;
-        let filter_template = fs::read_to_string(prompt_dir.join("filter.md"))?;
+        let filter_template = fs::read_to_string(prompt_dir.join("internal/filter.md"))?;
         let new_config = Self {
             system_prompt: fs::read_to_string(prompt_dir.join("system.md"))?,
             character_prompt: character_prompt.clone(),
+            reply_rules_prompt: fs::read_to_string(prompt_dir.join("reply_rules.md"))?,
             instruction_prompt: fs::read_to_string(prompt_dir.join("instruction.md"))?,
             filter_prompt: filter_template.replace("{{character_prompt}}", character_prompt.trim()),
             image_description_prompt: fs::read_to_string(

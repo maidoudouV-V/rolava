@@ -43,12 +43,58 @@ impl OpenRouterProvider {
             reasoning_effort: reasoning_effort.into(),
         }
     }
+
+    async fn send_chat_completions(
+        &self,
+        messages: &[ToolChatMessage],
+        tools: &[ToolDefinition],
+        session_id: Option<&str>,
+    ) -> anyhow::Result<ToolChatResponse> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let body = build_openrouter_chat_request(
+            &self.model,
+            self.max_tokens,
+            &self.reasoning_effort,
+            messages,
+            tools,
+            session_id,
+        );
+        trace!(
+            provider = "openrouter",
+            model = %self.model,
+            request = %serde_json::to_string_pretty(&body)
+                .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
+            "AI Provider 完整请求"
+        );
+        let resp = self
+            .http_client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .header("HTTP-Referer", OPENROUTER_APP_URL)
+            .header("X-OpenRouter-Title", OPENROUTER_APP_TITLE)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_text = resp.text().await.unwrap_or_default();
+            trace!(provider = "openrouter", status = %status, response = %error_text, "AI Provider 原始错误响应");
+            return Err(anyhow!("OpenRouter API 调用失败，状态码 {}", status));
+        }
+
+        let response_text = resp.text().await?;
+        trace!(provider = "openrouter", response = %response_text, "AI Provider 原始响应");
+        parse_openrouter_chat_response(&response_text)
+    }
 }
 
 /// OpenRouter Chat Completions 请求结构
 #[derive(Serialize)]
 struct OpenRouterChatRequest<'a> {
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
     messages: Vec<OpenRouterChatMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<i32>,
@@ -221,6 +267,7 @@ fn build_openrouter_chat_request<'a>(
     reasoning_effort: &'a str,
     messages: &'a [ToolChatMessage],
     tools: &'a [ToolDefinition],
+    session_id: Option<&'a str>,
 ) -> OpenRouterChatRequest<'a> {
     let messages = messages
         .iter()
@@ -283,6 +330,7 @@ fn build_openrouter_chat_request<'a>(
 
     OpenRouterChatRequest {
         model,
+        session_id,
         messages,
         max_completion_tokens: max_tokens,
         reasoning: OpenRouterReasoning {
@@ -328,41 +376,17 @@ impl AIProvider for OpenRouterProvider {
         messages: &[ToolChatMessage],
         tools: &[ToolDefinition],
     ) -> anyhow::Result<ToolChatResponse> {
-        let url = format!("{}/chat/completions", self.base_url);
-        let body = build_openrouter_chat_request(
-            &self.model,
-            self.max_tokens,
-            &self.reasoning_effort,
-            messages,
-            tools,
-        );
-        trace!(
-            provider = "openrouter",
-            model = %self.model,
-            request = %serde_json::to_string_pretty(&body)
-                .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
-            "AI Provider 完整请求"
-        );
-        let resp = self
-            .http_client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .header("HTTP-Referer", OPENROUTER_APP_URL)
-            .header("X-OpenRouter-Title", OPENROUTER_APP_TITLE)
-            .json(&body)
-            .send()
-            .await?;
+        self.send_chat_completions(messages, tools, None).await
+    }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text = resp.text().await.unwrap_or_default();
-            trace!(provider = "openrouter", status = %status, response = %error_text, "AI Provider 原始错误响应");
-            return Err(anyhow!("OpenRouter API 调用失败，状态码 {}", status));
-        }
-
-        let response_text = resp.text().await?;
-        trace!(provider = "openrouter", response = %response_text, "AI Provider 原始响应");
-        parse_openrouter_chat_response(&response_text)
+    async fn chat_completions_with_session(
+        &self,
+        messages: &[ToolChatMessage],
+        tools: &[ToolDefinition],
+        session_id: Option<&str>,
+    ) -> anyhow::Result<ToolChatResponse> {
+        self.send_chat_completions(messages, tools, session_id)
+            .await
     }
 
     async fn describe_image(&self, image_data_url: &str, prompt: &str) -> anyhow::Result<String> {
@@ -589,9 +613,17 @@ mod tests {
         let expected_details =
             response.raw_response["choices"][0]["message"]["reasoning_details"].clone();
         let messages = vec![response.assistant_message()];
-        let request = build_openrouter_chat_request("test", Some(100), "medium", &messages, &[]);
+        let request = build_openrouter_chat_request(
+            "test",
+            Some(100),
+            "medium",
+            &messages,
+            &[],
+            Some("rolava:chat:test"),
+        );
         let request_json = serde_json::to_value(request).unwrap();
 
+        assert_eq!(request_json["session_id"], "rolava:chat:test");
         assert_eq!(
             request_json["messages"][0]["reasoning_details"],
             expected_details
@@ -613,7 +645,8 @@ mod tests {
             ]),
         }];
 
-        let request = build_openrouter_chat_request("test", Some(100), "medium", &messages, &[]);
+        let request =
+            build_openrouter_chat_request("test", Some(100), "medium", &messages, &[], None);
         let request_json = serde_json::to_value(request).unwrap();
 
         assert_eq!(request_json["messages"][0]["content"][0]["type"], "text");
@@ -632,7 +665,7 @@ mod tests {
         let messages = vec![ToolChatMessage::User {
             content: ToolChatUserContent::text("test"),
         }];
-        let request = build_openrouter_chat_request("test", None, "auto", &messages, &[]);
+        let request = build_openrouter_chat_request("test", None, "auto", &messages, &[], None);
         let request_json = serde_json::to_value(request).unwrap();
 
         assert!(request_json.get("max_completion_tokens").is_none());

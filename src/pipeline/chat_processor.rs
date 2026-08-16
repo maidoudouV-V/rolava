@@ -21,6 +21,7 @@ use crate::tools::{
 };
 use crate::transport::message::{ConversationKind, IncomingMessage, MessageTarget};
 use crate::transport::{GroupInfo, SendOptions};
+use sha2::{Digest, Sha256};
 
 use super::filter::FilteredMessage;
 
@@ -433,6 +434,7 @@ impl ChatProcessor {
         tool_definitions: &[ToolDefinition],
     ) -> anyhow::Result<ToolChatResponse> {
         let max_attempts = self.services.app_config.app.ai_request_max_attempts();
+        let session_id = self.openrouter_session_id();
         let mut last_error = None;
 
         for attempt in 1..=max_attempts {
@@ -446,7 +448,11 @@ impl ChatProcessor {
                 Self::run_ai_request_with_timeout(
                     self.services.app_config.app.ai_request_timeout_seconds,
                     "聊天模型 API 请求",
-                    chat_provider.chat_completions(messages, tool_definitions),
+                    chat_provider.chat_completions_with_session(
+                        messages,
+                        tool_definitions,
+                        Some(&session_id),
+                    ),
                 )
                 .await
             };
@@ -537,9 +543,27 @@ impl ChatProcessor {
         let unread_message_time = Self::render_unread_message_time(earliest_unread_timestamp);
         let rendered_instruction_prompt =
             self.render_instruction_prompt(unread_message_time.as_deref())?;
-        let mut context = vec![ToolChatMessage::System {
-            content: self.render_static_system_prompt(),
-        }];
+        let mut context = vec![
+            ToolChatMessage::System {
+                content: self.services.app_config.prompt_config.system_prompt.clone(),
+            },
+            ToolChatMessage::System {
+                content: self
+                    .services
+                    .app_config
+                    .prompt_config
+                    .character_prompt
+                    .clone(),
+            },
+            ToolChatMessage::System {
+                content: self
+                    .services
+                    .app_config
+                    .prompt_config
+                    .reply_rules_prompt
+                    .clone(),
+            },
+        ];
         // 原始图片只附加到配置窗口内的正文消息，更早的消息仍保留 Markdown 图片 ID。
         let vision_message_ids = Self::vision_message_ids(
             &message_ids,
@@ -849,12 +873,23 @@ impl ChatProcessor {
         }
     }
 
-    fn render_static_system_prompt(&self) -> String {
-        format!(
-            "{}\n\n{}",
-            self.services.app_config.prompt_config.system_prompt,
-            self.services.app_config.prompt_config.character_prompt,
-        )
+    /// 为同一来源、机器人与会话生成固定且不暴露原始会话 ID 的 OpenRouter 会话标识。
+    fn openrouter_session_id(&self) -> String {
+        let conversation_kind = match self.message_target.conversation.kind {
+            ConversationKind::Direct => "direct",
+            ConversationKind::Group => "group",
+        };
+        let mut hasher = Sha256::new();
+        for value in [
+            self.message_target.source.as_str(),
+            self.message_target.bot_id.as_str(),
+            conversation_kind,
+            self.message_target.conversation.id.as_str(),
+        ] {
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+        format!("rolava:chat:{:x}", hasher.finalize())
     }
 
     fn refresh_instruction_prompt(

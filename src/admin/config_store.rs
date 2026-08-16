@@ -172,6 +172,7 @@ pub struct PromptFileSummary {
 }
 
 const INTERNAL_PROMPT_FILES: &[&str] = &[
+    "filter",
     "image_description",
     "web_search_agent",
     "scheduled_task",
@@ -192,13 +193,13 @@ pub fn list_prompt_files(config: &AppConfig) -> Result<Vec<PromptFileSummary>> {
             category: "core",
         },
         PromptFileSummary {
-            id: "instruction".into(),
-            name: "instruction.md".into(),
+            id: "reply_rules".into(),
+            name: "reply_rules.md".into(),
             category: "core",
         },
         PromptFileSummary {
-            id: "filter".into(),
-            name: "filter.md".into(),
+            id: "instruction".into(),
+            name: "instruction.md".into(),
             category: "core",
         },
     ];
@@ -247,7 +248,9 @@ pub fn write_prompt(config: &AppConfig, prompt_id: &str, content: &str) -> Resul
 fn resolve_prompt_path(config: &AppConfig, prompt_id: &str) -> Result<PathBuf> {
     let root = Path::new(&config.app.prompt_dir);
     let path = match prompt_id {
-        "system" | "character" | "instruction" | "filter" => root.join(format!("{}.md", prompt_id)),
+        "system" | "character" | "reply_rules" | "instruction" => {
+            root.join(format!("{}.md", prompt_id))
+        }
         _ if prompt_id.starts_with("internal:") => {
             let name = prompt_id.trim_start_matches("internal:");
             if !INTERNAL_PROMPT_FILES.contains(&name) {
