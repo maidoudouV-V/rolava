@@ -12,6 +12,9 @@ use tracing::{debug, trace};
 
 /// 视觉识别只做图片转写，固定使用 OpenRouter 支持的最低推理强度。
 const VISION_REASONING_EFFORT: &str = "low";
+/// OpenRouter 用此 URL 归属请求到应用；必须与标题一同发送。
+const OPENROUTER_APP_URL: &str = "https://github.com/maidoudouV-V/rolava";
+const OPENROUTER_APP_TITLE: &str = "Rolava";
 
 // ========== OpenRouter 接口 ==========
 pub struct OpenRouterProvider {
@@ -344,7 +347,8 @@ impl AIProvider for OpenRouterProvider {
             .http_client
             .post(url)
             .bearer_auth(&self.api_key)
-            .header("X-OpenRouter-Title", env!("CARGO_PKG_NAME"))
+            .header("HTTP-Referer", OPENROUTER_APP_URL)
+            .header("X-OpenRouter-Title", OPENROUTER_APP_TITLE)
             .json(&body)
             .send()
             .await?;
@@ -395,7 +399,8 @@ impl AIProvider for OpenRouterProvider {
             .http_client
             .post(url)
             .bearer_auth(&self.api_key)
-            .header("X-OpenRouter-Title", env!("CARGO_PKG_NAME"))
+            .header("HTTP-Referer", OPENROUTER_APP_URL)
+            .header("X-OpenRouter-Title", OPENROUTER_APP_TITLE)
             .json(&body)
             .send()
             .await?;

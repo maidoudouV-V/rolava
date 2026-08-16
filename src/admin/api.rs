@@ -2,6 +2,7 @@ use super::config_store::{
     list_prompt_files, read_prompt, write_admin_config, write_prompt, AdminConfigUpdate,
     AdminConfigView, AdminProviderConfig,
 };
+use super::log_buffer::AdminLogBuffer;
 use crate::ai_provider::{
     google_aistudio::GoogleAIStudioProvider, openai_compatible::OpenAICompatibleProvider,
     openrouter::OpenRouterProvider, AIProvider, ToolChatMessage, ToolChatUserContent,
@@ -44,6 +45,7 @@ pub struct AdminState {
     pub scheduler: Arc<SchedulerService>,
     pub onebot: Arc<OneBotHttpServer>,
     pub runtime: Arc<RuntimeState>,
+    pub logs: Arc<AdminLogBuffer>,
     pub restart: CancellationToken,
     pub started_at: i64,
     user_memory: Arc<UserMemoryService>,
@@ -57,6 +59,7 @@ impl AdminState {
         scheduler: Arc<SchedulerService>,
         onebot: Arc<OneBotHttpServer>,
         runtime: Arc<RuntimeState>,
+        logs: Arc<AdminLogBuffer>,
         restart: CancellationToken,
     ) -> Self {
         Self {
@@ -67,6 +70,7 @@ impl AdminState {
             scheduler,
             onebot,
             runtime,
+            logs,
             restart,
             started_at: Utc::now().timestamp(),
         }
@@ -86,6 +90,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
     let api = Router::new()
         .route("/auth/verify", post(verify_auth))
         .route("/status", get(status))
+        .route("/logs", get(logs))
         .route("/config", get(get_config).put(put_config))
         .route("/test/onebot", post(test_onebot))
         .route("/test/model", post(test_model))
@@ -132,6 +137,23 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/", get(admin_index))
         .nest_service("/admin/assets", ServeDir::new("web/assets"))
         .nest("/api/admin", api)
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    after_id: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn logs(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<LogQuery>,
+) -> Json<super::log_buffer::AdminLogPage> {
+    Json(
+        state
+            .logs
+            .read_after(query.after_id, query.limit.unwrap_or(200)),
+    )
 }
 
 async fn admin_path_redirect() -> Redirect {
@@ -709,6 +731,7 @@ async fn conversation_detail(
 #[derive(Deserialize)]
 struct MessageListQuery {
     before_id: Option<i64>,
+    after_id: Option<i64>,
     limit: Option<u32>,
 }
 
@@ -718,14 +741,22 @@ async fn conversation_messages(
     Query(query): Query<MessageListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     get_conversation(&state, conversation_id)?;
+    if query.before_id.is_some() && query.after_id.is_some() {
+        return Err(ApiError::bad_request("before_id 和 after_id 不能同时使用"));
+    }
     let bot_id = state.runtime.bot_id();
     let bot_name = state.runtime.bot_name();
     let messages = state.db_manager.get_admin_conversation_messages(
         conversation_id,
         query.before_id,
+        query.after_id,
         query.limit.unwrap_or(50),
     )?;
-    let next_before_id = messages.first().map(|message| message.id);
+    let next_before_id = query
+        .after_id
+        .is_none()
+        .then(|| messages.first().map(|message| message.id))
+        .flatten();
     let items = messages
         .into_iter()
         .map(|message| {

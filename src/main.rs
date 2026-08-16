@@ -35,7 +35,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 use transport::message::IncomingMessage;
 use transport::onebot::{OneBotHttpServer, OneBotMessageSender};
 use transport::MessageSender;
@@ -138,7 +140,8 @@ async fn run_worker() -> Result<WorkerExit> {
     let app_config = Arc::new(
         AppConfig::new(config_path.to_string_lossy().as_ref()).context("配置文件读取失败")?,
     );
-    init_tracing(app_config.logging.level.as_str());
+    let admin_logs = Arc::new(admin::AdminLogBuffer::new(1000));
+    init_tracing(app_config.logging.level.as_str(), admin_logs.clone());
 
     let restart = CancellationToken::new();
     let runtime = Arc::new(RuntimeState::default());
@@ -176,6 +179,7 @@ async fn run_worker() -> Result<WorkerExit> {
         scheduler.clone(),
         qq_receive_server.clone(),
         runtime.clone(),
+        admin_logs,
         restart.clone(),
     ));
     let admin_router = admin::router(admin_state);
@@ -267,13 +271,18 @@ fn log_task_exit<T>(name: &str, result: Result<T, tokio::task::JoinError>) {
     }
 }
 
-fn init_tracing(configured_level: &str) {
+fn init_tracing(configured_level: &str, admin_logs: Arc<admin::AdminLogBuffer>) {
     let default_filter = format!("warn,rolava={}", configured_level);
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(true)
-        .compact()
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .compact()
+                .with_filter(env_filter),
+        )
+        // 管理日志保留全部应用级别，前端可独立切换详细程度。
+        .with(admin::AdminLogLayer::new(admin_logs).with_filter(EnvFilter::new("off,rolava=trace")))
         .init();
 }

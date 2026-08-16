@@ -14,7 +14,7 @@
   <div class="login-screen" id="login-screen">
     <form class="login-panel" id="login-form">
       <span class="brand-mark">R</span>
-      <div><p class="eyebrow">ROLAVA STUDIO</p><h1>连接你的机器人</h1></div>
+      <div><p class="eyebrow">ROLAVA ADMIN</p><h1>连接你的机器人</h1></div>
       <p>输入 <code>meta.toml</code> 中的管理 Token。Token 只保存在当前浏览器会话。</p>
       <label>管理 Token<input id="login-token" type="password" autocomplete="current-password" required></label>
       <p class="form-error" id="login-error" hidden></p>
@@ -29,6 +29,7 @@
         <p>工作区</p>
         <button class="nav-button active" data-page="overview"><i data-lucide="sparkles"></i>概览</button>
         <button class="nav-button" data-page="conversations"><i data-lucide="messages-square"></i>会话管理</button>
+        <button class="nav-button" data-page="logs"><i data-lucide="scroll-text"></i>运行日志</button>
         <p>机器人设置</p>
         <button class="nav-button" data-page="connection"><i data-lucide="waypoints"></i>连接配置</button>
         <button class="nav-button" data-page="models"><i data-lucide="brain-circuit"></i>模型服务</button>
@@ -79,6 +80,22 @@
               <div class="empty detail-empty"><i data-lucide="message-square-dashed"></i><strong>选择一个会话</strong><span>查看最新消息、记忆和定时任务</span></div>
             </section>
           </div>
+        </section>
+
+        <section class="page" id="page-logs">
+          <div class="page-heading"><div><p class="eyebrow">LIVE LOGS</p><h1>运行日志</h1><p>当前 Worker · 内存保留最近 1000 条</p></div></div>
+          <section class="log-console">
+            <header class="log-toolbar">
+              <div><span class="log-status live" id="log-status">等待连接</span></div>
+              <div class="log-actions">
+                <label for="log-level-filter">详细程度</label>
+                <select id="log-level-filter"><option value="INFO">标准</option><option value="DEBUG">调试</option><option value="TRACE">完整</option></select>
+                <button class="button small" id="toggle-logs"><i data-lucide="pause"></i>暂停</button>
+                <button class="icon-button" id="clear-logs" title="清空当前视图"><i data-lucide="trash-2"></i></button>
+              </div>
+            </header>
+            <div class="log-stream" id="log-stream"><div class="empty log-empty">正在读取日志</div></div>
+          </section>
         </section>
 
         <section class="page config-page" id="page-connection">

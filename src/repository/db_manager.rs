@@ -662,22 +662,38 @@ impl QQChatContextManager {
         &self,
         conversation_id: i64,
         before_id: Option<i64>,
+        after_id: Option<i64>,
         limit: u32,
     ) -> Result<Vec<ChatMessage>> {
         let connection = self.conn_pool.get()?;
-        let mut statement = connection.prepare(
-            "SELECT m.id, m.conversation_id, c.source, c.source_conversation_id, c.kind,
-                    m.source_message_id, m.sender_id, m.sender_display_name, m.sender_nickname,
-                    m.sender_role, m.content_text, m.message_type, m.content_parts_json,
-                    m.metadata_json, m.is_read, m.event_timestamp, m.created_at
-             FROM messages m
-             INNER JOIN conversations c ON c.id = m.conversation_id
-             WHERE m.conversation_id = ?1 AND (?2 IS NULL OR m.id < ?2)
-             ORDER BY m.id DESC LIMIT ?3",
-        )?;
+        let limit = limit.clamp(1, 100);
+        let select = "SELECT m.id, m.conversation_id, c.source, c.source_conversation_id, c.kind,
+                             m.source_message_id, m.sender_id, m.sender_display_name, m.sender_nickname,
+                             m.sender_role, m.content_text, m.message_type, m.content_parts_json,
+                             m.metadata_json, m.is_read, m.event_timestamp, m.created_at
+                      FROM messages m
+                      INNER JOIN conversations c ON c.id = m.conversation_id";
+
+        if let Some(after_id) = after_id {
+            // 实时增量查询必须按主键正序返回，前端才能直接追加且不会改变已有消息。
+            let mut statement = connection.prepare(&format!(
+                "{select} WHERE m.conversation_id = ?1 AND m.id > ?2 ORDER BY m.id ASC LIMIT ?3"
+            ))?;
+            return Ok(statement
+                .query_map(
+                    params![conversation_id, after_id, limit],
+                    ChatMessage::from_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+
+        let mut statement = connection.prepare(&format!(
+            "{select} WHERE m.conversation_id = ?1 AND (?2 IS NULL OR m.id < ?2) \
+             ORDER BY m.id DESC LIMIT ?3"
+        ))?;
         let mut messages = statement
             .query_map(
-                params![conversation_id, before_id, limit.clamp(1, 100)],
+                params![conversation_id, before_id, limit],
                 ChatMessage::from_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;

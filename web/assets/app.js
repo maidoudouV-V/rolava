@@ -1,11 +1,12 @@
 import { api } from "./api.js";
 import { ConfigController } from "./config.js";
 import { ConversationsController } from "./conversations.js";
+import { LogsController } from "./logs.js";
 import { PromptController } from "./prompts.js";
 import { escapeHtml, formatTime, initial, refreshIcons, toast } from "./ui.js";
 
 const pageNames = {
-  overview: "概览", conversations: "会话管理", connection: "连接配置",
+  overview: "概览", conversations: "会话管理", logs: "运行日志", connection: "连接配置",
   models: "模型服务", behavior: "消息行为", prompts: "角色与提示词", access: "权限与工具",
 };
 const configPages = new Set(["connection", "models", "behavior", "access"]);
@@ -35,6 +36,7 @@ const companionMessages = [
 ];
 
 const conversations = new ConversationsController();
+new LogsController();
 const config = new ConfigController({ onRestart: restart, onDirty: markDirty });
 const prompts = new PromptController({ onRestart: restart });
 

@@ -7,6 +7,7 @@ export class ConversationsController {
     this.cursor = null;
     this.items = [];
     this.selectedId = null;
+    this.pollingMessages = false;
     document.getElementById("conversation-filters").addEventListener("click", event => {
       const button = event.target.closest("[data-kind]");
       if (!button || button.classList.contains("active")) return;
@@ -18,6 +19,7 @@ export class ConversationsController {
       if (row) this.select(Number(row.dataset.conversationId));
     });
     document.getElementById("load-conversations").addEventListener("click", () => this.load(false));
+    this.messagePollTimer = window.setInterval(() => this.pollMessages(), 1500);
   }
 
   async load(reset = true) {
@@ -57,6 +59,7 @@ export class ConversationsController {
         api.get(`/conversations/${id}/character-memories`),
         api.get(`/conversations/${id}/scheduled-tasks`),
       ]);
+      if (this.selectedId !== id) return;
       this.detailData = { conversation, messages, users, characters, tasks };
       this.renderDetail();
     } catch (error) { detail.innerHTML = `<div class="empty detail-empty"><strong>会话读取失败</strong><span>${escapeHtml(error.message)}</span></div>`; }
@@ -85,7 +88,53 @@ export class ConversationsController {
   messagesHtml() {
     const items = this.detailData.messages.items;
     if (!items.length) return '<div class="empty">暂无聊天记录</div>';
-    return `<div class="chat-list">${items.map(message => `<article class="chat-message ${message.is_bot ? "bot" : ""}"><span class="avatar">${escapeHtml(initial(message.sender_name))}</span><div class="chat-copy"><div class="chat-author">${escapeHtml(message.sender_name)} · ${formatTime(message.timestamp, true)}</div><div class="chat-bubble">${escapeHtml(message.content || "[非文本消息]")}</div></div></article>`).join("")}</div>`;
+    return `<div class="chat-list">${items.map(message => this.messageHtml(message)).join("")}</div>`;
+  }
+
+  messageHtml(message) {
+    return `<article class="chat-message ${message.is_bot ? "bot" : ""}" data-message-id="${message.id}"><span class="avatar">${escapeHtml(initial(message.sender_name))}</span><div class="chat-copy"><div class="chat-author">${escapeHtml(message.sender_name)} · ${formatTime(message.timestamp, true)}</div><div class="chat-bubble">${escapeHtml(message.content || "[非文本消息]")}</div></div></article>`;
+  }
+
+  async pollMessages() {
+    const id = this.selectedId;
+    const messages = this.detailData?.messages?.items;
+    const messagesTabActive = document.querySelector('#conversation-detail [data-tab="messages"]')?.classList.contains("active");
+    if (!api.token || document.hidden || !id || !messages || this.pollingMessages || !document.getElementById("page-conversations").classList.contains("active") || !messagesTabActive) return;
+
+    this.pollingMessages = true;
+    try {
+      const lastId = messages.length ? messages[messages.length - 1].id : 0;
+      const response = await api.get(`/conversations/${id}/messages?after_id=${lastId}&limit=100`);
+      if (this.selectedId !== id || !response.items.length) return;
+
+      const panel = document.querySelector('#conversation-detail [data-panel="messages"]');
+      const body = document.querySelector("#conversation-detail .detail-body");
+      const shouldFollow = body && body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+      this.detailData.messages.items.push(...response.items);
+
+      let list = panel?.querySelector(".chat-list");
+      if (!list && panel) {
+        panel.innerHTML = '<div class="chat-list"></div>';
+        list = panel.firstElementChild;
+      }
+      if (list) list.insertAdjacentHTML("beforeend", response.items.map(message => this.messageHtml(message)).join(""));
+      if (shouldFollow && body) body.scrollTop = body.scrollHeight;
+      this.updateSelectedConversation(response.items[response.items.length - 1]);
+    } catch (_) {
+      // 短暂网络错误交给下一轮轮询恢复，鉴权失效仍由统一 API 客户端处理。
+    } finally {
+      this.pollingMessages = false;
+    }
+  }
+
+  updateSelectedConversation(message) {
+    const item = this.items.find(conversation => conversation.id === this.selectedId);
+    if (!item) return;
+    item.latest_sender_name = message.sender_name;
+    item.latest_content = message.content;
+    item.latest_message_at = message.timestamp;
+    this.items = [item, ...this.items.filter(conversation => conversation !== item)];
+    this.renderList();
   }
 
   userMemoriesHtml() {
