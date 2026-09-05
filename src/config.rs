@@ -1,6 +1,6 @@
 use crate::ai_provider::{
     google_aistudio::GoogleAIStudioProvider, openai_compatible::OpenAICompatibleProvider,
-    openrouter::OpenRouterProvider, AIProvider,
+    openai_responses::OpenAIResponsesProvider, openrouter::OpenRouterProvider, AIProvider,
 };
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 const DEFAULT_AI_REQUEST_RETRY_COUNT: u32 = 1;
 const DEFAULT_AI_REQUEST_TIMEOUT_SECONDS: u64 = 0;
 const DEFAULT_VISION_IMAGE_MESSAGE_WINDOW: usize = 10;
+const DEFAULT_STARTUP_HISTORY_FETCH_COUNT: u32 = 99;
 
 #[derive(Deserialize, Debug)]
 struct TomlConfig {
@@ -73,6 +74,9 @@ pub struct AppSection {
     pub prompt_dir: String,
     /// 发送给模型的最大历史消息数。
     pub max_history_messages: u32,
+    /// 程序启动时为每个群回填的最近历史消息数；0 表示关闭回填。
+    #[serde(default = "default_startup_history_fetch_count")]
+    pub startup_history_fetch_count: u32,
     /// 主模型请求中允许附带原始图片的最近正文消息数；0 表示不附带原图。
     #[serde(default = "default_vision_image_message_window")]
     pub vision_image_message_window: usize,
@@ -125,6 +129,10 @@ fn default_vision_image_message_window() -> usize {
     DEFAULT_VISION_IMAGE_MESSAGE_WINDOW
 }
 
+fn default_startup_history_fetch_count() -> u32 {
+    DEFAULT_STARTUP_HISTORY_FETCH_COUNT
+}
+
 #[derive(Deserialize, Debug)]
 pub struct ServerSection {
     /// 本服务监听地址
@@ -143,7 +151,7 @@ pub struct ServerSection {
 pub struct ProviderConfig {
     /// 服务商名称，用作唯一标识
     pub name: String,
-    /// 服务商类型，如 openai_compatible、google_aistudio 或 openrouter
+    /// 服务商类型，如 openai_compatible、openai_responses、google_aistudio 或 openrouter
     pub r#type: String,
     /// 服务商访问密钥
     pub key: String,
@@ -237,6 +245,10 @@ impl AppConfig {
             admin,
         } = toml::from_str(&toml_str)?;
 
+        if app.startup_history_fetch_count > 999 {
+            anyhow::bail!("每群启动历史消息数不能超过 999");
+        }
+
         let enabled_tools = app
             .enabled_actions
             .iter()
@@ -288,6 +300,13 @@ impl AppConfig {
                     })?;
             let model: Box<dyn AIProvider + Send + Sync> = match provider_config.r#type.as_str() {
                 "openai_compatible" => Box::new(OpenAICompatibleProvider::new(
+                    provider_config.key.clone(),
+                    provider_config.base_url.clone(),
+                    model_config.model.clone(),
+                    model_config.max_tokens,
+                    model_config.reasoning_effort.clone(),
+                )),
+                "openai_responses" => Box::new(OpenAIResponsesProvider::new(
                     provider_config.key.clone(),
                     provider_config.base_url.clone(),
                     model_config.model.clone(),
@@ -394,6 +413,7 @@ pub struct PromptConfig {
     pub scheduled_task_prompt: String,
     pub scheduled_task_recovery_prompt: String,
     pub wait_for_reply_timeout_prompt: String,
+    pub chat_history_summary_prompt: String,
 }
 impl PromptConfig {
     pub fn new(prompt_dir: &Path) -> Result<Self> {
@@ -419,6 +439,9 @@ impl PromptConfig {
             )?,
             wait_for_reply_timeout_prompt: fs::read_to_string(
                 prompt_dir.join("internal/wait_for_reply_timeout.md"),
+            )?,
+            chat_history_summary_prompt: fs::read_to_string(
+                prompt_dir.join("internal/chat_history_summary.md"),
             )?,
         };
         Ok(new_config)

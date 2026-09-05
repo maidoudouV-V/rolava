@@ -113,7 +113,7 @@
 
         <section class="page config-page" id="page-behavior">
           <div class="page-heading"><div><p class="eyebrow">BEHAVIOR</p><h1>消息行为</h1><p>控制进入主模型的条件、上下文范围和回复节奏。</p></div></div>
-          <section class="section-block"><div class="section-header"><div><h2>上下文与请求</h2></div></div><div class="form-grid three"><label>最大历史消息数<input id="max-history" type="number" min="1"></label><label>图片保留轮次<input id="image-window" type="number" min="0"></label><label>失败重试次数<input id="retry-count" type="number" min="0"></label><label>请求超时（秒）<input id="request-timeout" type="number" min="0"></label><label>随机回复延时上限（秒）<input id="reply-delay" type="number" min="0" step="0.1"></label></div></section>
+          <section class="section-block"><div class="section-header"><div><h2>上下文与请求</h2></div></div><div class="form-grid three"><label>最大历史消息数<input id="max-history" type="number" min="1"></label><label>启动时历史读取数（每群，0 关闭）<input id="startup-history-fetch-count" type="number" min="0" max="999"></label><label>图片保留轮次<input id="image-window" type="number" min="0"></label><label>失败重试次数<input id="retry-count" type="number" min="0"></label><label>请求超时（秒）<input id="request-timeout" type="number" min="0"></label><label>随机回复延时上限（秒）<input id="reply-delay" type="number" min="0" step="0.1"></label></div></section>
           <aside class="info-strip"><i data-lucide="split"></i><div><strong>回复固定按换行分段发送</strong><p>第二段起会叠加模拟打字时间，单段总延时不会超过 6 秒。</p></div></aside>
         </section>
 

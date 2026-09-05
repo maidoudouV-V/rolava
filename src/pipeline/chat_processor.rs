@@ -9,12 +9,14 @@ use tokio::sync::OnceCell;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
+use crate::chat_history::render_history_message_line;
 use crate::conversation_context::{ActiveToolHistory, RuntimeContextState, ToolRoundHistory};
 use crate::conversation_control::ConversationControl;
 use crate::conversation_trigger::{ConversationTrigger, ConversationTriggerSender};
+use crate::history_compression::{render_summary_date_heading, summary_date_for_timestamp};
 use crate::memory::{CharacterMemorySession, UserMemorySession};
 use crate::message_enricher::MessageEnricher;
-use crate::repository::db_manager::ChatMessage;
+use crate::repository::db_manager::{ChatMessage, ConversationDailySummary};
 use crate::tools::{
     ConversationEffect, ConversationToolContext, ToolContext, ToolDefinition, ToolRegistry,
     ToolResult, ToolServices,
@@ -519,6 +521,22 @@ impl ChatProcessor {
             &self.message_target.conversation.id,
             self.services.app_config.app.max_history_messages,
         )?;
+        let daily_summaries = match history_window.messages.first() {
+            Some(oldest_message) => {
+                let through_date = summary_date_for_timestamp(oldest_message.event_timestamp)?;
+                // 只注入最近 30 天的摘要，空缺日期不使用更早摘要补齐。
+                let from_date =
+                    summary_date_for_timestamp((Local::now() - chrono::Days::new(30)).timestamp())?;
+                self.services
+                    .db_manager
+                    .get_conversation_daily_summaries_between(
+                        oldest_message.conversation_id,
+                        &from_date,
+                        &through_date,
+                    )?
+            }
+            None => Vec::new(),
+        };
         let message_ids = history_window
             .messages
             .iter()
@@ -572,9 +590,7 @@ impl ChatProcessor {
         );
 
         let mut unread_message_ids = Vec::new();
-        context.push(ToolChatMessage::User {
-            content: ToolChatUserContent::text("# 聊天记录\n"),
-        });
+        Self::append_history_sections(&mut context, &daily_summaries)?;
 
         let mut last_rendered_date: Option<String> = None;
         let history_block_size = history_window.history_block_size;
@@ -674,7 +690,7 @@ impl ChatProcessor {
         let dt_utc = DateTime::<Utc>::from_timestamp(db_msg.event_timestamp, 0).unwrap();
         let dt_local: DateTime<Local> = DateTime::<Local>::from(dt_utc);
         let date_line = dt_local.format("%Y-%m-%d").to_string();
-        let message_line = Self::history_message_line(db_msg, &dt_local);
+        let message_line = render_history_message_line(db_msg, &dt_local);
         let should_render_date = last_rendered_date.as_deref() != Some(date_line.as_str());
 
         if let Some(ToolChatMessage::User { content }) = context.last_mut() {
@@ -729,6 +745,30 @@ impl ChatProcessor {
             reasoning: None,
             tool_calls: Vec::new(),
         });
+    }
+
+    /// 标题和全部摘要合并为一个消息块，原始消息使用固定窗口标题。
+    fn append_history_sections(
+        context: &mut Vec<ToolChatMessage>,
+        summaries: &[ConversationDailySummary],
+    ) -> anyhow::Result<()> {
+        let mut history = String::from("# 聊天记录\n");
+        if !summaries.is_empty() {
+            history.push_str("\n已压缩的历史消息：");
+            for summary in summaries {
+                let heading = render_summary_date_heading(&summary.summary_date)?;
+                history.push_str(&format!("\n\n{}\n{}", heading, summary.summary_text));
+            }
+            context.push(ToolChatMessage::User {
+                content: ToolChatUserContent::text(history),
+            });
+            history = String::new();
+        }
+        history.push_str("\n当前聊天窗口消息：");
+        context.push(ToolChatMessage::User {
+            content: ToolChatUserContent::text(history),
+        });
+        Ok(())
     }
 
     /// 从消息富文本片段读取图片，并生成本轮请求使用的临时 data URL。
@@ -912,7 +952,7 @@ impl ChatProcessor {
         let timestamp = earliest_unread_timestamp?;
         let dt_utc = DateTime::<Utc>::from_timestamp(timestamp, 0)?;
         let dt_local: DateTime<Local> = DateTime::<Local>::from(dt_utc);
-        Some(dt_local.format("%Y-%m-%d %H:%M").to_string())
+        Some(dt_local.format("%Y-%m-%d %H:%M:%S").to_string())
     }
 
     /// 没有可用值时移除占位符所在行，避免向模型发送不完整的动态状态。
@@ -928,17 +968,5 @@ impl ChatProcessor {
                 .filter(|line| !line.contains(placeholder))
                 .collect(),
         }
-    }
-
-    /// 将数据库消息格式化为提示词里的聊天记录行。
-    fn history_message_line(db_msg: &ChatMessage, dt_local: &DateTime<Local>) -> String {
-        let time_text = dt_local.format("%H:%M").to_string();
-        let sender_name = db_msg
-            .sender_nickname
-            .clone()
-            .unwrap_or(db_msg.sender_display_name.clone());
-        let content = db_msg.content_text.clone().unwrap_or_default();
-
-        format!("{}（{}）:{}", sender_name, time_text, content)
     }
 }

@@ -18,6 +18,7 @@ pub struct StoredMessage {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResetConversationResult {
     pub deleted_messages: usize,
+    pub deleted_daily_summaries: usize,
 }
 
 /// 主模型本轮使用的数据库消息窗口及其统一分块容量。
@@ -25,6 +26,34 @@ pub struct ResetConversationResult {
 pub struct ConversationHistoryWindow {
     pub messages: Vec<ChatMessage>,
     pub history_block_size: usize,
+}
+
+/// 一个存在聊天记录但尚未生成摘要的会话统计日。
+#[derive(Debug, Clone)]
+pub struct PendingDailySummary {
+    pub conversation_id: i64,
+    pub source: String,
+    pub source_conversation_id: String,
+    pub summary_date: String,
+}
+
+/// 已经生成并可加入主模型上下文的每日摘要。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationDailySummary {
+    pub summary_date: String,
+    pub summary_text: String,
+}
+
+/// 一条待写入的每日聊天摘要。
+pub struct NewConversationDailySummary<'a> {
+    pub conversation_id: i64,
+    pub summary_date: &'a str,
+    pub period_start: i64,
+    pub period_end: i64,
+    pub summary_text: &'a str,
+    pub source_message_count: i64,
+    pub source_first_message_id: i64,
+    pub source_last_message_id: i64,
 }
 
 /// 一条会话目录记录。
@@ -284,6 +313,34 @@ impl QQChatContextManager {
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_conversation_source_message
             ON messages (conversation_id, source_message_id);
+
+            CREATE TABLE IF NOT EXISTS conversation_daily_summaries (
+                -- 每日摘要的数据库主键。
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- 摘要所属会话，不同群聊和私聊完全隔离。
+                conversation_id         INTEGER NOT NULL,
+                -- 以本地时间凌晨 03:00 为起点的统计日期，格式 YYYY-MM-DD。
+                summary_date            TEXT    NOT NULL,
+                -- 统计窗口起点的 Unix 时间戳，包含该时刻。
+                period_start            INTEGER NOT NULL,
+                -- 统计窗口终点的 Unix 时间戳，不包含该时刻。
+                period_end              INTEGER NOT NULL,
+                -- 主模型生成的当日聊天摘要正文。
+                summary_text            TEXT    NOT NULL,
+                -- 生成摘要时使用的源消息数量，仅用于查看生成依据。
+                source_message_count    INTEGER NOT NULL,
+                -- 按事件时间排序后，生成摘要时第一条源消息的数据库 ID。
+                source_first_message_id INTEGER NOT NULL,
+                -- 按事件时间排序后，生成摘要时最后一条源消息的数据库 ID。
+                source_last_message_id  INTEGER NOT NULL,
+                -- 摘要成功写入数据库的 Unix 时间戳。
+                created_at              INTEGER NOT NULL,
+                UNIQUE(conversation_id, summary_date),
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_daily_summaries_conversation_date
+            ON conversation_daily_summaries (conversation_id, summary_date ASC);
 
             CREATE TABLE IF NOT EXISTS scheduled_tasks (
                 -- 稳定任务 ID；修改时间或内容时保持不变。
@@ -757,13 +814,20 @@ impl QQChatContextManager {
             "DELETE FROM messages WHERE conversation_id = ?1",
             params![conversation_id],
         )?;
+        let deleted_daily_summaries = tx.execute(
+            "DELETE FROM conversation_daily_summaries WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
         tx.execute(
             "UPDATE conversations SET last_message_at = created_at WHERE id = ?1",
             params![conversation_id],
         )?;
         tx.commit()?;
 
-        Ok(ResetConversationResult { deleted_messages })
+        Ok(ResetConversationResult {
+            deleted_messages,
+            deleted_daily_summaries,
+        })
     }
 
     /// 获取指定来源会话的聊天记录；按入库顺序分块滚动，平台时间只用于内容展示。
@@ -924,6 +988,157 @@ impl QQChatContextManager {
         let mut messages = messages_iter.collect::<rusqlite::Result<Vec<_>>>()?;
         messages.reverse();
         Ok(messages)
+    }
+
+    /// 查找已经结束且存在消息、但尚未生成摘要的会话统计日。
+    pub fn get_pending_daily_summaries(
+        &self,
+        closed_before_timestamp: i64,
+    ) -> Result<Vec<PendingDailySummary>> {
+        let connection = self.conn_pool.get()?;
+        let mut statement = connection.prepare(
+            "
+            WITH daily_messages AS (
+                SELECT
+                    conversation_id,
+                    date(event_timestamp, 'unixepoch', 'localtime', '-3 hours') AS summary_date
+                FROM messages
+                WHERE event_timestamp < ?1
+                GROUP BY conversation_id, summary_date
+            )
+            SELECT
+                d.conversation_id,
+                c.source,
+                c.source_conversation_id,
+                d.summary_date
+            FROM daily_messages d
+            INNER JOIN conversations c ON c.id = d.conversation_id
+            LEFT JOIN conversation_daily_summaries s
+                ON s.conversation_id = d.conversation_id
+                AND s.summary_date = d.summary_date
+            WHERE s.id IS NULL
+            ORDER BY d.summary_date ASC, d.conversation_id ASC
+            ",
+        )?;
+        let summaries = statement
+            .query_map(params![closed_before_timestamp], |row| {
+                Ok(PendingDailySummary {
+                    conversation_id: row.get(0)?,
+                    source: row.get(1)?,
+                    source_conversation_id: row.get(2)?,
+                    summary_date: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(summaries)
+    }
+
+    /// 读取一个会话统计日的全部消息，并按平台时间和数据库 ID 排序。
+    pub fn get_daily_summary_source_messages(
+        &self,
+        conversation_id: i64,
+        summary_date: &str,
+    ) -> Result<Vec<ChatMessage>> {
+        let connection = self.conn_pool.get()?;
+        let mut statement = connection.prepare(
+            "
+            SELECT
+                m.id,
+                m.conversation_id,
+                c.source,
+                c.source_conversation_id,
+                c.kind,
+                m.source_message_id,
+                m.sender_id,
+                m.sender_display_name,
+                m.sender_nickname,
+                m.sender_role,
+                m.content_text,
+                m.message_type,
+                m.content_parts_json,
+                m.metadata_json,
+                m.is_read,
+                m.event_timestamp,
+                m.created_at
+            FROM messages m
+            INNER JOIN conversations c ON c.id = m.conversation_id
+            WHERE m.conversation_id = ?1
+              AND date(m.event_timestamp, 'unixepoch', 'localtime', '-3 hours') = ?2
+            ORDER BY m.event_timestamp ASC, m.id ASC
+            ",
+        )?;
+        let messages = statement
+            .query_map(
+                params![conversation_id, summary_date],
+                ChatMessage::from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(messages)
+    }
+
+    /// 幂等写入每日摘要；已有同会话同日期记录时保持原内容不变。
+    pub fn insert_conversation_daily_summary(
+        &self,
+        summary: &NewConversationDailySummary<'_>,
+    ) -> Result<bool> {
+        let connection = self.conn_pool.get()?;
+        let inserted = connection.execute(
+            "
+            INSERT OR IGNORE INTO conversation_daily_summaries (
+                conversation_id,
+                summary_date,
+                period_start,
+                period_end,
+                summary_text,
+                source_message_count,
+                source_first_message_id,
+                source_last_message_id,
+                created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ",
+            params![
+                summary.conversation_id,
+                summary.summary_date,
+                summary.period_start,
+                summary.period_end,
+                summary.summary_text,
+                summary.source_message_count,
+                summary.source_first_message_id,
+                summary.source_last_message_id,
+                Utc::now().timestamp(),
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// 按包含两端的统计日期范围读取摘要，旧摘要仍保留在数据库中。
+    pub fn get_conversation_daily_summaries_between(
+        &self,
+        conversation_id: i64,
+        from_summary_date: &str,
+        through_summary_date: &str,
+    ) -> Result<Vec<ConversationDailySummary>> {
+        let connection = self.conn_pool.get()?;
+        let mut statement = connection.prepare(
+            "
+            SELECT summary_date, summary_text
+            FROM conversation_daily_summaries
+            WHERE conversation_id = ?1 AND summary_date BETWEEN ?2 AND ?3
+            ORDER BY summary_date ASC, id ASC
+            ",
+        )?;
+        let summaries = statement
+            .query_map(
+                params![conversation_id, from_summary_date, through_summary_date],
+                |row| {
+                    Ok(ConversationDailySummary {
+                        summary_date: row.get(0)?,
+                        summary_text: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(summaries)
     }
 
     /// 按平台消息 ID 查询同一会话内的原消息，用于还原回复引用。
@@ -1673,7 +1888,11 @@ impl QQChatContextManager {
 mod tests {
     use std::fs;
 
-    use super::{NewChatMessage, NewReceivedImage, QQChatContextManager};
+    use chrono::{Local, TimeZone};
+
+    use super::{
+        NewChatMessage, NewConversationDailySummary, NewReceivedImage, QQChatContextManager,
+    };
     use rand::Rng;
 
     // 验证历史窗口按返回的分块大小滚动。
@@ -1796,6 +2015,22 @@ mod tests {
         manager
             .write_message_internal(&test_message("message-1", "需要删除", 1))
             .unwrap();
+        let conversation_id = manager
+            .get_conversation_history("test", "conversation", 10)
+            .unwrap()[0]
+            .conversation_id;
+        manager
+            .insert_conversation_daily_summary(&NewConversationDailySummary {
+                conversation_id,
+                summary_date: "1970-01-01",
+                period_start: 0,
+                period_end: 86_400,
+                summary_text: "需要删除的摘要",
+                source_message_count: 1,
+                source_first_message_id: 1,
+                source_last_message_id: 1,
+            })
+            .unwrap();
         manager
             .insert_scheduled_task(
                 "task_ResetKeep",
@@ -1817,6 +2052,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.deleted_messages, 1);
+        assert_eq!(result.deleted_daily_summaries, 1);
         assert!(manager
             .get_conversation_history("test", "conversation", 10)
             .unwrap()
@@ -1832,6 +2068,160 @@ mod tests {
             .get_scheduled_task("test", "conversation", "task_ResetKeep")
             .unwrap()
             .is_some());
+
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
+    // 摘要一旦存在，即使后来补入同一统计日的消息也不会重新进入候选列表。
+    #[test]
+    fn existing_daily_summary_skips_late_messages() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        let first_time = Local
+            .with_ymd_and_hms(2026, 8, 10, 4, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let cutoff = Local
+            .with_ymd_and_hms(2026, 8, 11, 3, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        manager
+            .write_message_internal(&test_message("message-1", "第一条", first_time))
+            .unwrap();
+
+        let pending = manager.get_pending_daily_summaries(cutoff).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].summary_date, "2026-08-10");
+        manager
+            .insert_conversation_daily_summary(&NewConversationDailySummary {
+                conversation_id: pending[0].conversation_id,
+                summary_date: &pending[0].summary_date,
+                period_start: first_time - 3_600,
+                period_end: cutoff,
+                summary_text: "已有摘要",
+                source_message_count: 1,
+                source_first_message_id: 1,
+                source_last_message_id: 1,
+            })
+            .unwrap();
+        manager
+            .write_message_internal(&test_message("message-2", "迟到消息", first_time + 60))
+            .unwrap();
+
+        assert!(manager
+            .get_pending_daily_summaries(cutoff)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            manager
+                .get_conversation_daily_summaries_between(
+                    pending[0].conversation_id,
+                    "2026-07-12",
+                    "2026-08-10",
+                )
+                .unwrap(),
+            vec![super::ConversationDailySummary {
+                summary_date: "2026-08-10".to_string(),
+                summary_text: "已有摘要".to_string(),
+            }]
+        );
+
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
+    // 实际查询验证日期窗口、会话隔离和缺日不回补；范围外的摘要仍保留。
+    #[test]
+    fn daily_summary_window_filters_dates_without_deleting_history() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        for conversation in ["conversation", "other"] {
+            let mut message = test_message("message-1", "正文", 1);
+            message.source_conversation_id = conversation.to_string();
+            manager.write_message_internal(&message).unwrap();
+            let conversation_id = manager
+                .get_conversation_history("test", conversation, 1)
+                .unwrap()[0]
+                .conversation_id;
+            for date in ["2026-08-30", "2026-07-31", "2026-08-31", "2026-08-01"] {
+                manager
+                    .insert_conversation_daily_summary(&NewConversationDailySummary {
+                        conversation_id,
+                        summary_date: date,
+                        period_start: 0,
+                        period_end: 86_400,
+                        summary_text: conversation,
+                        source_message_count: 1,
+                        source_first_message_id: 1,
+                        source_last_message_id: 1,
+                    })
+                    .unwrap();
+            }
+        }
+        let conversation_id = manager
+            .get_conversation_history("test", "conversation", 1)
+            .unwrap()[0]
+            .conversation_id;
+        let summaries = manager
+            .get_conversation_daily_summaries_between(conversation_id, "2026-08-01", "2026-08-30")
+            .unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|s| s.summary_date.as_str())
+                .collect::<Vec<_>>(),
+            ["2026-08-01", "2026-08-30"]
+        );
+        assert!(summaries.iter().all(|s| s.summary_text == "conversation"));
+        assert_eq!(
+            manager
+                .get_conversation_daily_summaries_between(
+                    conversation_id,
+                    "2026-07-31",
+                    "2026-08-31",
+                )
+                .unwrap()
+                .len(),
+            4
+        );
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
+    // 数据库按本地时间凌晨 03:00 切分统计日，边界前后必须落入不同日期。
+    #[test]
+    fn pending_daily_summaries_split_at_three_am() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        let before_boundary = Local
+            .with_ymd_and_hms(2026, 8, 10, 2, 59, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let at_boundary = Local
+            .with_ymd_and_hms(2026, 8, 10, 3, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let cutoff = Local
+            .with_ymd_and_hms(2026, 8, 11, 3, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        manager
+            .write_message_internal(&test_message("message-1", "边界前", before_boundary))
+            .unwrap();
+        manager
+            .write_message_internal(&test_message("message-2", "边界时", at_boundary))
+            .unwrap();
+
+        let pending = manager.get_pending_daily_summaries(cutoff).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].summary_date, "2026-08-09");
+        assert_eq!(pending[1].summary_date, "2026-08-10");
 
         drop(manager);
         fs::remove_file(path).unwrap();

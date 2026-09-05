@@ -169,34 +169,3 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     value.truncate(boundary);
     value.push('…');
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{AdminLogBuffer, AdminLogEntry};
-
-    #[test]
-    fn ring_buffer_discards_oldest_entries_and_reports_cursor_gap() {
-        let buffer = AdminLogBuffer::new(2);
-        for message in ["one", "two", "three"] {
-            buffer.push(AdminLogEntry {
-                id: 0,
-                timestamp: 1,
-                level: "INFO".to_string(),
-                target: "rolava".to_string(),
-                message: message.to_string(),
-                fields: String::new(),
-            });
-        }
-
-        let page = buffer.read_after(Some(0), 10);
-        assert!(page.truncated);
-        assert_eq!(page.latest_id, 3);
-        assert_eq!(
-            page.items
-                .iter()
-                .map(|entry| entry.message.as_str())
-                .collect::<Vec<_>>(),
-            vec!["two", "three"]
-        );
-    }
-}

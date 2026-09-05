@@ -1,10 +1,12 @@
 mod admin;
 mod ai_provider;
+mod chat_history;
 mod commands;
 mod config;
 mod conversation_context;
 pub mod conversation_control;
 pub mod conversation_trigger;
+mod history_compression;
 mod memory;
 mod message_enricher;
 mod message_ingestion;
@@ -19,6 +21,7 @@ mod transport;
 
 use crate::admin::AdminState;
 use crate::config::AppConfig;
+use crate::history_compression::HistoryCompressionService;
 use crate::message_ingestion::MessageIngestionService;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -148,6 +151,10 @@ async fn run_worker() -> Result<WorkerExit> {
     let (platform_tx, platform_rx) = mpsc::channel::<IncomingMessage>(MESSAGE_CHANNEL_CAPACITY);
     let (internal_trigger_tx, internal_trigger_rx) = mpsc::unbounded_channel();
     let db_manager = Arc::new(QQChatContextManager::new("test_chat.db")?);
+    let history_compression = Arc::new(HistoryCompressionService::new(
+        app_config.clone(),
+        db_manager.clone(),
+    ));
     let message_ingestion = Arc::new(MessageIngestionService::new(
         app_config.clone(),
         db_manager.clone(),
@@ -233,6 +240,7 @@ async fn run_worker() -> Result<WorkerExit> {
     let mut dispatcher_task = tokio::spawn(async move { conversation_dispatcher.run().await });
     let mut scheduler_task = tokio::spawn(scheduler.run());
     let mut cleanup_task = tokio::spawn(resource_cleanup.run());
+    let mut history_compression_task = tokio::spawn(history_compression.run());
     info!(admin_url = "/admin", "服务启动完成");
 
     let outcome = tokio::select! {
@@ -253,6 +261,10 @@ async fn run_worker() -> Result<WorkerExit> {
             log_task_exit("资源清理服务", result);
             WorkerExit::Stop
         }
+        result = &mut history_compression_task => {
+            log_task_exit("聊天记录压缩服务", result);
+            WorkerExit::Stop
+        }
     };
 
     restart.cancel();
@@ -261,6 +273,7 @@ async fn run_worker() -> Result<WorkerExit> {
     dispatcher_task.abort();
     scheduler_task.abort();
     cleanup_task.abort();
+    history_compression_task.abort();
     Ok(outcome)
 }
 

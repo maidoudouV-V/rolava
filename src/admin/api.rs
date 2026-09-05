@@ -5,7 +5,8 @@ use super::config_store::{
 use super::log_buffer::AdminLogBuffer;
 use crate::ai_provider::{
     google_aistudio::GoogleAIStudioProvider, openai_compatible::OpenAICompatibleProvider,
-    openrouter::OpenRouterProvider, AIProvider, ToolChatMessage, ToolChatUserContent,
+    openai_responses::OpenAIResponsesProvider, openrouter::OpenRouterProvider, AIProvider,
+    ToolChatMessage, ToolChatUserContent,
 };
 use crate::config::{AppConfig, ModelConfig};
 use crate::memory::{
@@ -330,6 +331,13 @@ async fn test_model(
             request.model.max_tokens,
             request.model.reasoning_effort,
         )),
+        "openai_responses" => Box::new(OpenAIResponsesProvider::new(
+            key,
+            request.provider.base_url,
+            request.model.model,
+            request.model.max_tokens,
+            request.model.reasoning_effort,
+        )),
         "openrouter" => Box::new(OpenRouterProvider::new(
             key,
             request.provider.base_url,
@@ -380,7 +388,7 @@ async fn provider_models(
 ) -> Result<Json<Value>, ApiError> {
     let key = resolve_provider_key(&state, &request.provider);
     let items = match request.provider.r#type.as_str() {
-        "openai_compatible" | "openrouter" => {
+        "openai_compatible" | "openai_responses" | "openrouter" => {
             fetch_openai_style_models(&request.provider, &key).await?
         }
         "google_aistudio" => fetch_google_models(&request.provider, &key).await?,

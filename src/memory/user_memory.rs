@@ -195,10 +195,9 @@ impl UserMemorySession {
             )?;
             output.push_str("---\n");
             output.push_str(&format!(
-                "- 群名片：{}\n- QQ号：{}\n- QQ昵称：{}\n- 记忆：\n",
-                user.group_card.as_deref().unwrap_or("无"),
+                "- QQ号：{}；当前昵称：{}\n- 记忆：\n",
                 user.user_id,
-                user.qq_nickname,
+                user.group_card.as_deref().unwrap_or(&user.qq_nickname),
             ));
             if memories.is_empty() {
                 output.push_str("    没有关于ta的记忆\n");

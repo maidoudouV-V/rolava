@@ -25,6 +25,7 @@ pub struct AdminAppConfig {
     pub web_search_model_name: String,
     pub visual_model_name: String,
     pub max_history_messages: u32,
+    pub startup_history_fetch_count: u32,
     pub vision_image_message_window: usize,
     pub ai_request_retry_count: u32,
     pub ai_request_timeout_seconds: u64,
@@ -78,6 +79,7 @@ impl AdminConfigView {
                 web_search_model_name: config.app.web_search_model_name.clone(),
                 visual_model_name: config.app.visual_model_name.clone(),
                 max_history_messages: config.app.max_history_messages,
+                startup_history_fetch_count: config.app.startup_history_fetch_count,
                 vision_image_message_window: config.app.vision_image_message_window,
                 ai_request_retry_count: config.app.ai_request_retry_count,
                 ai_request_timeout_seconds: config.app.ai_request_timeout_seconds,
@@ -172,6 +174,7 @@ pub struct PromptFileSummary {
 }
 
 const INTERNAL_PROMPT_FILES: &[&str] = &[
+    "chat_history_summary",
     "filter",
     "image_description",
     "web_search_agent",
@@ -281,6 +284,9 @@ fn validate_update(update: &AdminConfigUpdate) -> Result<()> {
     if update.app.max_history_messages == 0 {
         anyhow::bail!("历史消息数必须大于 0");
     }
+    if update.app.startup_history_fetch_count > 999 {
+        anyhow::bail!("每群启动历史消息数不能超过 999");
+    }
     if !update.app.reply_delay_random_max_secs.is_finite()
         || update.app.reply_delay_random_max_secs < 0.0
     {
@@ -343,6 +349,7 @@ fn apply_app(document: &mut DocumentMut, app: &AdminAppConfig) {
     table["web_search_model_name"] = value(&app.web_search_model_name);
     table["visual_model_name"] = value(&app.visual_model_name);
     table["max_history_messages"] = value(i64::from(app.max_history_messages));
+    table["startup_history_fetch_count"] = value(i64::from(app.startup_history_fetch_count));
     table["vision_image_message_window"] = value(app.vision_image_message_window as i64);
     table["ai_request_retry_count"] = value(i64::from(app.ai_request_retry_count));
     table["ai_request_timeout_seconds"] = value(app.ai_request_timeout_seconds as i64);
@@ -352,6 +359,7 @@ fn apply_app(document: &mut DocumentMut, app: &AdminAppConfig) {
     table["command_whitelist"] = Item::Value(strings_array(&app.command_whitelist).into());
     table["reply_delay_random_max_secs"] = value(app.reply_delay_random_max_secs);
     table.as_table_mut().map(|table| {
+        table.remove("startup_history_message_count");
         table.remove("split_reply_on_newlines");
         table.remove("enable_ai_filter");
     });

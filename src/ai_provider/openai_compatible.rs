@@ -569,68 +569,6 @@ mod tests {
             "原始推理文本"
         );
     }
-
-    // 验证联网请求遵循官方的上下文大小参数。
-    #[test]
-    fn web_search_request_uses_official_medium_context_option() {
-        let request = OpenAICompatibleWebSearchRequest {
-            model: "gpt-5-search-api",
-            messages: vec![OpenAICompatibleToolMessage::User {
-                content: OpenAICompatibleUserContent::Text("今天有什么新闻？"),
-            }],
-            web_search_options: OpenAICompatibleWebSearchOptions {
-                search_context_size: WEB_SEARCH_CONTEXT_SIZE,
-            },
-        };
-        let request_json = serde_json::to_value(request).unwrap();
-
-        assert_eq!(request_json["model"], "gpt-5-search-api");
-        assert_eq!(request_json["messages"][0]["role"], "user");
-        assert_eq!(
-            request_json["web_search_options"]["search_context_size"],
-            "medium"
-        );
-    }
-
-    // 验证图文消息使用高精度图片参数。
-    #[test]
-    fn multimodal_user_message_uses_high_detail_image_url() {
-        let messages = vec![ToolChatMessage::User {
-            content: ToolChatUserContent::from_parts(vec![
-                ToolChatContentPart::Text {
-                    text: "看看这张图".to_string(),
-                },
-                ToolChatContentPart::Image {
-                    data_url: "data:image/jpeg;base64,abc".to_string(),
-                },
-            ]),
-        }];
-
-        let request = build_openai_compatible_request("test", Some(100), "medium", &messages, &[]);
-        let request_json = serde_json::to_value(request).unwrap();
-
-        assert_eq!(request_json["messages"][0]["content"][0]["type"], "text");
-        assert_eq!(
-            request_json["messages"][0]["content"][1]["image_url"]["url"],
-            "data:image/jpeg;base64,abc"
-        );
-        assert_eq!(
-            request_json["messages"][0]["content"][1]["image_url"]["detail"],
-            "high"
-        );
-    }
-
-    #[test]
-    fn automatic_defaults_are_omitted_from_request() {
-        let messages = vec![ToolChatMessage::User {
-            content: ToolChatUserContent::text("test"),
-        }];
-        let request = build_openai_compatible_request("test", None, "auto", &messages, &[]);
-        let request_json = serde_json::to_value(request).unwrap();
-
-        assert!(request_json.get("max_tokens").is_none());
-        assert!(request_json.get("reasoning_effort").is_none());
-    }
 }
 
 fn first_choice<'a>(

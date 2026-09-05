@@ -1,5 +1,6 @@
 pub mod google_aistudio;
 pub mod openai_compatible;
+pub mod openai_responses;
 pub mod openrouter;
 use crate::tools::{ToolCall, ToolDefinition, ToolResult};
 use anyhow::Result;

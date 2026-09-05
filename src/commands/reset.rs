@@ -29,8 +29,8 @@ impl Command for ResetCommand {
             &context.message.conversation.id,
         )?;
         Ok(CommandOutput::conversation_reset(format!(
-            "当前会话已重置，已删除 {} 条聊天记录。",
-            result.deleted_messages
+            "当前会话已重置，已删除 {} 条聊天记录和 {} 条历史摘要。",
+            result.deleted_messages, result.deleted_daily_summaries
         )))
     }
 }

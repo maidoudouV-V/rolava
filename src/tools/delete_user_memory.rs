@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"删除指定用户的一条用户记忆。
+const DESCRIPTION: &str = r#"删除指定群友/好友的一条用户记忆。
 user_id 必须使用最近活跃用户中显示的真实 QQ 号，memory_id 必须原样使用该用户记忆中显示的稳定 ID。
 仅当记忆已经失效且不再需要保留时删除；需要纠正或补充内容时，应使用 update_user_memory 更新。"#;
 

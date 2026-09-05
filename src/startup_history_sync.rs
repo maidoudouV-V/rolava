@@ -9,8 +9,6 @@ use crate::repository::db_manager::QQChatContextManager;
 use crate::transport::message::IncomingMessage;
 use crate::transport::onebot::OneBotHttpServer;
 
-const STARTUP_GROUP_HISTORY_COUNT: u32 = 99;
-
 /// 程序启动时回填群历史；只补数据库，不进入过滤器、Actor 或主模型流程。
 pub struct StartupHistorySyncService {
     app_config: Arc<AppConfig>,
@@ -42,6 +40,11 @@ impl StartupHistorySyncService {
     }
 
     async fn sync(&self, history_before_timestamp: i64) -> Result<()> {
+        let history_count = self.app_config.app.startup_history_fetch_count;
+        if history_count == 0 {
+            info!("启动群历史同步已关闭");
+            return Ok(());
+        }
         let bot_id = self.onebot.fetch_login_user_id().await?;
         let group_ids = self.target_group_ids().await?;
         let mut inserted_count = 0usize;
@@ -89,7 +92,11 @@ impl StartupHistorySyncService {
     ) -> Result<usize> {
         let history = self
             .onebot
-            .fetch_group_history(group_id, bot_id, STARTUP_GROUP_HISTORY_COUNT)
+            .fetch_group_history(
+                group_id,
+                bot_id,
+                self.app_config.app.startup_history_fetch_count,
+            )
             .await?;
         // 接收器启动后的消息留给实时 Actor，避免回填去重使它们失去触发 AI 的机会。
         let history = history

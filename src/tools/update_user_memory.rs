@@ -5,9 +5,12 @@ use serde_json::{json, Value};
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"更新最近活跃用户的一条已有用户记忆。
+const DESCRIPTION: &str = r#"更新对指定群友/好友的长期记忆。
+当聊天内容中发现某个群友已记录的信息发生变化、补充或你推断出已有记忆出错时，应主动更新对应记忆，无需等待用户要求。
+重复提及、换一种说法或短暂状态变化不需要更新；不要为了润色措辞而反复改写，也不要用未经确认的推测覆盖已有事实。
 user_id 必须使用最近活跃用户中显示的真实 QQ 号，memory_id 必须原样使用该用户记忆中显示的 `mem_...` 稳定 ID。
-content 是更新后的完整记忆内容，不是只包含本次变化的补丁。"#;
+记忆内容涉及具体用户时，必须使用“昵称（QQ号）”标识每位相关用户，不能只写昵称。QQ号必须来自当前上下文中已确认的身份信息，不得猜测或编造。
+content 是更新后的完整记忆内容，不是只包含本次变化的补丁；保留仍然有效的信息，删去被明确纠正的旧内容。"#;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

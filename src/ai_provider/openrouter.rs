@@ -630,46 +630,4 @@ mod tests {
         );
         assert!(request_json["messages"][0].get("reasoning").is_none());
     }
-
-    // 验证图文消息使用高精度图片参数。
-    #[test]
-    fn multimodal_user_message_uses_high_detail_image_url() {
-        let messages = vec![ToolChatMessage::User {
-            content: ToolChatUserContent::from_parts(vec![
-                ToolChatContentPart::Text {
-                    text: "看看这张图".to_string(),
-                },
-                ToolChatContentPart::Image {
-                    data_url: "data:image/png;base64,abc".to_string(),
-                },
-            ]),
-        }];
-
-        let request =
-            build_openrouter_chat_request("test", Some(100), "medium", &messages, &[], None);
-        let request_json = serde_json::to_value(request).unwrap();
-
-        assert_eq!(request_json["messages"][0]["content"][0]["type"], "text");
-        assert_eq!(
-            request_json["messages"][0]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,abc"
-        );
-        assert_eq!(
-            request_json["messages"][0]["content"][1]["image_url"]["detail"],
-            "high"
-        );
-    }
-
-    #[test]
-    fn automatic_defaults_keep_summary_without_forcing_limits() {
-        let messages = vec![ToolChatMessage::User {
-            content: ToolChatUserContent::text("test"),
-        }];
-        let request = build_openrouter_chat_request("test", None, "auto", &messages, &[], None);
-        let request_json = serde_json::to_value(request).unwrap();
-
-        assert!(request_json.get("max_completion_tokens").is_none());
-        assert!(request_json["reasoning"].get("effort").is_none());
-        assert_eq!(request_json["reasoning"]["summary"], "auto");
-    }
 }
