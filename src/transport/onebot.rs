@@ -3,8 +3,8 @@ use crate::conversation_trigger::{ConversationTrigger, RoutedConversationTrigger
 use crate::repository::db_manager::{NewChatMessage, QQChatContextManager};
 use crate::runtime_state::{RuntimeGroupInfo, RuntimeState};
 use crate::transport::message::{
-    Conversation, ConversationKind, IncomingMessage, MessageContent, MessagePart, MessageTarget,
-    Participant,
+    preferred_sender_name, Conversation, ConversationKind, IncomingMessage, MessageContent,
+    MessagePart, MessageTarget, Participant,
 };
 use crate::transport::{GroupInfo, MessageSender, QqExpression, SendOptions, SentMessage};
 use anyhow::{bail, Context, Result};
@@ -33,6 +33,7 @@ use tracing::{debug, error, info, trace, warn};
 mod history;
 
 const RAW_MESSAGE_CHANNEL_CAPACITY: usize = 128;
+const MAX_TEXT_SEGMENTS_PER_SEND: usize = 5;
 const FOLLOWUP_SEGMENT_DELAY_PER_CHAR_MS: u64 = 100;
 const FOLLOWUP_SEGMENT_MAX_DELAY: Duration = Duration::from_secs(6);
 const QQ_RANDOM_EXPRESSION_ANIMATION_DELAY: Duration = Duration::from_secs(3);
@@ -819,6 +820,8 @@ impl OneBotGroupMessageDto {
             at_display_names,
             face_id_map,
         );
+        let effective_group_name =
+            OneBotHttpServer::member_display_name(&nickname, card.as_deref());
         let parts = message
             .into_iter()
             .map(|part| part.into_message_part(face_id_map))
@@ -835,7 +838,7 @@ impl OneBotGroupMessageDto {
             sender: Participant {
                 id: user_id.to_string(),
                 display_name: nickname.clone(),
-                nickname: card.clone(),
+                nickname: Some(effective_group_name),
                 role: role.clone(),
             },
             content: MessageContent { text, parts },
@@ -1184,6 +1187,25 @@ impl OneBotMessageSender {
             .collect()
     }
 
+    /// 限制一次普通文本回复的消息数量，超出部分合并到最后一段且不丢失正文。
+    fn bounded_text_segments(text: &str) -> (Vec<String>, usize) {
+        let segments = Self::text_segments(text);
+        let original_count = segments.len();
+        if original_count <= MAX_TEXT_SEGMENTS_PER_SEND {
+            return (
+                segments.into_iter().map(str::to_string).collect(),
+                original_count,
+            );
+        }
+
+        let mut bounded = segments[..MAX_TEXT_SEGMENTS_PER_SEND - 1]
+            .iter()
+            .map(|segment| (*segment).to_string())
+            .collect::<Vec<_>>();
+        bounded.push(segments[MAX_TEXT_SEGMENTS_PER_SEND - 1..].join("\n"));
+        (bounded, original_count)
+    }
+
     async fn send_text_segment(
         &self,
         target: &MessageTarget,
@@ -1274,9 +1296,16 @@ impl MessageSender for OneBotMessageSender {
         if target.source != "onebot" {
             bail!("OneBot 发送器不支持消息来源：{}", target.source);
         }
-        let segments = Self::text_segments(text);
+        let (segments, original_segment_count) = Self::bounded_text_segments(text);
         if segments.is_empty() {
             bail!("不能发送空消息");
+        }
+        if original_segment_count > MAX_TEXT_SEGMENTS_PER_SEND {
+            warn!(
+                original_segment_count,
+                max_segment_count = MAX_TEXT_SEGMENTS_PER_SEND,
+                "分段消息超过上限，剩余正文已合并到最后一段"
+            );
         }
 
         let mut sent_messages = Vec::with_capacity(segments.len());
@@ -1286,7 +1315,7 @@ impl MessageSender for OneBotMessageSender {
             let delay = if segment_index == 0 {
                 self.reply_delay(options)
             } else {
-                Self::followup_segment_delay(self.reply_delay(SendOptions::default()), segment)
+                Self::followup_segment_delay(self.reply_delay(SendOptions::default()), &segment)
             };
             if !delay.is_zero() {
                 debug!(
@@ -1299,7 +1328,7 @@ impl MessageSender for OneBotMessageSender {
             }
 
             let sent_message = self
-                .send_text_segment(target, segment, true)
+                .send_text_segment(target, &segment, true)
                 .await?
                 .expect("持久化发送必须返回数据库消息");
             sent_messages.push(sent_message);
@@ -1755,10 +1784,7 @@ impl OneBotHttpServer {
 
     /// 优先使用群名片，群名片为空时使用 QQ 昵称。
     fn member_display_name(nickname: &str, card: Option<&str>) -> String {
-        card.map(str::trim)
-            .filter(|card| !card.is_empty())
-            .unwrap_or_else(|| nickname.trim())
-            .to_string()
+        preferred_sender_name(nickname, card).to_string()
     }
 
     /// 群成员缓存 key。

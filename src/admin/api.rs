@@ -18,7 +18,9 @@ use crate::repository::db_manager::{ConversationRecord, QQChatContextManager};
 use crate::runtime_state::{RuntimeGroupMember, RuntimeState};
 use crate::scheduler::SchedulerService;
 use crate::tools::ToolRegistry;
-use crate::transport::message::{Conversation, ConversationKind, MessageTarget};
+use crate::transport::message::{
+    preferred_sender_name, Conversation, ConversationKind, MessageTarget,
+};
 use crate::transport::onebot::OneBotHttpServer;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
@@ -781,7 +783,11 @@ async fn conversation_messages(
                     .unwrap_or(&message.sender_display_name)
                     .to_string()
             } else {
-                message.sender_nickname.clone().unwrap_or_else(|| message.sender_display_name.clone())
+                preferred_sender_name(
+                    &message.sender_display_name,
+                    message.sender_nickname.as_deref(),
+                )
+                .to_string()
             };
             json!({
                 "id": message.id,

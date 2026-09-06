@@ -4,6 +4,7 @@ use crate::history_compression::summary_date_for_timestamp;
 use crate::repository::db_manager::{
     ChatMessage, ConversationDailySummary, ConversationHistoryWindow, QQChatContextManager,
 };
+use crate::transport::message::preferred_sender_name;
 
 /// 主模型和管理页面共用同一个原始消息窗口及摘要日期范围。
 pub struct ChatHistoryContext {
@@ -42,10 +43,10 @@ pub fn load_chat_history_context(
 /// 将数据库消息格式化为供模型阅读的一行聊天记录。
 pub fn render_history_message_line(message: &ChatMessage, local_time: &DateTime<Local>) -> String {
     let time_text = local_time.format("%H:%M:%S").to_string();
-    let sender_name = message
-        .sender_nickname
-        .clone()
-        .unwrap_or_else(|| message.sender_display_name.clone());
+    let sender_name = preferred_sender_name(
+        &message.sender_display_name,
+        message.sender_nickname.as_deref(),
+    );
     let content = message.content_text.clone().unwrap_or_default();
     format!("{}（{}）:{}", sender_name, time_text, content)
 }

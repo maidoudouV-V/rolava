@@ -6,7 +6,7 @@ use crate::config::AppConfig;
 use crate::conversation_control::ConversationControl;
 use crate::message_ingestion::MessageIngestionService;
 use crate::repository::db_manager::{ChatMessage, QQChatContextManager};
-use crate::transport::message::{ConversationKind, IncomingMessage};
+use crate::transport::message::{preferred_sender_name, ConversationKind, IncomingMessage};
 
 const INITIAL_FILTER_CONTEXT_MESSAGES: u32 = 50;
 const MAX_FILTER_CONTEXT_MESSAGES: usize = 100;
@@ -219,7 +219,11 @@ impl ConversationFilter {
             .map(|message| {
                 format!(
                     "{}: {}",
-                    message.message.sender.display_name, message.message.content.text
+                    preferred_sender_name(
+                        &message.message.sender.display_name,
+                        message.message.sender.nickname.as_deref(),
+                    ),
+                    message.message.content.text
                 )
             })
             .collect::<Vec<_>>()
@@ -258,10 +262,10 @@ impl ConversationFilter {
                 content,
             }
         } else {
-            let sender_name = message
-                .sender_nickname
-                .as_ref()
-                .unwrap_or(&message.sender_display_name);
+            let sender_name = preferred_sender_name(
+                &message.sender_display_name,
+                message.sender_nickname.as_deref(),
+            );
             ContextMessage {
                 role: MessageRole::User,
                 content: format!("{}: {}", sender_name, content),
@@ -272,7 +276,14 @@ impl ConversationFilter {
     fn incoming_context_message(message: &IncomingMessage) -> ContextMessage {
         ContextMessage {
             role: MessageRole::User,
-            content: format!("{}: {}", message.sender.display_name, message.content.text),
+            content: format!(
+                "{}: {}",
+                preferred_sender_name(
+                    &message.sender.display_name,
+                    message.sender.nickname.as_deref(),
+                ),
+                message.content.text
+            ),
         }
     }
 

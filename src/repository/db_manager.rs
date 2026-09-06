@@ -141,6 +141,7 @@ pub struct ChatMessage {
 /// 回复引用只需要的原消息摘要。
 pub struct ReferencedMessage {
     pub sender_display_name: String,
+    pub sender_nickname: Option<String>,
     pub content_text: Option<String>,
 }
 
@@ -677,7 +678,8 @@ impl QQChatContextManager {
         let mut statement = connection.prepare(
             "SELECT c.id, c.source, c.source_conversation_id, c.kind, c.title,
                     c.metadata_json, c.created_at, c.last_message_at,
-                    latest.sender_display_name, latest.content_text, latest.event_timestamp,
+                    COALESCE(NULLIF(TRIM(latest.sender_nickname), ''), latest.sender_display_name),
+                    latest.content_text, latest.event_timestamp,
                     COALESCE(SUM(CASE WHEN m.is_read = 0 THEN 1 ELSE 0 END), 0)
              FROM conversations c
              LEFT JOIN messages latest ON latest.id = (
@@ -1121,6 +1123,7 @@ impl QQChatContextManager {
                 "
                 SELECT
                     m.sender_display_name,
+                    m.sender_nickname,
                     m.content_text
                 FROM messages m
                 INNER JOIN conversations c ON c.id = m.conversation_id
@@ -1133,7 +1136,8 @@ impl QQChatContextManager {
                 |row| {
                     Ok(ReferencedMessage {
                         sender_display_name: row.get(0)?,
-                        content_text: row.get(1)?,
+                        sender_nickname: row.get(1)?,
+                        content_text: row.get(2)?,
                     })
                 },
             )

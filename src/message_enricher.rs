@@ -20,7 +20,7 @@ use crate::config::AppConfig;
 use crate::repository::db_manager::{
     NewReceivedImage, QQChatContextManager, ReceivedImageRecord, ReferencedMessage,
 };
-use crate::transport::message::IncomingMessage;
+use crate::transport::message::{preferred_sender_name, IncomingMessage};
 
 const IMAGE_READ_FAILED_TEXT: &str = "[图片消息 读取失败]";
 const REPLY_MESSAGE_PLACEHOLDER: &str = "[回复消息]";
@@ -194,7 +194,10 @@ impl MessageEnricher {
             .as_deref()
             .map(Self::reply_content_preview)
             .filter(|content| !content.is_empty());
-        let sender = original.sender_display_name.trim();
+        let sender = preferred_sender_name(
+            &original.sender_display_name,
+            original.sender_nickname.as_deref(),
+        );
 
         match (sender.is_empty(), content) {
             (false, Some(content)) => format!("[reply {}：{}]", sender, content),

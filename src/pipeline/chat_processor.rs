@@ -21,7 +21,9 @@ use crate::tools::{
     ConversationEffect, ConversationToolContext, ToolContext, ToolDefinition, ToolRegistry,
     ToolResult, ToolServices,
 };
-use crate::transport::message::{ConversationKind, IncomingMessage, MessageTarget};
+use crate::transport::message::{
+    preferred_sender_name, ConversationKind, IncomingMessage, MessageTarget,
+};
 use crate::transport::{GroupInfo, SendOptions};
 use sha2::{Digest, Sha256};
 
@@ -115,7 +117,10 @@ impl ChatProcessor {
         for incoming_message in &incoming_messages {
             debug!(
                 scene = %self.scene,
-                sender = %incoming_message.sender.display_name,
+                sender = %preferred_sender_name(
+                    &incoming_message.sender.display_name,
+                    incoming_message.sender.nickname.as_deref(),
+                ),
                 content = ?incoming_message.content.text,
                 "收到平台消息"
             );
@@ -893,13 +898,24 @@ impl ChatProcessor {
     }
 
     fn render_scene(&self) -> String {
-        match self.group_info.get().and_then(Option::as_ref) {
-            Some(group_info) => format!(
-                "{}\n- 当前群名称:{}\n- 当前群成员数量:{}",
-                self.scene, group_info.name, group_info.member_count
-            ),
-            None => self.scene.clone(),
+        if !matches!(
+            self.message_target.conversation.kind,
+            ConversationKind::Group
+        ) {
+            return self.scene.clone();
         }
+
+        let mut scene = format!(
+            "{}\n- 当前聊天群号：{}",
+            self.scene, self.message_target.conversation.id
+        );
+        if let Some(group_info) = self.group_info.get().and_then(Option::as_ref) {
+            scene.push_str(&format!(
+                "\n- 当前群名称:{}\n- 当前群成员数量:{}",
+                group_info.name, group_info.member_count
+            ));
+        }
+        scene
     }
 
     /// 为同一来源、机器人与会话生成固定且不暴露原始会话 ID 的 OpenRouter 会话标识。

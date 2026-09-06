@@ -9,8 +9,7 @@ use serde_json::Value;
 
 use crate::config::AppConfig;
 use crate::repository::db_manager::{ChatMessage, QQChatContextManager};
-use crate::transport::message::IncomingMessage;
-use crate::transport::message::MessageTarget;
+use crate::transport::message::{ConversationKind, IncomingMessage, MessageTarget};
 
 use super::member_profile::OneBotMemberProfileClient;
 
@@ -194,11 +193,18 @@ impl UserMemorySession {
                 &user.user_id,
             )?;
             output.push_str("---\n");
-            output.push_str(&format!(
-                "- QQ号：{}；当前昵称：{}\n- 记忆：\n",
-                user.user_id,
-                user.group_card.as_deref().unwrap_or(&user.qq_nickname),
-            ));
+            match self.target.conversation.kind {
+                ConversationKind::Group => output.push_str(&format!(
+                    "- QQ号：{}；账户昵称：{}；当前群昵称：{}\n- 记忆：\n",
+                    user.user_id,
+                    user.qq_nickname,
+                    user.group_card.as_deref().unwrap_or(&user.qq_nickname),
+                )),
+                ConversationKind::Direct => output.push_str(&format!(
+                    "- QQ号：{}；账户昵称：{}\n- 记忆：\n",
+                    user.user_id, user.qq_nickname,
+                )),
+            }
             if memories.is_empty() {
                 output.push_str("    没有关于ta的记忆\n");
             } else {

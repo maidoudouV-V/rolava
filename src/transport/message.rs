@@ -90,6 +90,14 @@ pub struct Participant {
     pub role: Option<String>,
 }
 
+/// 优先使用当前会话昵称或群名片，缺失或为空时回退到平台展示名。
+pub fn preferred_sender_name<'a>(display_name: &'a str, nickname: Option<&'a str>) -> &'a str {
+    nickname
+        .map(str::trim)
+        .filter(|nickname| !nickname.is_empty())
+        .unwrap_or_else(|| display_name.trim())
+}
+
 /// 标准化后的消息内容。
 #[derive(Debug, Clone)]
 pub struct MessageContent {
