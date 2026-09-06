@@ -34,6 +34,8 @@ mod history;
 
 const RAW_MESSAGE_CHANNEL_CAPACITY: usize = 128;
 const MAX_TEXT_SEGMENTS_PER_SEND: usize = 5;
+const JSON_CARD_URL_MAX_CHARS: usize = 100;
+const UNAVAILABLE_CONTENT_HINT: &str = "当前客户端版本过低，无法显示内容";
 const FOLLOWUP_SEGMENT_DELAY_PER_CHAR_MS: u64 = 100;
 const FOLLOWUP_SEGMENT_MAX_DELAY: Duration = Duration::from_secs(6);
 const QQ_RANDOM_EXPRESSION_ANIMATION_DELAY: Duration = Duration::from_secs(3);
@@ -279,25 +281,29 @@ impl OneBotMessageSegmentDto {
             "at" => Self::push_token(output, &self.render_at_text(bot_id, at_display_names)),
             "face" => Self::push_token(output, &self.face_context_text(face_id_map)),
             "image" => Self::push_token(output, "[图片]"),
-            "record" => Self::push_token(output, "[语音]"),
-            "video" => Self::push_token(output, "[视频]"),
+            "record" => Self::push_token(output, &Self::unavailable_placeholder("语音")),
+            "video" => Self::push_token(output, &Self::unavailable_placeholder("视频")),
             "file" => Self::push_token(output, &self.file_context_text()),
             "reply" => Self::push_token(output, "[回复消息]"),
-            "forward" => Self::push_token(output, "[合并转发]"),
-            "node" => Self::push_token(output, "[转发节点]"),
+            "forward" => Self::push_token(output, &Self::unavailable_placeholder("合并转发")),
+            "node" => Self::push_token(output, &Self::unavailable_placeholder("转发节点")),
             "share" => Self::push_token(output, &self.render_named_placeholder("分享", "title")),
-            "contact" => Self::push_token(output, "[名片]"),
+            "contact" => Self::push_token(output, &Self::unavailable_placeholder("名片")),
             "location" => Self::push_token(output, &self.render_named_placeholder("位置", "name")),
-            "music" => Self::push_token(output, "[音乐]"),
+            "music" => Self::push_token(output, &Self::unavailable_placeholder("音乐")),
             "json" => Self::push_token(output, &Self::json_context_text(&self.data)),
-            "xml" => Self::push_token(output, "[XML消息]"),
+            "xml" => Self::push_token(output, &Self::unavailable_placeholder("XML消息")),
             "dice" => Self::push_token(output, &self.dice_context_text()),
             "rps" => Self::push_token(output, &self.rps_context_text()),
             "shake" => Self::push_token(output, "[窗口抖动]"),
             "poke" => Self::push_token(output, &self.poke_context_text()),
             "anonymous" => Self::push_token(output, "[匿名]"),
-            other => Self::push_token(output, &format!("[{}]", other)),
+            other => Self::push_token(output, &Self::unavailable_placeholder(other)),
         }
+    }
+
+    fn unavailable_placeholder(label: &str) -> String {
+        format!("[{}（{}）]", label, UNAVAILABLE_CONTENT_HINT)
     }
 
     /// 超级表情优先使用平台文本，经典表情再按 ID 查表。
@@ -403,7 +409,7 @@ impl OneBotMessageSegmentDto {
             .filter(|name| !name.trim().is_empty())
         {
             Some(name) => format!("[{}:{}]", label, name),
-            None => format!("[{}]", label),
+            None => Self::unavailable_placeholder(label),
         }
     }
 
@@ -427,7 +433,7 @@ impl OneBotMessageSegmentDto {
             details.push(file_size);
         }
         if details.is_empty() {
-            "[文件]".to_string()
+            Self::unavailable_placeholder("文件")
         } else {
             format!("[文件 {}]", details.join("；"))
         }
@@ -452,7 +458,7 @@ impl OneBotMessageSegmentDto {
     /// 将 OneBot JSON 卡片转换成主聊天 AI 容易理解的摘要。
     fn json_context_text(json_data: &Value) -> String {
         let Some(payload) = Self::parse_json_segment_payload(json_data) else {
-            return "[JSON消息]".to_string();
+            return Self::unavailable_placeholder("JSON消息");
         };
 
         let label = Self::json_card_label(&payload);
@@ -606,14 +612,23 @@ impl OneBotMessageSegmentDto {
         }
     }
 
-    /// 补齐常见无协议链接。
+    /// 补齐常见无协议链接，并限制其占用的上下文长度。
     fn normalize_card_url(url: String) -> String {
         let url = url.trim();
-        if url.starts_with("http://") || url.starts_with("https://") {
+        let normalized = if url.starts_with("http://") || url.starts_with("https://") {
             url.to_string()
         } else {
             format!("https://{}", url.trim_start_matches('/'))
+        };
+        if normalized.chars().count() <= JSON_CARD_URL_MAX_CHARS {
+            return normalized;
         }
+
+        let visible_chars = JSON_CARD_URL_MAX_CHARS.saturating_sub(3);
+        format!(
+            "{}...",
+            normalized.chars().take(visible_chars).collect::<String>()
+        )
     }
 
     /// 获取消息段 data 中的字符串值，兼容数字形式的字段。

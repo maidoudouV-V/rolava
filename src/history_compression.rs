@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, TimeZone, Utc, Weekday};
 use tokio::time::{sleep, timeout};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ai_provider::{ToolChatMessage, ToolChatResponse, ToolChatUserContent};
 use crate::chat_history::render_history_message_line;
@@ -12,6 +12,7 @@ use crate::config::AppConfig;
 use crate::repository::db_manager::{
     ChatMessage, NewConversationDailySummary, PendingDailySummary, QQChatContextManager,
 };
+use crate::runtime_state::RuntimeState;
 
 const COMPRESSION_RUN_HOUR: u32 = 3;
 
@@ -19,6 +20,7 @@ const COMPRESSION_RUN_HOUR: u32 = 3;
 pub struct HistoryCompressionService {
     app_config: Arc<AppConfig>,
     db_manager: Arc<QQChatContextManager>,
+    runtime_state: Arc<RuntimeState>,
 }
 
 #[derive(Default)]
@@ -29,10 +31,15 @@ struct CompressionStats {
 }
 
 impl HistoryCompressionService {
-    pub fn new(app_config: Arc<AppConfig>, db_manager: Arc<QQChatContextManager>) -> Self {
+    pub fn new(
+        app_config: Arc<AppConfig>,
+        db_manager: Arc<QQChatContextManager>,
+        runtime_state: Arc<RuntimeState>,
+    ) -> Self {
         Self {
             app_config,
             db_manager,
+            runtime_state,
         }
     }
 
@@ -88,6 +95,12 @@ impl HistoryCompressionService {
 
         // 每个统计日独立失败，不能让一条超长记录阻塞其它会话的补偿任务。
         for task in tasks {
+            debug!(
+                source = %task.source,
+                conversation_id = %task.source_conversation_id,
+                summary_date = %task.summary_date,
+                "开始压缩会话当日聊天记录"
+            );
             match self.compress_task(&task).await {
                 Ok(true) => stats.inserted += 1,
                 Ok(false) => {}
@@ -130,6 +143,8 @@ impl HistoryCompressionService {
             period_end.timestamp(),
             local_time(period_end.date_naive(), COMPRESSION_RUN_HOUR)?.timestamp(),
         )?;
+        let bot_id = self.runtime_state.bot_id();
+        let bot_name = self.runtime_state.bot_name();
         let request_messages = build_summary_request(
             &self.app_config.prompt_config.chat_history_summary_prompt,
             &task.summary_date,
@@ -138,6 +153,8 @@ impl HistoryCompressionService {
                 .first()
                 .map(|summary| summary.summary_text.as_str()),
             &following_messages,
+            bot_id.as_deref(),
+            bot_name.as_deref(),
         )?;
         let summary_text = self.request_summary(&request_messages).await?;
         // 消息已经按事件时间和 ID 排序，首尾 ID 必须反映实际总结输入的顺序。
@@ -215,8 +232,10 @@ fn build_summary_request(
     messages: &[ChatMessage],
     previous_summary: Option<&str>,
     following_messages: &[ChatMessage],
+    bot_id: Option<&str>,
+    bot_name: Option<&str>,
 ) -> Result<Vec<ToolChatMessage>> {
-    let history = render_daily_messages(messages)?;
+    let history = render_daily_messages(messages, bot_id, bot_name)?;
     let mut content = format!("本次总结日期：{summary_date}（本地时间 00:00:00 至次日 00:00:00，不含终点）。只总结此日期内的内容。\n");
     if let Some(summary) = previous_summary {
         content.push_str(&format!(
@@ -227,7 +246,7 @@ fn build_summary_request(
     if !following_messages.is_empty() {
         content.push_str(&format!(
             "\n# 次日 00:00～03:00 聊天记录（不含 03:00，仅供连贯性参考，不纳入本次摘要）\n{}\n",
-            render_daily_messages(following_messages)?
+            render_daily_messages(following_messages, bot_id, bot_name)?
         ));
     }
     Ok(vec![
@@ -240,7 +259,11 @@ fn build_summary_request(
     ])
 }
 
-fn render_daily_messages(messages: &[ChatMessage]) -> Result<String> {
+fn render_daily_messages(
+    messages: &[ChatMessage],
+    bot_id: Option<&str>,
+    bot_name: Option<&str>,
+) -> Result<String> {
     let mut rendered = String::new();
     let mut last_date = None;
     for message in messages {
@@ -256,6 +279,14 @@ fn render_daily_messages(messages: &[ChatMessage]) -> Result<String> {
             last_date = Some(date);
         }
         rendered.push('\n');
+        if bot_id == Some(message.sender_id.as_str()) {
+            if let Some(bot_name) = bot_name.filter(|name| !name.trim().is_empty()) {
+                let time = local.format("%H:%M:%S");
+                let content = message.content_text.as_deref().unwrap_or_default();
+                rendered.push_str(&format!("{}（{}）:{}", bot_name.trim(), time, content));
+                continue;
+            }
+        }
         rendered.push_str(&render_history_message_line(message, &local));
     }
     Ok(rendered)

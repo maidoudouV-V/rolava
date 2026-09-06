@@ -154,6 +154,7 @@ async fn run_worker() -> Result<WorkerExit> {
     let history_compression = Arc::new(HistoryCompressionService::new(
         app_config.clone(),
         db_manager.clone(),
+        runtime.clone(),
     ));
     let message_ingestion = Arc::new(MessageIngestionService::new(
         app_config.clone(),
