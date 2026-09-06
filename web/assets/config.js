@@ -43,6 +43,7 @@ export class ConfigController {
     document.getElementById("onebot-api").value = server.onebot_api;
     document.getElementById("onebot-token").placeholder = server.onebot_token_configured ? "已配置，留空保持不变" : "未配置";
     document.getElementById("max-history").value = app.max_history_messages;
+    document.getElementById("history-summary-enabled").checked = app.history_summary_enabled;
     document.getElementById("startup-history-fetch-count").value = app.startup_history_fetch_count;
     document.getElementById("image-window").value = app.vision_image_message_window;
     document.getElementById("retry-count").value = app.ai_request_retry_count;
@@ -248,6 +249,7 @@ export class ConfigController {
       web_search_model_name: document.getElementById("web-model").value,
       visual_model_name: document.getElementById("visual-model").value,
       max_history_messages: Number(document.getElementById("max-history").value),
+      history_summary_enabled: document.getElementById("history-summary-enabled").checked,
       startup_history_fetch_count: Number(document.getElementById("startup-history-fetch-count").value),
       vision_image_message_window: Number(document.getElementById("image-window").value),
       ai_request_retry_count: Number(document.getElementById("retry-count").value),

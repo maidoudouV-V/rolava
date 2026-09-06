@@ -8,7 +8,9 @@ use crate::ai_provider::{
     openai_responses::OpenAIResponsesProvider, openrouter::OpenRouterProvider, AIProvider,
     ToolChatMessage, ToolChatUserContent,
 };
+use crate::chat_history::load_chat_history_context;
 use crate::config::{AppConfig, ModelConfig};
+use crate::history_compression::render_summary_date_heading;
 use crate::memory::{
     CharacterMemorySession, UserMemoryService, MAX_RETENTION_DAYS, SECONDS_PER_DAY,
 };
@@ -41,6 +43,10 @@ const GROUP_MEMBER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 #[derive(Clone)]
 pub struct AdminState {
     app_config: Arc<RwLock<Arc<AppConfig>>>,
+    // 与运行中的主模型一致；仅保存配置但未重启时，不提前切换窗口大小。
+    context_history_limit: u32,
+    // 使用启动时的值，确保页面与运行中的模型上下文一致。
+    context_summary_enabled: bool,
     pub config_path: PathBuf,
     pub db_manager: Arc<QQChatContextManager>,
     pub scheduler: Arc<SchedulerService>,
@@ -64,6 +70,8 @@ impl AdminState {
         restart: CancellationToken,
     ) -> Self {
         Self {
+            context_history_limit: app_config.app.max_history_messages,
+            context_summary_enabled: app_config.app.history_summary_enabled,
             user_memory: Arc::new(UserMemoryService::new(db_manager.clone())),
             app_config: Arc::new(RwLock::new(app_config)),
             config_path,
@@ -736,36 +744,33 @@ async fn conversation_detail(
     })))
 }
 
-#[derive(Deserialize)]
-struct MessageListQuery {
-    before_id: Option<i64>,
-    after_id: Option<i64>,
-    limit: Option<u32>,
-}
-
 async fn conversation_messages(
     State(state): State<Arc<AdminState>>,
     Path(conversation_id): Path<i64>,
-    Query(query): Query<MessageListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    get_conversation(&state, conversation_id)?;
-    if query.before_id.is_some() && query.after_id.is_some() {
-        return Err(ApiError::bad_request("before_id 和 after_id 不能同时使用"));
-    }
+    let conversation = get_conversation(&state, conversation_id)?;
     let bot_id = state.runtime.bot_id();
     let bot_name = state.runtime.bot_name();
-    let messages = state.db_manager.get_admin_conversation_messages(
-        conversation_id,
-        query.before_id,
-        query.after_id,
-        query.limit.unwrap_or(50),
+    let history = load_chat_history_context(
+        &state.db_manager,
+        &conversation.source,
+        &conversation.source_conversation_id,
+        state.context_history_limit,
+        Local::now(),
+        state.context_summary_enabled,
     )?;
-    let next_before_id = query
-        .after_id
-        .is_none()
-        .then(|| messages.first().map(|message| message.id))
-        .flatten();
-    let items = messages
+    let summaries = history
+        .summaries
+        .iter()
+        .map(|summary| {
+            Ok(json!({
+                "date": summary.summary_date,
+                "heading": render_summary_date_heading(&summary.summary_date)?,
+                "content": summary.summary_text,
+            }))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let items = history.window.messages
         .into_iter()
         .map(|message| {
             let is_bot = bot_id.as_deref() == Some(message.sender_id.as_str());
@@ -776,7 +781,7 @@ async fn conversation_messages(
                     .unwrap_or(&message.sender_display_name)
                     .to_string()
             } else {
-                message.sender_display_name.clone()
+                message.sender_nickname.clone().unwrap_or_else(|| message.sender_display_name.clone())
             };
             json!({
                 "id": message.id,
@@ -790,9 +795,7 @@ async fn conversation_messages(
             })
         })
         .collect::<Vec<_>>();
-    Ok(Json(
-        json!({ "items": items, "next_before_id": next_before_id }),
-    ))
+    Ok(Json(json!({ "items": items, "summaries": summaries })))
 }
 
 #[derive(Serialize)]

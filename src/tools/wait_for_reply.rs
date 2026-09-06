@@ -14,9 +14,10 @@ use crate::conversation_trigger::ConversationTrigger;
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"等待指定秒数，如果指定目标在此期间没有发送任何消息，系统将触发模型调用。
-重复调用时，同一用户的新任务会替换旧任务。
-当需要等待对方回复时使用，适合等待对方回答或确认。"#;
+const DESCRIPTION: &str = r#"当需要等待对方回答或确认，并在对方迟迟未回复时继续处理，使用此工具。
+工具会创建后台等待任务并立即返回，你可以继续完成本轮处理，无需再次调用来检查等待结果。
+指定时间到期时，如果对方在当前会话中没有发送任何新消息，系统会再次唤起你，按 reason 中的说明继续处理；对方已发送消息则不触发本次超时处理。
+同一会话中，对同一人的新等待任务会替换旧任务。"#;
 
 #[derive(Debug, Deserialize)]
 pub struct WaitForReplyArgs {
@@ -68,7 +69,7 @@ impl Tool for WaitForReplyTool {
             "properties": {
                 "user_id": {
                     "type": "string",
-                    "description": "需要等待回复的用户 QQ 号，使用最近活跃用户中显示的真实 QQ 号",
+                    "description": "需要等待回复的对方 QQ 号，使用最近活跃用户中显示的真实 QQ 号",
                     "minLength": 1
                 },
                 "timeout_seconds": {
@@ -79,7 +80,7 @@ impl Tool for WaitForReplyTool {
                 },
                 "reason": {
                     "type": "string",
-                    "description": "等待目标回复的原因，以及到期后需要继续处理的事项",
+                    "description": "等待对方回复的原因，以及到期仍未回复时需要继续处理的事项",
                     "minLength": 1
                 }
             },

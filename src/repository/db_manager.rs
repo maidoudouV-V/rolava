@@ -319,7 +319,7 @@ impl QQChatContextManager {
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
                 -- 摘要所属会话，不同群聊和私聊完全隔离。
                 conversation_id         INTEGER NOT NULL,
-                -- 以本地时间凌晨 03:00 为起点的统计日期，格式 YYYY-MM-DD。
+                -- 以本地时间 00:00 为起点的自然日，格式 YYYY-MM-DD。
                 summary_date            TEXT    NOT NULL,
                 -- 统计窗口起点的 Unix 时间戳，包含该时刻。
                 period_start            INTEGER NOT NULL,
@@ -714,50 +714,6 @@ impl QQChatContextManager {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// 读取会话详情中的消息页，返回顺序为从旧到新。
-    pub fn get_admin_conversation_messages(
-        &self,
-        conversation_id: i64,
-        before_id: Option<i64>,
-        after_id: Option<i64>,
-        limit: u32,
-    ) -> Result<Vec<ChatMessage>> {
-        let connection = self.conn_pool.get()?;
-        let limit = limit.clamp(1, 100);
-        let select = "SELECT m.id, m.conversation_id, c.source, c.source_conversation_id, c.kind,
-                             m.source_message_id, m.sender_id, m.sender_display_name, m.sender_nickname,
-                             m.sender_role, m.content_text, m.message_type, m.content_parts_json,
-                             m.metadata_json, m.is_read, m.event_timestamp, m.created_at
-                      FROM messages m
-                      INNER JOIN conversations c ON c.id = m.conversation_id";
-
-        if let Some(after_id) = after_id {
-            // 实时增量查询必须按主键正序返回，前端才能直接追加且不会改变已有消息。
-            let mut statement = connection.prepare(&format!(
-                "{select} WHERE m.conversation_id = ?1 AND m.id > ?2 ORDER BY m.id ASC LIMIT ?3"
-            ))?;
-            return Ok(statement
-                .query_map(
-                    params![conversation_id, after_id, limit],
-                    ChatMessage::from_row,
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?);
-        }
-
-        let mut statement = connection.prepare(&format!(
-            "{select} WHERE m.conversation_id = ?1 AND (?2 IS NULL OR m.id < ?2) \
-             ORDER BY m.id DESC LIMIT ?3"
-        ))?;
-        let mut messages = statement
-            .query_map(
-                params![conversation_id, before_id, limit],
-                ChatMessage::from_row,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        messages.reverse();
-        Ok(messages)
-    }
-
     pub fn admin_database_stats(&self, today_start_timestamp: i64) -> Result<AdminDatabaseStats> {
         let connection = self.conn_pool.get()?;
         connection
@@ -1001,7 +957,7 @@ impl QQChatContextManager {
             WITH daily_messages AS (
                 SELECT
                     conversation_id,
-                    date(event_timestamp, 'unixepoch', 'localtime', '-3 hours') AS summary_date
+                    date(event_timestamp, 'unixepoch', 'localtime') AS summary_date
                 FROM messages
                 WHERE event_timestamp < ?1
                 GROUP BY conversation_id, summary_date
@@ -1039,6 +995,17 @@ impl QQChatContextManager {
         conversation_id: i64,
         summary_date: &str,
     ) -> Result<Vec<ChatMessage>> {
+        let (start, end) = crate::history_compression::summary_period(summary_date)?;
+        self.get_summary_messages_in_period(conversation_id, start.timestamp(), end.timestamp())
+    }
+
+    /// 读取摘要正文或参考时段的消息，包含起点、不包含终点。
+    pub fn get_summary_messages_in_period(
+        &self,
+        conversation_id: i64,
+        start_timestamp: i64,
+        end_timestamp: i64,
+    ) -> Result<Vec<ChatMessage>> {
         let connection = self.conn_pool.get()?;
         let mut statement = connection.prepare(
             "
@@ -1063,13 +1030,13 @@ impl QQChatContextManager {
             FROM messages m
             INNER JOIN conversations c ON c.id = m.conversation_id
             WHERE m.conversation_id = ?1
-              AND date(m.event_timestamp, 'unixepoch', 'localtime', '-3 hours') = ?2
+              AND m.event_timestamp >= ?2 AND m.event_timestamp < ?3
             ORDER BY m.event_timestamp ASC, m.id ASC
             ",
         )?;
         let messages = statement
             .query_map(
-                params![conversation_id, summary_date],
+                params![conversation_id, start_timestamp, end_timestamp],
                 ChatMessage::from_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1910,9 +1877,16 @@ mod tests {
                 .unwrap();
         }
 
-        let window = manager
-            .get_conversation_history_window("test", "conversation", 10)
-            .unwrap();
+        let window = crate::chat_history::load_chat_history_context(
+            &manager,
+            "test",
+            "conversation",
+            10,
+            Local::now(),
+            true,
+        )
+        .unwrap()
+        .window;
         assert_eq!(window.history_block_size, 2);
         assert_eq!(window.messages.len(), 9);
         assert_eq!(
@@ -2138,8 +2112,12 @@ mod tests {
     fn daily_summary_window_filters_dates_without_deleting_history() {
         let path = temporary_db_path();
         let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        let message_time = Local
+            .with_ymd_and_hms(2026, 8, 15, 12, 0, 0)
+            .single()
+            .unwrap();
         for conversation in ["conversation", "other"] {
-            let mut message = test_message("message-1", "正文", 1);
+            let mut message = test_message("message-1", "正文", message_time.timestamp());
             message.source_conversation_id = conversation.to_string();
             manager.write_message_internal(&message).unwrap();
             let conversation_id = manager
@@ -2176,6 +2154,41 @@ mod tests {
             ["2026-08-01", "2026-08-30"]
         );
         assert!(summaries.iter().all(|s| s.summary_text == "conversation"));
+        // 共用入口还应排除原始消息窗口之后的摘要，且无消息时不显示摘要。
+        let now = Local
+            .with_ymd_and_hms(2026, 8, 31, 12, 0, 0)
+            .single()
+            .unwrap();
+        let context = crate::chat_history::load_chat_history_context(
+            &manager,
+            "test",
+            "conversation",
+            10,
+            now,
+            true,
+        )
+        .unwrap();
+        assert_eq!(context.window.messages.len(), 1);
+        assert_eq!(context.summaries, summaries[..1]);
+        let empty = crate::chat_history::load_chat_history_context(
+            &manager, "test", "missing", 10, now, true,
+        )
+        .unwrap();
+        assert!(empty.window.messages.is_empty() && empty.summaries.is_empty());
+        let disabled = crate::chat_history::load_chat_history_context(
+            &manager,
+            "test",
+            "conversation",
+            10,
+            now,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            disabled.window.messages.len(),
+            context.window.messages.len()
+        );
+        assert!(disabled.summaries.is_empty());
         assert_eq!(
             manager
                 .get_conversation_daily_summaries_between(
@@ -2191,18 +2204,18 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
-    // 数据库按本地时间凌晨 03:00 切分统计日，边界前后必须落入不同日期。
+    // 验证零点分日、正文与次日参考时段隔离，以及三点参考终点不包含。
     #[test]
-    fn pending_daily_summaries_split_at_three_am() {
+    fn pending_daily_summaries_split_at_midnight() {
         let path = temporary_db_path();
         let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
         let before_boundary = Local
-            .with_ymd_and_hms(2026, 8, 10, 2, 59, 0)
+            .with_ymd_and_hms(2026, 8, 9, 23, 59, 59)
             .single()
             .unwrap()
             .timestamp();
         let at_boundary = Local
-            .with_ymd_and_hms(2026, 8, 10, 3, 0, 0)
+            .with_ymd_and_hms(2026, 8, 10, 0, 0, 0)
             .single()
             .unwrap()
             .timestamp();
@@ -2222,6 +2235,37 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].summary_date, "2026-08-09");
         assert_eq!(pending[1].summary_date, "2026-08-10");
+
+        let conversation_id = pending[0].conversation_id;
+        let reference_end = Local
+            .with_ymd_and_hms(2026, 8, 10, 3, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        manager
+            .write_message_internal(&test_message("message-3", "参考末秒", reference_end - 1))
+            .unwrap();
+        manager
+            .write_message_internal(&test_message("message-4", "三点整", reference_end))
+            .unwrap();
+        let day = manager
+            .get_daily_summary_source_messages(conversation_id, "2026-08-09")
+            .unwrap();
+        assert_eq!(day.len(), 1);
+        assert_eq!(day[0].event_timestamp, before_boundary);
+        let reference = manager
+            .get_summary_messages_in_period(conversation_id, at_boundary, reference_end)
+            .unwrap();
+        assert_eq!(reference.len(), 2);
+        assert_eq!(reference[0].event_timestamp, at_boundary);
+        assert_eq!(reference[1].event_timestamp, reference_end - 1);
+        assert_eq!(
+            manager
+                .get_daily_summary_source_messages(conversation_id, "2026-08-10")
+                .unwrap()
+                .len(),
+            3
+        );
 
         drop(manager);
         fs::remove_file(path).unwrap();

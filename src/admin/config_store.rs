@@ -25,6 +25,8 @@ pub struct AdminAppConfig {
     pub web_search_model_name: String,
     pub visual_model_name: String,
     pub max_history_messages: u32,
+    #[serde(default)]
+    pub history_summary_enabled: bool,
     pub startup_history_fetch_count: u32,
     pub vision_image_message_window: usize,
     pub ai_request_retry_count: u32,
@@ -79,6 +81,7 @@ impl AdminConfigView {
                 web_search_model_name: config.app.web_search_model_name.clone(),
                 visual_model_name: config.app.visual_model_name.clone(),
                 max_history_messages: config.app.max_history_messages,
+                history_summary_enabled: config.app.history_summary_enabled,
                 startup_history_fetch_count: config.app.startup_history_fetch_count,
                 vision_image_message_window: config.app.vision_image_message_window,
                 ai_request_retry_count: config.app.ai_request_retry_count,
@@ -349,6 +352,7 @@ fn apply_app(document: &mut DocumentMut, app: &AdminAppConfig) {
     table["web_search_model_name"] = value(&app.web_search_model_name);
     table["visual_model_name"] = value(&app.visual_model_name);
     table["max_history_messages"] = value(i64::from(app.max_history_messages));
+    table["history_summary_enabled"] = value(app.history_summary_enabled);
     table["startup_history_fetch_count"] = value(i64::from(app.startup_history_fetch_count));
     table["vision_image_message_window"] = value(app.vision_image_message_window as i64);
     table["ai_request_retry_count"] = value(i64::from(app.ai_request_retry_count));

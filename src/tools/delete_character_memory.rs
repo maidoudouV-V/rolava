@@ -5,9 +5,12 @@ use serde_json::{json, Value};
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"删除当前会话的一条角色记忆。
-title 必须与提示词中显示的角色记忆标题完全一致，不要猜测或模糊匹配。
-仅当记忆已经失效且不再需要保留时调用此工具删除；需要修改内容或续期时，应使用 set_character_memory。"#;
+const DESCRIPTION: &str = r#"删除一条你在当前会话中不再需要保留的角色记忆。
+仅当记忆已经失效且没有后续价值，或确认与另一条保留的记忆重复时删除。
+事情已经完成不代表必须删除；如果这段经历仍有值得保留的意义，可以继续保留。
+需要纠正内容、补充进展或续期时，使用 set_character_memory，不要先删除再重建。
+title 必须原样使用当前角色记忆中显示的标题，不要猜测或模糊匹配。
+根据记忆所在的位置选择工具：当前角色记忆中的条目使用本工具；最近活跃用户中列出的个人记忆使用 delete_user_memory。"#;
 
 #[derive(Debug, Deserialize)]
 pub struct DeleteCharacterMemoryArgs {

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, TimeZone, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, TimeZone, Utc, Weekday};
 use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
 
@@ -13,7 +13,7 @@ use crate::repository::db_manager::{
     ChatMessage, NewConversationDailySummary, PendingDailySummary, QQChatContextManager,
 };
 
-const DAILY_BOUNDARY_HOUR: u32 = 3;
+const COMPRESSION_RUN_HOUR: u32 = 3;
 
 /// 按会话和统计日调用主模型，将已经结束的聊天记录压缩为长期摘要。
 pub struct HistoryCompressionService {
@@ -36,13 +36,14 @@ impl HistoryCompressionService {
         }
     }
 
-    /// 启动时立即补偿一次，之后始终等待到下一个本地时间 03:00。
+    /// 启动时若已启用，立即补偿今天之前的记录，之后在本地时间 03:00 执行。
     pub async fn run(self: Arc<Self>) {
-        info!(
-            boundary_hour = DAILY_BOUNDARY_HOUR,
-            "聊天记录压缩服务已启动"
-        );
-        self.run_and_log().await;
+        if !self.app_config.app.history_summary_enabled {
+            // 保持受主进程监管的任务存活，关闭摘要不应触发整个服务退出。
+            std::future::pending::<()>().await;
+        }
+        info!(run_hour = COMPRESSION_RUN_HOUR, "聊天记录压缩服务已启动");
+        self.run_and_log(true).await;
         loop {
             let now = Local::now();
             let next_run = match next_compression_run(now) {
@@ -56,12 +57,12 @@ impl HistoryCompressionService {
             let wait = (next_run - Local::now()).to_std().unwrap_or(Duration::ZERO);
             info!(next_run = %next_run.format("%Y-%m-%d %H:%M:%S"), "等待下次聊天记录压缩");
             sleep(wait).await;
-            self.run_and_log().await;
+            self.run_and_log(false).await;
         }
     }
 
-    async fn run_and_log(&self) {
-        match self.run_once(Local::now()).await {
+    async fn run_and_log(&self, immediate: bool) {
+        match self.run_once(Local::now(), immediate).await {
             Ok(stats) => info!(
                 pending = stats.pending,
                 inserted = stats.inserted,
@@ -72,8 +73,13 @@ impl HistoryCompressionService {
         }
     }
 
-    async fn run_once(&self, now: DateTime<Local>) -> Result<CompressionStats> {
-        let closed_before = last_closed_boundary(now)?.timestamp();
+    async fn run_once(&self, now: DateTime<Local>, immediate: bool) -> Result<CompressionStats> {
+        let closed_before = if immediate {
+            local_time(now.date_naive(), 0)?
+        } else {
+            last_closed_boundary(now)?
+        }
+        .timestamp();
         let tasks = self.db_manager.get_pending_daily_summaries(closed_before)?;
         let mut stats = CompressionStats {
             pending: tasks.len(),
@@ -107,12 +113,33 @@ impl HistoryCompressionService {
         if messages.is_empty() {
             return Ok(false);
         }
+        let (period_start, period_end) = summary_period(&task.summary_date)?;
+        let previous_date = period_start
+            .date_naive()
+            .pred_opt()
+            .context("无法计算前一天摘要日期")?
+            .format("%Y-%m-%d")
+            .to_string();
+        let previous_summaries = self.db_manager.get_conversation_daily_summaries_between(
+            task.conversation_id,
+            &previous_date,
+            &previous_date,
+        )?;
+        let following_messages = self.db_manager.get_summary_messages_in_period(
+            task.conversation_id,
+            period_end.timestamp(),
+            local_time(period_end.date_naive(), COMPRESSION_RUN_HOUR)?.timestamp(),
+        )?;
         let request_messages = build_summary_request(
             &self.app_config.prompt_config.chat_history_summary_prompt,
+            &task.summary_date,
             &messages,
+            previous_summaries
+                .first()
+                .map(|summary| summary.summary_text.as_str()),
+            &following_messages,
         )?;
         let summary_text = self.request_summary(&request_messages).await?;
-        let (period_start, period_end) = summary_period(&task.summary_date)?;
         // 消息已经按事件时间和 ID 排序，首尾 ID 必须反映实际总结输入的顺序。
         let source_first_message_id = messages.first().expect("消息列表已检查为非空").id;
         let source_last_message_id = messages.last().expect("消息列表已检查为非空").id;
@@ -184,15 +211,31 @@ fn completed_summary_text(response: ToolChatResponse) -> Result<String> {
 /// 生成固定的 system + 单个 user 请求，不混入普通聊天提示词或工具定义。
 fn build_summary_request(
     system_prompt: &str,
+    summary_date: &str,
     messages: &[ChatMessage],
+    previous_summary: Option<&str>,
+    following_messages: &[ChatMessage],
 ) -> Result<Vec<ToolChatMessage>> {
     let history = render_daily_messages(messages)?;
+    let mut content = format!("本次总结日期：{summary_date}（本地时间 00:00:00 至次日 00:00:00，不含终点）。只总结此日期内的内容。\n");
+    if let Some(summary) = previous_summary {
+        content.push_str(&format!(
+            "\n# 前一天摘要（仅供连贯性参考，不纳入本次摘要）\n{summary}\n"
+        ));
+    }
+    content.push_str(&format!("\n# 当天聊天记录（本次总结对象）\n{history}\n"));
+    if !following_messages.is_empty() {
+        content.push_str(&format!(
+            "\n# 次日 00:00～03:00 聊天记录（不含 03:00，仅供连贯性参考，不纳入本次摘要）\n{}\n",
+            render_daily_messages(following_messages)?
+        ));
+    }
     Ok(vec![
         ToolChatMessage::System {
             content: system_prompt.to_string(),
         },
         ToolChatMessage::User {
-            content: ToolChatUserContent::text(format!("需要压缩的聊天记录：\n{}", history)),
+            content: ToolChatUserContent::text(content),
         },
     ])
 }
@@ -218,18 +261,11 @@ fn render_daily_messages(messages: &[ChatMessage]) -> Result<String> {
     Ok(rendered)
 }
 
-/// 将平台时间戳映射到以本地时间 03:00 为起点的统计日期。
+/// 将平台时间戳映射到以本地时间 00:00 为起点的自然日。
 pub fn summary_date_for_timestamp(timestamp: i64) -> Result<String> {
     let utc = DateTime::<Utc>::from_timestamp(timestamp, 0).context("消息时间戳无效")?;
     let local = DateTime::<Local>::from(utc);
-    let date = if local.hour() < DAILY_BOUNDARY_HOUR {
-        local
-            .date_naive()
-            .pred_opt()
-            .context("无法计算消息所属的前一统计日")?
-    } else {
-        local.date_naive()
-    };
+    let date = local.date_naive();
     Ok(date.format("%Y-%m-%d").to_string())
 }
 
@@ -259,40 +295,43 @@ fn parse_summary_date(summary_date: &str) -> Result<NaiveDate> {
         .with_context(|| format!("摘要统计日期格式无效：{}", summary_date))
 }
 
-fn local_boundary(date: NaiveDate) -> Result<DateTime<Local>> {
+fn local_time(date: NaiveDate, hour: u32) -> Result<DateTime<Local>> {
     let naive = date
-        .and_hms_opt(DAILY_BOUNDARY_HOUR, 0, 0)
+        .and_hms_opt(hour, 0, 0)
         .context("无法构造聊天记录压缩时间")?;
     match Local.from_local_datetime(&naive) {
         LocalResult::Single(value) => Ok(value),
         LocalResult::Ambiguous(first, _) => Ok(first),
-        LocalResult::None => anyhow::bail!("本地时区不存在 {} 03:00", date),
+        LocalResult::None => anyhow::bail!("本地时区不存在 {} {:02}:00", date, hour),
     }
 }
 
-fn summary_period(summary_date: &str) -> Result<(DateTime<Local>, DateTime<Local>)> {
+pub(crate) fn summary_period(summary_date: &str) -> Result<(DateTime<Local>, DateTime<Local>)> {
     let date = parse_summary_date(summary_date)?;
     let next_date = date.succ_opt().context("无法计算摘要统计日终点")?;
-    Ok((local_boundary(date)?, local_boundary(next_date)?))
+    Ok((local_time(date, 0)?, local_time(next_date, 0)?))
 }
 
 fn last_closed_boundary(now: DateTime<Local>) -> Result<DateTime<Local>> {
     let today = now.date_naive();
-    let today_boundary = local_boundary(today)?;
-    if now >= today_boundary {
-        Ok(today_boundary)
+    let today_run = local_time(today, COMPRESSION_RUN_HOUR)?;
+    if now >= today_run {
+        local_time(today, 0)
     } else {
-        local_boundary(today.pred_opt().context("无法计算前一统计日")?)
+        local_time(today.pred_opt().context("无法计算前一统计日")?, 0)
     }
 }
 
 fn next_compression_run(now: DateTime<Local>) -> Result<DateTime<Local>> {
     let today = now.date_naive();
-    let today_boundary = local_boundary(today)?;
+    let today_boundary = local_time(today, COMPRESSION_RUN_HOUR)?;
     if now < today_boundary {
         Ok(today_boundary)
     } else {
-        local_boundary(today.succ_opt().context("无法计算下一统计日")?)
+        local_time(
+            today.succ_opt().context("无法计算下一统计日")?,
+            COMPRESSION_RUN_HOUR,
+        )
     }
 }
 
@@ -300,17 +339,19 @@ fn next_compression_run(now: DateTime<Local>) -> Result<DateTime<Local>> {
 mod tests {
     use chrono::{Local, TimeZone};
 
-    use super::summary_date_for_timestamp;
+    use super::{
+        last_closed_boundary, next_compression_run, summary_date_for_timestamp, summary_period,
+    };
 
-    // 验证凌晨三点是统计日唯一边界，边界前一分钟仍属于前一天。
+    // 验证自然日零点边界与凌晨三点执行时间互不混淆，重启也不会提前总结。
     #[test]
-    fn summary_day_changes_at_three_am() {
+    fn summary_day_changes_at_midnight_but_runs_at_three_am() {
         let before = Local
-            .with_ymd_and_hms(2026, 8, 25, 2, 59, 0)
+            .with_ymd_and_hms(2026, 8, 24, 23, 59, 59)
             .single()
             .unwrap();
         let boundary = Local
-            .with_ymd_and_hms(2026, 8, 25, 3, 0, 0)
+            .with_ymd_and_hms(2026, 8, 25, 0, 0, 0)
             .single()
             .unwrap();
 
@@ -321,6 +362,25 @@ mod tests {
         assert_eq!(
             summary_date_for_timestamp(boundary.timestamp()).unwrap(),
             "2026-08-25"
+        );
+        let run = Local
+            .with_ymd_and_hms(2026, 8, 25, 3, 0, 0)
+            .single()
+            .unwrap();
+        let (start, end) = summary_period("2026-08-24").unwrap();
+        assert_eq!(end, boundary);
+        assert_eq!(
+            last_closed_boundary(run - chrono::Duration::seconds(1)).unwrap(),
+            start
+        );
+        assert_eq!(last_closed_boundary(run).unwrap(), end);
+        assert_eq!(next_compression_run(boundary).unwrap(), run);
+        assert_eq!(
+            next_compression_run(run).unwrap(),
+            Local
+                .with_ymd_and_hms(2026, 8, 26, 3, 0, 0)
+                .single()
+                .unwrap()
         );
     }
 }

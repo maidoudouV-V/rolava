@@ -49,12 +49,13 @@ export class ConversationsController {
 
   async select(id) {
     this.selectedId = id; this.renderList();
+    this.detailData = null;
     const detail = document.getElementById("conversation-detail");
     detail.innerHTML = '<div class="empty detail-empty"><span class="spinner"></span>正在读取会话</div>';
     try {
       const [conversation, messages, users, characters, tasks] = await Promise.all([
         api.get(`/conversations/${id}`),
-        api.get(`/conversations/${id}/messages?limit=50`),
+        api.get(`/conversations/${id}/messages`),
         api.get(`/conversations/${id}/user-memories`).catch(error => ({ users: [], error: error.message })),
         api.get(`/conversations/${id}/character-memories`),
         api.get(`/conversations/${id}/scheduled-tasks`),
@@ -86,9 +87,9 @@ export class ConversationsController {
   }
 
   messagesHtml() {
-    const items = this.detailData.messages.items;
-    if (!items.length) return '<div class="empty">暂无聊天记录</div>';
-    return `<div class="chat-list">${items.map(message => this.messageHtml(message)).join("")}</div>`;
+    const { items, summaries } = this.detailData.messages;
+    const summaryHtml = summaries.length ? `<section class="chat-summaries"><h3>已压缩的历史消息</h3>${summaries.map(summary => `<article><h4>${escapeHtml(summary.heading)}</h4><p>${escapeHtml(summary.content)}</p></article>`).join("")}</section>` : "";
+    return `${summaryHtml}<div class="panel-toolbar"><h3>当前聊天窗口消息 · ${items.length} 条</h3></div>${items.length ? `<div class="chat-list">${items.map(message => this.messageHtml(message)).join("")}</div>` : '<div class="empty">暂无聊天记录</div>'}`;
   }
 
   messageHtml(message) {
@@ -97,29 +98,33 @@ export class ConversationsController {
 
   async pollMessages() {
     const id = this.selectedId;
-    const messages = this.detailData?.messages?.items;
+    const detailData = this.detailData;
+    const messages = detailData?.messages;
     const messagesTabActive = document.querySelector('#conversation-detail [data-tab="messages"]')?.classList.contains("active");
     if (!api.token || document.hidden || !id || !messages || this.pollingMessages || !document.getElementById("page-conversations").classList.contains("active") || !messagesTabActive) return;
 
     this.pollingMessages = true;
     try {
-      const lastId = messages.length ? messages[messages.length - 1].id : 0;
-      const response = await api.get(`/conversations/${id}/messages?after_id=${lastId}&limit=100`);
-      if (this.selectedId !== id || !response.items.length) return;
+      const response = await api.get(`/conversations/${id}/messages`);
+      if (this.selectedId !== id || this.detailData !== detailData) return;
+      if (JSON.stringify(response) === JSON.stringify(messages)) return;
 
       const panel = document.querySelector('#conversation-detail [data-panel="messages"]');
       const body = document.querySelector("#conversation-detail .detail-body");
       const shouldFollow = body && body.scrollHeight - body.scrollTop - body.clientHeight < 80;
-      this.detailData.messages.items.push(...response.items);
-
-      let list = panel?.querySelector(".chat-list");
-      if (!list && panel) {
-        panel.innerHTML = '<div class="chat-list"></div>';
-        list = panel.firstElementChild;
+      const anchor = body && Array.from(panel?.querySelectorAll("[data-message-id]") || []).find(node => node.getBoundingClientRect().bottom > body.getBoundingClientRect().top);
+      const anchorTop = anchor?.getBoundingClientRect().top;
+      this.detailData.messages = response;
+      if (panel) panel.innerHTML = this.messagesHtml();
+      if (shouldFollow && body) {
+        body.scrollTop = body.scrollHeight;
+      } else if (anchor && body) {
+        const replacement = panel?.querySelector(`[data-message-id="${anchor.dataset.messageId}"]`);
+        if (replacement) body.scrollTop += replacement.getBoundingClientRect().top - anchorTop;
       }
-      if (list) list.insertAdjacentHTML("beforeend", response.items.map(message => this.messageHtml(message)).join(""));
-      if (shouldFollow && body) body.scrollTop = body.scrollHeight;
-      this.updateSelectedConversation(response.items[response.items.length - 1]);
+      const latest = response.items[response.items.length - 1];
+      const previousLatest = messages.items[messages.items.length - 1];
+      if (latest && JSON.stringify(latest) !== JSON.stringify(previousLatest)) this.updateSelectedConversation(latest);
     } catch (_) {
       // 短暂网络错误交给下一轮轮询恢复，鉴权失效仍由统一 API 客户端处理。
     } finally {

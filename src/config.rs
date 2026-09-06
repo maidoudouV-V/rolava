@@ -74,6 +74,9 @@ pub struct AppSection {
     pub prompt_dir: String,
     /// 发送给模型的最大历史消息数。
     pub max_history_messages: u32,
+    /// 是否生成并使用历史摘要；默认关闭，重启后生效。
+    #[serde(default)]
+    pub history_summary_enabled: bool,
     /// 程序启动时为每个群回填的最近历史消息数；0 表示关闭回填。
     #[serde(default = "default_startup_history_fetch_count")]
     pub startup_history_fetch_count: u32,

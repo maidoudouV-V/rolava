@@ -4,9 +4,9 @@ use serde_json::{json, Value};
 
 use super::{Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"结束查看实时聊天内容。
-降低查看群消息频率，不再实时查看每条聊天内容，只在群聊场景中生效。
-在当前聊天内容与你无关时调用。"#;
+const DESCRIPTION: &str = r#"当本轮无需发送聊天正文，也不再需要关注当前话题时，调用此工具结束本轮处理。
+在群聊中，调用后恢复常规消息筛选，不再持续将每条消息交给你处理；在私聊中，仅结束本轮处理。
+应在必要操作完成后单独调用，不同时输出正文，也不与其他工具一起调用。"#;
 
 pub struct EndConversationTool;
 

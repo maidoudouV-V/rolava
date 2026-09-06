@@ -9,11 +9,11 @@ use tokio::sync::OnceCell;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
-use crate::chat_history::render_history_message_line;
+use crate::chat_history::{load_chat_history_context, render_history_message_line};
 use crate::conversation_context::{ActiveToolHistory, RuntimeContextState, ToolRoundHistory};
 use crate::conversation_control::ConversationControl;
 use crate::conversation_trigger::{ConversationTrigger, ConversationTriggerSender};
-use crate::history_compression::{render_summary_date_heading, summary_date_for_timestamp};
+use crate::history_compression::render_summary_date_heading;
 use crate::memory::{CharacterMemorySession, UserMemorySession};
 use crate::message_enricher::MessageEnricher;
 use crate::repository::db_manager::{ChatMessage, ConversationDailySummary};
@@ -516,27 +516,16 @@ impl ChatProcessor {
             debug!(memory_count = deleted_memories, "已删除确认遗忘的角色记忆");
         }
         let supports_vision = self.services.app_config.chat_model_supports_vision();
-        let history_window = self.services.db_manager.get_conversation_history_window(
+        let history = load_chat_history_context(
+            &self.services.db_manager,
             &self.message_target.source,
             &self.message_target.conversation.id,
             self.services.app_config.app.max_history_messages,
+            Local::now(),
+            self.services.app_config.app.history_summary_enabled,
         )?;
-        let daily_summaries = match history_window.messages.first() {
-            Some(oldest_message) => {
-                let through_date = summary_date_for_timestamp(oldest_message.event_timestamp)?;
-                // 只注入最近 30 天的摘要，空缺日期不使用更早摘要补齐。
-                let from_date =
-                    summary_date_for_timestamp((Local::now() - chrono::Days::new(30)).timestamp())?;
-                self.services
-                    .db_manager
-                    .get_conversation_daily_summaries_between(
-                        oldest_message.conversation_id,
-                        &from_date,
-                        &through_date,
-                    )?
-            }
-            None => Vec::new(),
-        };
+        let history_window = history.window;
+        let daily_summaries = history.summaries;
         let message_ids = history_window
             .messages
             .iter()

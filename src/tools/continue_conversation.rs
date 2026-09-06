@@ -4,9 +4,9 @@ use serde_json::{json, Value};
 
 use super::{Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"继续查看后续对话。
-只在群聊场景中生效。
-当选择本轮对话不进行回复，但还要继续查看后续聊天内容时调用。"#;
+const DESCRIPTION: &str = r#"当本轮无需发送聊天正文，但仍需关注后续对话时，调用此工具结束本轮处理。
+在群聊中，调用后会继续将后续消息交给你处理；在私聊中，仅结束本轮处理。
+应在必要操作完成后单独调用，不同时输出正文，也不与其他工具一起调用。"#;
 
 pub struct ContinueConversationTool;
 

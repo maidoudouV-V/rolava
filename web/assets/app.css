@@ -154,6 +154,12 @@ label { display: grid; gap: 6px; color: #44524e; font-size: 12px; font-weight: 6
   .section-block { padding: 17px; }.table-wrap { margin: 0 -17px; padding: 0 17px; }
 }
 
+.chat-summaries { margin-bottom: 24px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; }
+.chat-summaries h3 { margin: 0 0 14px; font-size: 14px; }
+.chat-summaries article + article { margin-top: 16px; }
+.chat-summaries h4 { margin: 0 0 6px; color: var(--muted); font-size: 12px; }
+.chat-summaries p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
 @media (max-width: 430px) {
   .topbar strong { display: none; }.button { padding: 0 10px; }.topbar .button svg + * { display: none; }
   .metric-grid { grid-template-columns: 1fr; }.capabilities { grid-template-columns: 1fr; }
