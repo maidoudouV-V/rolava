@@ -175,13 +175,13 @@ impl Tool for WaitForReplyTool {
                         if let Err(error) =
                             trigger_sender.send_trigger(ConversationTrigger { user_prompt })
                         {
-                            error!(error = %error, "等待回复到期后触发会话失败");
+                            error!(error = %format!("{error:#}"), "等待回复到期后触发会话失败");
                         } else {
                             info!("等待回复到期，已触发会话");
                         }
                     }
                     Err(error) => {
-                        error!(error = %error, "检查目标是否在等待期间回复失败");
+                        error!(error = %format!("{error:#}"), "检查目标是否在等待期间回复失败");
                     }
                 }
             }

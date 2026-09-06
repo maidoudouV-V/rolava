@@ -13,8 +13,28 @@ pub(super) struct MemberProfile {
 
 #[derive(Deserialize)]
 struct OneBotResponse<T> {
+    #[serde(default)]
+    status: Option<String>,
     retcode: i32,
     data: Option<T>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    wording: Option<String>,
+}
+
+impl<T> OneBotResponse<T> {
+    fn error_detail(&self) -> &str {
+        self.wording
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                self.message
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            })
+            .unwrap_or("未提供错误详情")
+    }
 }
 
 #[derive(Deserialize)]
@@ -67,24 +87,46 @@ impl OneBotMemberProfileClient {
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                warn!(user_id, error = %error, "查询记忆成员资料失败");
+                warn!(user_id, error = %format!("{error:#}"), "查询记忆成员资料失败");
                 return None;
             }
         };
-        let result = match response
-            .json::<OneBotResponse<OneBotGroupMemberInfo>>()
-            .await
-        {
-            Ok(result) => result,
+        let http_status = response.status();
+        let response_text = match response.text().await {
+            Ok(text) => text,
             Err(error) => {
-                warn!(user_id, error = %error, "解析记忆成员资料失败");
+                warn!(user_id, error = %format!("{error:#}"), "读取记忆成员资料响应失败");
                 return None;
             }
         };
+        if !http_status.is_success() {
+            warn!(
+                user_id,
+                status = %http_status,
+                response = %response_text,
+                "查询记忆成员资料返回 HTTP 错误"
+            );
+            return None;
+        }
+        let result =
+            match serde_json::from_str::<OneBotResponse<OneBotGroupMemberInfo>>(&response_text) {
+                Ok(result) => result,
+                Err(error) => {
+                    warn!(
+                        user_id,
+                        response = %response_text,
+                        error = %format!("{error:#}"),
+                        "解析记忆成员资料失败"
+                    );
+                    return None;
+                }
+            };
         if result.retcode != 0 {
             warn!(
                 user_id,
+                status = result.status.as_deref().unwrap_or("<missing>"),
                 retcode = result.retcode,
+                error = result.error_detail(),
                 "查询记忆成员资料返回错误"
             );
             return None;

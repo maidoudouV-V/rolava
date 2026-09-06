@@ -35,7 +35,7 @@ impl StartupHistorySyncService {
     /// 同步失败不能阻止机器人启动，具体失败原因记录到日志。
     pub async fn run(&self, history_before_timestamp: i64) {
         if let Err(error) = self.sync(history_before_timestamp).await {
-            warn!(error = %error, "启动群历史同步失败，继续启动其它服务");
+            warn!(error = %format!("{error:#}"), "启动群历史同步失败，继续启动其它服务");
         }
     }
 
@@ -57,7 +57,7 @@ impl StartupHistorySyncService {
             {
                 Ok(group_inserted_count) => inserted_count += group_inserted_count,
                 Err(error) => {
-                    warn!(group_id, error = %error, "同步单个群历史失败");
+                    warn!(group_id, error = %format!("{error:#}"), "同步单个群历史失败");
                 }
             }
         }

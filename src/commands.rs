@@ -131,7 +131,7 @@ impl CommandSystem {
                 Some(output)
             }
             Err(error) => {
-                warn!(command = command.name(), error = %error, "命令执行失败");
+                warn!(command = command.name(), error = %format!("{error:#}"), "命令执行失败");
                 Some(CommandOutput::reply(format!("命令执行失败：{}", error)))
             }
         }
@@ -148,7 +148,7 @@ impl CommandSystem {
             .send_transient_text(target, reply)
             .await
         {
-            error!(error = %error, "发送命令反馈失败");
+            error!(error = %format!("{error:#}"), "发送命令反馈失败");
         }
     }
 

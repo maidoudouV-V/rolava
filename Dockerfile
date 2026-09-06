@@ -22,6 +22,8 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /build/target/release/rolava /usr/local/bin/rolava
+COPY --from=builder /build/web /app/web
+COPY --from=builder /build/prompt /app/prompt
 
 RUN chmod +x /usr/local/bin/rolava
 

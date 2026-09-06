@@ -123,7 +123,7 @@ impl MessageEnricher {
                 }
                 Ok(None) => Self::image_enrichment_failure_text(is_file, &placeholder),
                 Err(err) => {
-                    warn!(error = %err, "图片增强失败");
+                    warn!(error = %format!("{err:#}"), "图片增强失败");
                     Self::image_enrichment_failure_text(is_file, &placeholder)
                 }
             };
@@ -153,7 +153,7 @@ impl MessageEnricher {
             ) {
                 Ok(context_text) => context_text,
                 Err(err) => {
-                    warn!(error = %err, "还原回复原消息失败");
+                    warn!(error = %format!("{err:#}"), "还原回复原消息失败");
                     REPLY_MESSAGE_PLACEHOLDER.to_string()
                 }
             };
@@ -297,7 +297,7 @@ impl MessageEnricher {
             if let Err(err) =
                 Self::process_description_job(&app_config, &db_manager, &image_id).await
             {
-                warn!(image_id, error = %err, "后台图片描述失败");
+                warn!(image_id, error = %format!("{err:#}"), "后台图片描述失败");
             }
         }
         warn!("后台图片描述队列已停止");
@@ -385,7 +385,7 @@ impl MessageEnricher {
         };
         if let Err(err) = self.db_manager.insert_received_image(&image) {
             if let Err(remove_err) = fs::remove_file(&local_path).await {
-                warn!(path = %local_path, error = %remove_err, "清理未入库图片文件失败");
+                warn!(path = %local_path, error = %format!("{remove_err:#}"), "清理未入库图片文件失败");
             }
             // 其它会话可能刚好先写入了同一图片，冲突后直接复用其稳定图片 ID。
             if let Some(record) = self.db_manager.get_received_image_by_hash(&content_hash)? {
@@ -494,7 +494,7 @@ impl MessageEnricher {
             {
                 Ok(description) => return Ok(Self::sanitize_description(&description)),
                 Err(err) => {
-                    warn!(attempt, max_attempts, error = %err, "图片识别 API 请求失败");
+                    warn!(attempt, max_attempts, error = %format!("{err:#}"), "图片识别 API 请求失败");
                     last_error = Some(err);
                 }
             }
