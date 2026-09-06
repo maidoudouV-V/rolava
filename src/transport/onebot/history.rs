@@ -176,11 +176,21 @@ impl OneBotHttpServer {
             .with_context(|| format!("读取 OneBot {} 响应失败", api_path))?;
         trace!(api_path, status = %http_status, response = %response_text, "OneBot 历史同步原始响应");
         if !http_status.is_success() {
-            bail!("OneBot {} 接口返回 HTTP {}", api_path, http_status);
+            bail!(
+                "OneBot {} 接口返回 HTTP {}，响应正文：{}",
+                api_path,
+                http_status,
+                response_text
+            );
         }
 
         let response: OneBotHistoryApiResponse<T> = serde_json::from_str(&response_text)
-            .with_context(|| format!("解析 OneBot {} 响应失败", api_path))?;
+            .with_context(|| {
+                format!(
+                    "解析 OneBot {} 响应失败，原始响应：{}",
+                    api_path, response_text
+                )
+            })?;
         if response.retcode != 0 || response.status != "ok" {
             let detail = response
                 .wording

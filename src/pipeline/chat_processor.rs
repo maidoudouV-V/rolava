@@ -176,7 +176,7 @@ impl ChatProcessor {
         {
             Ok(context) => context,
             Err(err) => {
-                error!(error = %err, "构造聊天上下文失败");
+                error!(error = %format!("{err:#}"), "构造聊天上下文失败");
                 return;
             }
         };
@@ -218,7 +218,7 @@ impl ChatProcessor {
             {
                 Ok(response) => response,
                 Err(err) => {
-                    error!(error = %err, "AI 请求最终失败");
+                    error!(error = %format!("{err:#}"), "AI 请求最终失败");
                     break;
                 }
             };
@@ -232,7 +232,7 @@ impl ChatProcessor {
                     .db_manager
                     .mark_messages_read(&built_context.unread_message_ids)
                 {
-                    error!(error = %err, "更新消息已读状态失败");
+                    error!(error = %format!("{err:#}"), "更新消息已读状态失败");
                 }
                 messages_marked_read = true;
             }
@@ -249,7 +249,7 @@ impl ChatProcessor {
                     Ok(sent_messages) => emitted_message_ids
                         .extend(sent_messages.into_iter().map(|message| message.database_id)),
                     Err(err) => {
-                        error!(error = %err, "发送 AI 回复失败")
+                        error!(error = %format!("{err:#}"), "发送 AI 回复失败")
                     }
                 }
             }
@@ -279,7 +279,7 @@ impl ChatProcessor {
                     .collect();
                 match ToolRoundHistory::new(assistant_message, tool_results) {
                     Ok(round) => tool_round_history.push(round),
-                    Err(error) => error!(error = %error, "保存内存工具轮次失败"),
+                    Err(error) => error!(error = %format!("{error:#}"), "保存内存工具轮次失败"),
                 }
                 break;
             }
@@ -345,7 +345,7 @@ impl ChatProcessor {
                 .collect::<Vec<_>>();
             match ToolRoundHistory::new(assistant_message.clone(), tool_result_messages.clone()) {
                 Ok(round) => tool_round_history.push(round),
-                Err(error) => error!(error = %error, "保存内存工具轮次失败"),
+                Err(error) => error!(error = %format!("{error:#}"), "保存内存工具轮次失败"),
             }
 
             if !Self::should_continue_tool_loop(&tool_results) {
@@ -372,7 +372,7 @@ impl ChatProcessor {
                         pending_expired_character_memory_ids = pending_ids;
                     }
                     Err(error) => {
-                        error!(error = %error, "刷新记忆提示词失败");
+                        error!(error = %format!("{error:#}"), "刷新记忆提示词失败");
                     }
                 }
             }
@@ -390,7 +390,7 @@ impl ChatProcessor {
                     debug!(memory_count = marked, "已确认展示本轮未续期的到期角色记忆");
                 }
                 Ok(_) => {}
-                Err(error) => error!(error = %error, "确认到期角色记忆展示状态失败"),
+                Err(error) => error!(error = %format!("{error:#}"), "确认到期角色记忆展示状态失败"),
             }
         }
 
@@ -414,10 +414,10 @@ impl ChatProcessor {
                         history
                     };
                     if let Err(error) = self.runtime_context.push_tool_history(history) {
-                        error!(error = %error, "追加内存工具历史失败");
+                        error!(error = %format!("{error:#}"), "追加内存工具历史失败");
                     }
                 }
-                Err(error) => error!(error = %error, "构造内存工具历史失败"),
+                Err(error) => error!(error = %format!("{error:#}"), "构造内存工具历史失败"),
             }
         }
     }
@@ -482,7 +482,7 @@ impl ChatProcessor {
                     return Ok(resp);
                 }
                 Err(err) => {
-                    warn!(attempt, max_attempts, error = %err, "AI 请求失败，准备重试");
+                    warn!(attempt, max_attempts, error = %format!("{err:#}"), "AI 请求失败，准备重试");
                     last_error = Some(err);
                 }
             }
@@ -767,11 +767,20 @@ impl ChatProcessor {
 
     /// 从消息富文本片段读取图片，并生成本轮请求使用的临时 data URL。
     async fn load_message_image_data_urls(&self, db_msg: &ChatMessage) -> Vec<String> {
-        let Ok(serde_json::Value::Array(parts)) =
-            serde_json::from_str::<serde_json::Value>(&db_msg.content_parts_json)
-        else {
-            warn!(message_id = db_msg.id, "解析消息图片片段失败");
-            return Vec::new();
+        let parts = match serde_json::from_str::<serde_json::Value>(&db_msg.content_parts_json) {
+            Ok(serde_json::Value::Array(parts)) => parts,
+            Ok(_) => {
+                warn!(message_id = db_msg.id, "消息图片片段不是 JSON 数组");
+                return Vec::new();
+            }
+            Err(error) => {
+                warn!(
+                    message_id = db_msg.id,
+                    error = %format!("{error:#}"),
+                    "解析消息图片片段失败"
+                );
+                return Vec::new();
+            }
         };
 
         let mut data_urls = Vec::new();
@@ -798,7 +807,7 @@ impl ChatProcessor {
                 Err(error) => warn!(
                     message_id = db_msg.id,
                     path = %local_path,
-                    error = %error,
+                    error = %format!("{error:#}"),
                     "读取聊天上下文图片失败，仅保留图片 ID"
                 ),
             }
@@ -889,7 +898,7 @@ impl ChatProcessor {
                 {
                     Ok(group_info) => group_info,
                     Err(error) => {
-                        warn!(error = %error, "查询群聊基础资料失败，仅显示群聊场景");
+                        warn!(error = %format!("{error:#}"), "查询群聊基础资料失败，仅显示群聊场景");
                         None
                     }
                 }

@@ -136,7 +136,7 @@ impl SchedulerService {
         let mut recovering_overdue_tasks = true;
         loop {
             if let Err(error) = self.process_due_tasks(recovering_overdue_tasks) {
-                error!(error = %error, "处理到期定时任务失败");
+                error!(error = %format!("{error:#}"), "处理到期定时任务失败");
                 tokio::select! {
                     _ = sleep(Duration::from_secs(SCHEDULER_ERROR_RETRY_SECONDS)) => {}
                     _ = self.schedule_changed.notified() => {}
@@ -149,7 +149,7 @@ impl SchedulerService {
             let next_run_at = match self.db_manager.next_scheduled_task_timestamp() {
                 Ok(next_run_at) => next_run_at,
                 Err(error) => {
-                    error!(error = %error, "读取下一条定时任务失败");
+                    error!(error = %format!("{error:#}"), "读取下一条定时任务失败");
                     sleep(Duration::from_secs(SCHEDULER_ERROR_RETRY_SECONDS)).await;
                     continue;
                 }

@@ -211,7 +211,7 @@ async fn run_worker() -> Result<WorkerExit> {
 
     // 启动时读取一次完整群列表，后续管理页面只使用这份运行时缓存。
     if let Err(error) = qq_receive_server.fetch_group_ids().await {
-        warn!(error = %error, "启动时加载群资料失败");
+        warn!(error = %format!("{error:#}"), "启动时加载群资料失败");
     }
     let history_before_timestamp = Utc::now().timestamp();
     StartupHistorySyncService::new(

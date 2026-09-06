@@ -78,7 +78,7 @@ impl ConversationFilter {
                 }),
                 Ok(None) => debug!("跳过已经入库的平台消息"),
                 Err(err) => {
-                    error!(error = %err, "写入聊天消息失败，不进入后续处理");
+                    error!(error = %format!("{err:#}"), "写入聊天消息失败，不进入后续处理");
                     continue;
                 }
             }
@@ -93,7 +93,7 @@ impl ConversationFilter {
         }
 
         if let Err(err) = self.update_filter_context(&accepted_messages) {
-            warn!(error = %err, "构造消息过滤上下文失败，继续主处理");
+            warn!(error = %format!("{err:#}"), "构造消息过滤上下文失败，继续主处理");
             return accepted_messages;
         }
 
@@ -133,7 +133,7 @@ impl ConversationFilter {
                 }
             }
             Err(err) => {
-                warn!(error = %err, "消息过滤模型请求失败，继续后续处理");
+                warn!(error = %format!("{err:#}"), "消息过滤模型请求失败，继续后续处理");
                 accepted_messages
             }
         }

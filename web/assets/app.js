@@ -108,6 +108,7 @@ async function saveConfig(restartAfterSave) {
       dirty = false;
       setSaveState("已保存，重启后生效", "saved");
       toast("配置已保存，重启 Rolava 后生效");
+      buttons.forEach(button => { button.disabled = false; });
     }
   } catch (error) {
     toast(error.message, true);

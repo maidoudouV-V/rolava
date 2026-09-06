@@ -80,7 +80,11 @@ impl OpenRouterProvider {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
             trace!(provider = "openrouter", status = %status, response = %error_text, "AI Provider 原始错误响应");
-            return Err(anyhow!("OpenRouter API 调用失败，状态码 {}", status));
+            return Err(anyhow!(
+                "OpenRouter API 调用失败，状态码 {}：{}",
+                status,
+                error_text
+            ));
         }
 
         let response_text = resp.text().await?;
@@ -433,7 +437,11 @@ impl AIProvider for OpenRouterProvider {
             let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
             trace!(provider = "openrouter", status = %status, response = %error_text, "视觉 Provider 原始错误响应");
-            return Err(anyhow!("OpenRouter 视觉 API 调用失败，状态码 {}", status));
+            return Err(anyhow!(
+                "OpenRouter 视觉 API 调用失败，状态码 {}：{}",
+                status,
+                error_text
+            ));
         }
 
         let response_text = resp.text().await?;

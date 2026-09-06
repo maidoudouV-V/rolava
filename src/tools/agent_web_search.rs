@@ -9,10 +9,13 @@ use crate::config::render_prompt_template;
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"启动一个新的互联网 Agent 查询内容。
+const DESCRIPTION: &str = r#"启动一个新的互联网 Agent 查询公开网络信息。
 输入你的问题，此工具会启用子 Agent 通过互联网查询并解决你的问题。
-当需要获取互联网实时信息时调用，工具暂时不提供图片搜索功能。
-请注意调用频率，只有确实需要连接互联网才能提供回答时才可使用。"#;
+仅在用户明确要求联网，或问题本身依赖实时、外部网络信息时调用。
+不得仅因自身不知道、不确定、无法判断或希望验证答案而调用此工具。
+是否使用互联网，应取决于用户的请求和信息需求，而不是模型自身的知识缺口。
+若无需联网也能正常完成对话，则不要调用此工具。
+"#;
 
 #[derive(Debug, Deserialize)]
 pub struct AgentWebSearchArgs {
@@ -90,7 +93,7 @@ impl Tool for AgentWebSearchTool {
             match search_result {
                 Ok(content) => return Ok(ToolOutput::text(content)),
                 Err(error) => {
-                    warn!(attempt, max_attempts, error = %error, "联网搜索 API 请求失败");
+                    warn!(attempt, max_attempts, error = %format!("{error:#}"), "联网搜索 API 请求失败");
                     last_error = Some(error);
                 }
             }

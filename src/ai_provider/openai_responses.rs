@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 use tracing::{debug, trace};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const WEB_SEARCH_CONTEXT_SIZE: &str = "medium";
 const RESPONSES_REPLAY_PROVIDER: &str = "openai_responses";
 
 /// OpenAI Responses API Provider。由应用管理完整上下文，不使用服务端会话存储。
@@ -78,7 +77,19 @@ impl OpenAIResponsesProvider {
             operation
         );
         if !status.is_success() {
-            bail!("OpenAI Responses API 调用失败，状态码 {}", status);
+            let detail = serde_json::from_str::<Value>(&response_text)
+                .ok()
+                .and_then(|body| {
+                    body.pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| response_text.chars().take(1000).collect());
+            bail!(
+                "OpenAI Responses API 调用失败，状态码 {}：{}",
+                status,
+                detail
+            );
         }
         parse_openai_responses_response(&response_text)
     }
@@ -128,13 +139,12 @@ struct OpenAIResponsesReasoning<'a> {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OpenAIResponsesTool<'a> {
+    WebSearch {},
     Function {
         name: &'a str,
         description: &'a str,
         parameters: &'a Value,
-    },
-    WebSearch {
-        search_context_size: &'static str,
+        strict: bool,
     },
 }
 
@@ -153,6 +163,7 @@ fn build_openai_responses_request<'a>(
                 name: tool.name,
                 description: tool.description,
                 parameters: &tool.parameters,
+                strict: false,
             })
             .collect()
     });
@@ -260,6 +271,17 @@ fn parse_openai_responses_response(response_text: &str) -> anyhow::Result<ToolCh
             .unwrap_or("未知错误");
         bail!("OpenAI Responses 生成失败：{}", message);
     }
+    if status.as_deref() != Some("completed") {
+        let reason = raw_response
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("未提供原因");
+        bail!(
+            "OpenAI Responses 生成未完成，状态：{:?}，原因：{}",
+            status,
+            reason
+        );
+    }
 
     let output = raw_response
         .get("output")
@@ -286,24 +308,21 @@ fn parse_openai_responses_response(response_text: &str) -> anyhow::Result<ToolCh
         }
     }
     let content = (!text_parts.is_empty()).then(|| text_parts.join("\n"));
-    if content.is_none() && tool_calls.is_empty() && status.as_deref() != Some("completed") {
+    if content.is_none() && tool_calls.is_empty() {
         bail!(
             "OpenAI Responses 响应既没有文本内容，也没有 function_call（状态：{:?}）",
             status
         );
     }
 
-    let finish_reason = match status.as_deref() {
-        Some("completed") if tool_calls.is_empty() => Some("stop".to_string()),
-        Some("completed") => Some("tool_calls".to_string()),
-        Some("incomplete") => raw_response
-            .pointer("/incomplete_details/reason")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| Some("incomplete".to_string())),
-        Some(other) => Some(other.to_string()),
-        None => None,
-    };
+    let finish_reason = Some(
+        if tool_calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        }
+        .to_string(),
+    );
     let usage = raw_response.get("usage").map(|usage| ChatUsage {
         prompt_tokens: usage.get("input_tokens").and_then(Value::as_u64),
         completion_tokens: usage.get("output_tokens").and_then(Value::as_u64),
@@ -451,12 +470,23 @@ impl AIProvider for OpenAIResponsesProvider {
             &[],
             None,
         );
-        body.tools = Some(vec![OpenAIResponsesTool::WebSearch {
-            search_context_size: WEB_SEARCH_CONTEXT_SIZE,
-        }]);
-        body.tool_choice = Some("auto");
-        self.send_request(&body, "联网搜索 Provider ")
-            .await?
+        body.tools = Some(vec![OpenAIResponsesTool::WebSearch {}]);
+        body.tool_choice = Some("required");
+        let response = self.send_request(&body, "联网搜索 Provider ").await?;
+        let searched = response
+            .raw_response
+            .get("output")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("web_search_call")
+                        && item.get("status").and_then(Value::as_str) == Some("completed")
+                })
+            });
+        if !searched {
+            bail!("OpenAI Responses 未返回已完成的联网搜索调用");
+        }
+        response
             .content
             .filter(|content| !content.trim().is_empty())
             .ok_or_else(|| anyhow!("OpenAI Responses 联网搜索响应内容为空"))
@@ -466,6 +496,24 @@ impl AIProvider for OpenAIResponsesProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 即使携带可解析的正文和工具参数，未完成的响应也不能进入发送或执行流程。
+    #[test]
+    fn rejects_incomplete_output_before_exposing_text_or_tools() {
+        let error = parse_openai_responses_response(
+            r#"{
+            "status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "output":[
+                {"type":"message","content":[{"type":"output_text","text":"未写完的回复"}]},
+                {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}
+            ]
+        }"#,
+        )
+        .err()
+        .expect("未完成响应必须返回错误");
+        assert!(error.to_string().contains("max_output_tokens"));
+    }
 
     // 验证响应解析后，加密推理和工具调用能完整回传并衔接对应的工具结果。
     #[test]

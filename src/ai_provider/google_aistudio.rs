@@ -297,7 +297,11 @@ impl GoogleAIStudioProvider {
         let response_text = resp.text().await?;
         trace!(provider = "google_aistudio", status = %status, response = %response_text, "AI Provider 原始响应");
         if !status.is_success() {
-            return Err(anyhow!("Google AI Studio API 调用失败，状态码 {}", status));
+            return Err(anyhow!(
+                "Google AI Studio API 调用失败，状态码 {}：{}",
+                status,
+                response_text
+            ));
         }
 
         Ok(response_text)

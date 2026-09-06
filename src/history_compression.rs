@@ -56,7 +56,7 @@ impl HistoryCompressionService {
             let next_run = match next_compression_run(now) {
                 Ok(value) => value,
                 Err(error) => {
-                    error!(error = %error, "计算下次聊天记录压缩时间失败");
+                    error!(error = %format!("{error:#}"), "计算下次聊天记录压缩时间失败");
                     sleep(Duration::from_secs(60)).await;
                     continue;
                 }
@@ -76,7 +76,7 @@ impl HistoryCompressionService {
                 failed = stats.failed,
                 "聊天记录压缩完成"
             ),
-            Err(error) => error!(error = %error, "扫描待压缩聊天记录失败"),
+            Err(error) => error!(error = %format!("{error:#}"), "扫描待压缩聊天记录失败"),
         }
     }
 
@@ -110,7 +110,7 @@ impl HistoryCompressionService {
                         source = %task.source,
                         conversation_id = %task.source_conversation_id,
                         summary_date = %task.summary_date,
-                        error = %error,
+                        error = %format!("{error:#}"),
                         "聊天记录压缩失败，保留到下次重试"
                     );
                 }
@@ -198,7 +198,7 @@ impl HistoryCompressionService {
             match result.and_then(completed_summary_text) {
                 Ok(content) => return Ok(content),
                 Err(error) => {
-                    warn!(attempt, max_attempts, error = %error, "聊天记录压缩请求失败，准备重试");
+                    warn!(attempt, max_attempts, error = %format!("{error:#}"), "聊天记录压缩请求失败，准备重试");
                     last_error = Some(error);
                 }
             }

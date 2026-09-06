@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::config::AppConfig;
 use crate::repository::db_manager::{ChatMessage, QQChatContextManager};
@@ -374,8 +375,23 @@ impl UserMemorySession {
     }
 
     fn stored_message_mentions(message: &ChatMessage, bot_id: &str) -> Vec<String> {
-        let Ok(Value::Array(parts)) = serde_json::from_str(&message.content_parts_json) else {
-            return Vec::new();
+        let parts = match serde_json::from_str::<Value>(&message.content_parts_json) {
+            Ok(Value::Array(parts)) => parts,
+            Ok(_) => {
+                warn!(
+                    message_id = message.id,
+                    "用户记忆读取的消息片段不是 JSON 数组"
+                );
+                return Vec::new();
+            }
+            Err(error) => {
+                warn!(
+                    message_id = message.id,
+                    error = %format!("{error:#}"),
+                    "用户记忆解析消息片段失败"
+                );
+                return Vec::new();
+            }
         };
         parts
             .iter()

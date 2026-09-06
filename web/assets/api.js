@@ -1,8 +1,27 @@
 const TOKEN_KEY = "rolava.admin.token";
+const TOKEN_EXPIRES_AT_KEY = "rolava.admin.token.expiresAt";
+const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 class AdminApi {
-  get token() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
-  set token(value) { value ? sessionStorage.setItem(TOKEN_KEY, value) : sessionStorage.removeItem(TOKEN_KEY); }
+  get token() {
+    const token = localStorage.getItem(TOKEN_KEY) || "";
+    const expiresAt = Number(localStorage.getItem(TOKEN_EXPIRES_AT_KEY));
+    if (!token || !Number.isFinite(expiresAt) || Date.now() >= expiresAt) {
+      this.token = "";
+      return "";
+    }
+    return token;
+  }
+
+  set token(value) {
+    if (value) {
+      localStorage.setItem(TOKEN_KEY, value);
+      localStorage.setItem(TOKEN_EXPIRES_AT_KEY, String(Date.now() + TOKEN_TTL_MS));
+      return;
+    }
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(TOKEN_EXPIRES_AT_KEY);
+  }
 
   async request(path, options = {}) {
     const headers = new Headers(options.headers || {});

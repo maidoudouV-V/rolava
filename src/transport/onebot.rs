@@ -906,10 +906,36 @@ struct OneBotGetMessageData {
 /// OneBot API 通用响应。
 #[derive(Deserialize, Debug)]
 struct OneBotApiResponse<T> {
+    /// OneBot 返回的业务状态。
+    #[serde(default)]
+    status: Option<String>,
     /// 状态码，0 通常表示成功。
     retcode: i32,
     /// API 返回数据。
     data: Option<T>,
+    /// OneBot 返回的错误说明。
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    wording: Option<String>,
+}
+
+impl<T> OneBotApiResponse<T> {
+    fn error_detail(&self) -> &str {
+        self.wording
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                self.message
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            })
+            .unwrap_or("未提供错误详情")
+    }
+
+    fn status_text(&self) -> &str {
+        self.status.as_deref().unwrap_or("<missing>")
+    }
 }
 
 /// OneBot 群成员信息响应数据。
@@ -943,6 +969,7 @@ pub struct OneBotMessageSender {
     db_manager: Arc<QQChatContextManager>,
     runtime_state: Arc<RuntimeState>,
     reply_delay_random_max_secs: f64,
+    send_max_attempts: u32,
 }
 
 impl OneBotMessageSender {
@@ -962,6 +989,7 @@ impl OneBotMessageSender {
             db_manager,
             runtime_state,
             reply_delay_random_max_secs: config.app.reply_delay_random_max_secs,
+            send_max_attempts: config.app.ai_request_max_attempts(),
         }
     }
 
@@ -1051,10 +1079,8 @@ impl OneBotMessageSender {
     ) -> Result<(&'static str, OneBotActionResponse<OneBotSendMessageData>)> {
         let (api_path, conversation_kind, payload) = Self::request_parts(target, message);
         trace!(api_path, payload = %payload, "OneBot 发送消息完整请求");
-        let mut request = self
-            .client
-            .post(format!("{}/{}", self.onebot_api_url, api_path))
-            .json(&payload);
+        let request_url = format!("{}/{}", self.onebot_api_url, api_path);
+        let mut request = self.client.post(&request_url).json(&payload);
         if let Some(token) = &self.onebot_token {
             request = request.header(AUTHORIZATION, format!("Bearer {}", token));
         }
@@ -1062,16 +1088,21 @@ impl OneBotMessageSender {
         let response = request
             .send()
             .await
-            .context("调用 OneBot 发送消息接口失败")?;
+            .with_context(|| format!("调用 OneBot 发送消息接口失败，url={request_url}"))?;
         let http_status = response.status();
         let response_text = response.text().await.context("读取 OneBot 发送响应失败")?;
         trace!(status = %http_status, response = %response_text, "OneBot 发送消息原始响应");
         if !http_status.is_success() {
-            bail!("OneBot 发送消息接口返回 HTTP {}", http_status);
+            bail!(
+                "OneBot 发送消息接口返回 HTTP {}，响应正文：{}",
+                http_status,
+                response_text
+            );
         }
 
         let response: OneBotActionResponse<OneBotSendMessageData> =
-            serde_json::from_str(&response_text).context("解析 OneBot 发送响应失败")?;
+            serde_json::from_str(&response_text)
+                .with_context(|| format!("解析 OneBot 发送响应失败，原始响应：{response_text}"))?;
         if response.status != "ok" || response.retcode != 0 {
             bail!(
                 "OneBot 发送消息失败，status={}，retcode={}：{}",
@@ -1081,6 +1112,33 @@ impl OneBotMessageSender {
             );
         }
         Ok((conversation_kind, response))
+    }
+
+    /// 只重试平台请求；平台确认后的数据库写入失败不能重试发送，以免产生重复消息。
+    async fn send_message_request_with_retry(
+        &self,
+        target: &MessageTarget,
+        message: Value,
+    ) -> Result<(&'static str, OneBotActionResponse<OneBotSendMessageData>)> {
+        let mut last_error = None;
+        for attempt in 1..=self.send_max_attempts {
+            match self.send_message_request(target, message.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    if attempt < self.send_max_attempts {
+                        warn!(
+                            attempt,
+                            max_attempts = self.send_max_attempts,
+                            conversation_id = %target.conversation.id,
+                            error = %format!("{error:#}"),
+                            "OneBot 消息发送失败，准备重试"
+                        );
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.expect("OneBot 消息发送重试循环至少应执行一次"))
     }
 
     fn response_message_id(
@@ -1175,11 +1233,17 @@ impl OneBotMessageSender {
             .context("读取 OneBot get_msg 响应失败")?;
         trace!(status = %http_status, response = %response_text, "OneBot get_msg 原始响应");
         if !http_status.is_success() {
-            bail!("OneBot get_msg 接口返回 HTTP {}", http_status);
+            bail!(
+                "OneBot get_msg 接口返回 HTTP {}，响应正文：{}",
+                http_status,
+                response_text
+            );
         }
 
         let response: OneBotActionResponse<OneBotGetMessageData> =
-            serde_json::from_str(&response_text).context("解析 OneBot get_msg 响应失败")?;
+            serde_json::from_str(&response_text).with_context(|| {
+                format!("解析 OneBot get_msg 响应失败，原始响应：{response_text}")
+            })?;
         if response.status != "ok" || response.retcode != 0 {
             bail!(
                 "OneBot get_msg 返回错误，status={}，retcode={}：{}",
@@ -1228,7 +1292,7 @@ impl OneBotMessageSender {
         persist: bool,
     ) -> Result<Option<SentMessage>> {
         let (conversation_kind, response) = self
-            .send_message_request(target, Value::String(text.to_string()))
+            .send_message_request_with_retry(target, Value::String(text.to_string()))
             .await?;
 
         if !persist {
@@ -1265,10 +1329,8 @@ impl MessageSender for OneBotMessageSender {
         let payload = serde_json::json!({
             "group_id": target.conversation.id,
         });
-        let mut request = self
-            .client
-            .post(format!("{}/get_group_info", self.onebot_api_url))
-            .json(&payload);
+        let request_url = format!("{}/get_group_info", self.onebot_api_url);
+        let mut request = self.client.post(&request_url).json(&payload);
         if let Some(token) = &self.onebot_token {
             request = request.header(AUTHORIZATION, format!("Bearer {}", token));
         }
@@ -1276,17 +1338,30 @@ impl MessageSender for OneBotMessageSender {
         let response = request
             .send()
             .await
-            .context("调用 OneBot get_group_info 失败")?;
+            .with_context(|| format!("调用 OneBot get_group_info 失败，url={request_url}"))?;
         let status = response.status();
-        if !status.is_success() {
-            bail!("OneBot get_group_info 返回 HTTP {}", status);
-        }
-        let result = response
-            .json::<OneBotApiResponse<OneBotGroupInfoDto>>()
+        let response_text = response
+            .text()
             .await
-            .context("解析 OneBot get_group_info 响应失败")?;
+            .context("读取 OneBot get_group_info 响应失败")?;
+        if !status.is_success() {
+            bail!(
+                "OneBot get_group_info 返回 HTTP {}，响应正文：{}",
+                status,
+                response_text
+            );
+        }
+        let result: OneBotApiResponse<OneBotGroupInfoDto> = serde_json::from_str(&response_text)
+            .with_context(|| {
+                format!("解析 OneBot get_group_info 响应失败，原始响应：{response_text}")
+            })?;
         if result.retcode != 0 {
-            bail!("OneBot get_group_info 返回错误码 {}", result.retcode);
+            bail!(
+                "OneBot get_group_info 返回错误，status={}，retcode={}：{}",
+                result.status_text(),
+                result.retcode,
+                result.error_detail()
+            );
         }
         Ok(result.data.map(|group| {
             self.runtime_state.update_group(RuntimeGroupInfo {
@@ -1344,7 +1419,10 @@ impl MessageSender for OneBotMessageSender {
 
             let sent_message = self
                 .send_text_segment(target, &segment, true)
-                .await?
+                .await
+                .with_context(|| {
+                    format!("发送第 {}/{} 段文本失败", segment_index + 1, segment_count)
+                })?
                 .expect("持久化发送必须返回数据库消息");
             sent_messages.push(sent_message);
         }
@@ -1389,7 +1467,9 @@ impl MessageSender for OneBotMessageSender {
             "type": expression_type,
             "data": outgoing_data.clone()
         }]);
-        let (conversation_kind, response) = self.send_message_request(target, message).await?;
+        let (conversation_kind, response) = self
+            .send_message_request_with_retry(target, message)
+            .await?;
 
         let mut stored_data = outgoing_data;
         let mut context_text = fallback_text;
@@ -1412,7 +1492,7 @@ impl MessageSender for OneBotMessageSender {
                     }
                     Ok(None) => warn!(expression_type, "get_msg 未返回已发送的表情段"),
                     Err(error) => {
-                        warn!(expression_type, error = %error, "查询已发送表情结果失败")
+                        warn!(expression_type, error = %format!("{error:#}"), "查询已发送表情结果失败")
                     }
                 }
             } else {
@@ -1700,22 +1780,48 @@ impl OneBotHttpServer {
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                warn!(user_id, error = %error, "查询用户信息失败");
+                warn!(user_id, error = %format!("{error:#}"), "查询用户信息失败");
                 return None;
             }
         };
-        let result = match response
-            .json::<OneBotApiResponse<OneBotUserInfoDto>>()
-            .await
-        {
-            Ok(result) => result,
+        let http_status = response.status();
+        let response_text = match response.text().await {
+            Ok(text) => text,
             Err(error) => {
-                warn!(user_id, error = %error, "解析用户信息失败");
+                warn!(user_id, error = %format!("{error:#}"), "读取用户信息响应失败");
                 return None;
             }
         };
+        if !http_status.is_success() {
+            warn!(
+                user_id,
+                status = %http_status,
+                response = %response_text,
+                "查询用户信息返回 HTTP 错误"
+            );
+            return None;
+        }
+        let result =
+            match serde_json::from_str::<OneBotApiResponse<OneBotUserInfoDto>>(&response_text) {
+                Ok(result) => result,
+                Err(error) => {
+                    warn!(
+                        user_id,
+                        response = %response_text,
+                        error = %format!("{error:#}"),
+                        "解析用户信息失败"
+                    );
+                    return None;
+                }
+            };
         if result.retcode != 0 {
-            warn!(user_id, retcode = result.retcode, "查询用户信息返回错误");
+            warn!(
+                user_id,
+                status = result.status_text(),
+                retcode = result.retcode,
+                error = result.error_detail(),
+                "查询用户信息返回错误"
+            );
             return None;
         }
 
@@ -1744,17 +1850,40 @@ impl OneBotHttpServer {
         let resp = match request.send().await {
             Ok(resp) => resp,
             Err(err) => {
-                warn!(group_id, user_id, error = %err, "查询群成员信息失败");
+                warn!(group_id, user_id, error = %format!("{err:#}"), "查询群成员信息失败");
                 return None;
             }
         };
-        let result = match resp
-            .json::<OneBotApiResponse<OneBotGroupMemberInfoDto>>()
-            .await
-        {
+        let http_status = resp.status();
+        let response_text = match resp.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                warn!(group_id, user_id, error = %format!("{error:#}"), "读取群成员信息响应失败");
+                return None;
+            }
+        };
+        if !http_status.is_success() {
+            warn!(
+                group_id,
+                user_id,
+                status = %http_status,
+                response = %response_text,
+                "查询群成员信息返回 HTTP 错误"
+            );
+            return None;
+        }
+        let result = match serde_json::from_str::<OneBotApiResponse<OneBotGroupMemberInfoDto>>(
+            &response_text,
+        ) {
             Ok(result) => result,
             Err(err) => {
-                warn!(group_id, user_id, error = %err, "解析群成员信息失败");
+                warn!(
+                    group_id,
+                    user_id,
+                    response = %response_text,
+                    error = %format!("{err:#}"),
+                    "解析群成员信息失败"
+                );
                 return None;
             }
         };
@@ -1762,7 +1891,9 @@ impl OneBotHttpServer {
             warn!(
                 group_id,
                 user_id,
+                status = result.status_text(),
                 retcode = result.retcode,
+                error = result.error_detail(),
                 "查询群成员信息返回错误"
             );
             return None;

@@ -54,7 +54,7 @@ impl ResourceCleanupService {
                     failed = stats.failed,
                     "过期资源清理完成"
                 ),
-                Err(error) => error!(error = %error, "过期资源清理失败"),
+                Err(error) => error!(error = %format!("{error:#}"), "过期资源清理失败"),
             }
         }
     }
@@ -80,7 +80,7 @@ impl ResourceCleanupService {
                 warn!(
                     image_id = %image.image_id,
                     path = %image.local_path,
-                    error = %error,
+                    error = %format!("{error:#}"),
                     "删除过期图片文件失败，保留数据库记录"
                 );
                 continue;
@@ -97,7 +97,7 @@ impl ResourceCleanupService {
                 }
                 Err(error) => {
                     stats.failed += 1;
-                    error!(image_id = %image.image_id, error = %error, "删除过期图片数据库记录失败");
+                    error!(image_id = %image.image_id, error = %format!("{error:#}"), "删除过期图片数据库记录失败");
                 }
             }
         }
