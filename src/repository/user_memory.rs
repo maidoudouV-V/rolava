@@ -11,6 +11,7 @@ pub struct UserMemoryRecord {
     pub memory_id: String,
     /// 记忆正文。
     pub content: String,
+    pub updated_at: i64,
 }
 
 /// 管理页面批量读取时携带所属 QQ 号。
@@ -110,7 +111,7 @@ impl QQChatContextManager {
         let connection = self.conn_pool.get()?;
         let mut statement = connection.prepare(
             "
-            SELECT memory_id, content
+            SELECT memory_id, content, updated_at
             FROM user_memories
             WHERE source = ?1 AND bot_id = ?2 AND user_id = ?3
             ORDER BY id DESC
@@ -121,6 +122,7 @@ impl QQChatContextManager {
                 Ok(UserMemoryRecord {
                     memory_id: row.get(0)?,
                     content: row.get(1)?,
+                    updated_at: row.get(2)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

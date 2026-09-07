@@ -2,7 +2,7 @@ mod agent_web_search;
 mod continue_conversation;
 mod create_scheduled_task;
 mod create_user_memory;
-mod delete_character_memory;
+mod delete_group_memory;
 mod delete_scheduled_task;
 mod delete_user_memory;
 mod end_conversation;
@@ -10,7 +10,7 @@ mod get_scheduled_task;
 mod registry;
 mod send_message;
 mod send_qq_expression;
-mod set_character_memory;
+mod set_group_memory;
 mod update_scheduled_task;
 mod update_user_memory;
 mod wait_for_reply;
@@ -19,14 +19,14 @@ pub use agent_web_search::AgentWebSearchTool;
 pub use continue_conversation::ContinueConversationTool;
 pub use create_scheduled_task::CreateScheduledTaskTool;
 pub use create_user_memory::CreateUserMemoryTool;
-pub use delete_character_memory::DeleteCharacterMemoryTool;
+pub use delete_group_memory::DeleteGroupMemoryTool;
 pub use delete_scheduled_task::DeleteScheduledTaskTool;
 pub use delete_user_memory::DeleteUserMemoryTool;
 pub use end_conversation::EndConversationTool;
 pub use get_scheduled_task::GetScheduledTaskTool;
 pub use registry::{OptionalToolDefinition, ToolRegistry};
 pub use send_qq_expression::SendQqExpressionTool;
-pub use set_character_memory::SetCharacterMemoryTool;
+pub use set_group_memory::SetGroupMemoryTool;
 pub use update_scheduled_task::UpdateScheduledTaskTool;
 pub use update_user_memory::UpdateUserMemoryTool;
 pub use wait_for_reply::WaitForReplyTool;
@@ -41,7 +41,7 @@ use std::sync::Arc;
 use crate::config::AppConfig;
 use crate::conversation_control::ConversationControl;
 use crate::conversation_trigger::ConversationTriggerSender;
-use crate::memory::{CharacterMemorySession, UserMemorySession};
+use crate::memory::{GroupMemorySession, UserMemorySession};
 use crate::repository::db_manager::QQChatContextManager;
 use crate::scheduler::SchedulerService;
 use crate::transport::message::{IncomingMessage, MessageTarget};
@@ -72,7 +72,7 @@ pub struct ConversationToolContext {
     pub current_messages: Vec<IncomingMessage>,
     pub control: Arc<ConversationControl>,
     pub trigger_sender: Arc<dyn ConversationTriggerSender>,
-    pub character_memory: Arc<CharacterMemorySession>,
+    pub group_memory: Arc<GroupMemorySession>,
     pub user_memory: Arc<UserMemorySession>,
 }
 

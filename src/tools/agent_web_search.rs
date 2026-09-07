@@ -10,11 +10,8 @@ use crate::config::render_prompt_template;
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
 const DESCRIPTION: &str = r#"启动一个新的互联网 Agent 查询公开网络信息。
-输入你的问题，此工具会启用子 Agent 通过互联网查询并解决你的问题。
+输入你的问题，此工具会启用智能子 Agent 通过搜索引擎查询并回答你的问题。
 仅在用户明确要求联网，或问题本身依赖实时、外部网络信息时调用。
-不得仅因自身不知道、不确定、无法判断或希望验证答案而调用此工具。
-是否使用互联网，应取决于用户的请求和信息需求，而不是模型自身的知识缺口。
-若无需联网也能正常完成对话，则不要调用此工具。
 "#;
 
 #[derive(Debug, Deserialize)]

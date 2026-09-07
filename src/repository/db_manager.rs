@@ -95,7 +95,7 @@ pub struct AdminDatabaseStats {
     pub direct_conversations: u64,
     pub messages_today: u64,
     pub user_memories: u64,
-    pub character_memories: u64,
+    pub group_memories: u64,
     pub scheduled_tasks: u64,
 }
 
@@ -274,6 +274,21 @@ impl QQChatContextManager {
         let conn_pool = Pool::builder().max_size(5).build(manager)?;
         let conn = conn_pool.get()?;
 
+        // 仅迁移旧表名称，保留已有记忆、会话归属和到期状态。
+        let has_legacy_memories: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'character_memories')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_legacy_memories {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE character_memories RENAME TO group_memories;
+                 DROP INDEX IF EXISTS idx_character_memories_owner;
+                 COMMIT;",
+            )?;
+        }
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS conversations (
@@ -385,10 +400,10 @@ impl QQChatContextManager {
             CREATE INDEX IF NOT EXISTS idx_user_memories_owner
             ON user_memories (source, bot_id, user_id, id DESC);
 
-            CREATE TABLE IF NOT EXISTS character_memories (
+            CREATE TABLE IF NOT EXISTS group_memories (
                 -- 内部主键用于稳定排序和标记本轮实际展示的记忆。
                 id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-                -- 平台、机器人账号和会话共同确定一份独立角色记忆。
+                -- 平台、机器人账号和会话共同确定一份独立群记忆。
                 source                      TEXT    NOT NULL,
                 bot_id                      TEXT    NOT NULL,
                 source_conversation_id      TEXT    NOT NULL,
@@ -404,8 +419,8 @@ impl QQChatContextManager {
                 UNIQUE (source, bot_id, source_conversation_id, title)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_character_memories_owner
-            ON character_memories (
+            CREATE INDEX IF NOT EXISTS idx_group_memories_owner
+            ON group_memories (
                 source, bot_id, source_conversation_id, expires_at ASC, id ASC
             );
 
@@ -726,7 +741,7 @@ impl QQChatContextManager {
                    (SELECT COUNT(*) FROM conversations WHERE kind = 'direct'),
                    (SELECT COUNT(*) FROM messages WHERE event_timestamp >= ?1),
                    (SELECT COUNT(*) FROM user_memories),
-                   (SELECT COUNT(*) FROM character_memories),
+                   (SELECT COUNT(*) FROM group_memories),
                    (SELECT COUNT(*) FROM scheduled_tasks)",
                 params![today_start_timestamp],
                 |row| {
@@ -736,7 +751,7 @@ impl QQChatContextManager {
                         direct_conversations: row.get(2)?,
                         messages_today: row.get(3)?,
                         user_memories: row.get(4)?,
-                        character_memories: row.get(5)?,
+                        group_memories: row.get(5)?,
                         scheduled_tasks: row.get(6)?,
                     })
                 },
@@ -1866,6 +1881,124 @@ mod tests {
     };
     use rand::Rng;
 
+    // 验证旧表改名后保留记录与到期状态，且再次启动不会重复迁移。
+    #[test]
+    fn legacy_group_memory_table_is_renamed_without_losing_records() {
+        let path = temporary_db_path();
+        {
+            let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+            let conn = manager.conn_pool.get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO group_memories
+                 (id, source, bot_id, source_conversation_id, title, content, expires_at, expired_seen_at, created_at, updated_at)
+                 VALUES (7, 'test', 'bot', 'group-1', '标题', '内容', 123456, 123400, 100, 200);
+                 ALTER TABLE group_memories RENAME TO character_memories;
+                 DROP INDEX idx_group_memories_owner;
+                 CREATE INDEX idx_character_memories_owner ON character_memories
+                 (source, bot_id, source_conversation_id, expires_at ASC, id ASC);",
+            ).unwrap();
+        }
+        for _ in 0..2 {
+            let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+            let records = manager
+                .get_group_memories("test", "bot", "group-1")
+                .unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].id, 7);
+            assert_eq!(records[0].content, "内容");
+            let conn = manager.conn_pool.get().unwrap();
+            let timestamps: (i64, i64, i64, i64) = conn.query_row(
+                "SELECT expires_at, expired_seen_at, created_at, updated_at FROM group_memories WHERE id = 7",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            assert_eq!(timestamps, (123456, 123400, 100, 200));
+            assert!(manager
+                .get_group_memories("test", "bot", "group-2")
+                .unwrap()
+                .is_empty());
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    // 验证长期记忆不被清理或淘汰，期限切换及更新时间读写正确。
+    #[test]
+    fn permanent_memory_survives_expiry_and_capacity_and_can_change_retention() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        manager
+            .set_group_memory("test", "bot", "group", "长期", Some("内容"), Some(0), 1)
+            .unwrap();
+        let memory = manager
+            .get_group_memories("test", "bot", "group")
+            .unwrap()
+            .remove(0);
+        assert!(memory.updated_at > 0);
+        assert_eq!(
+            manager
+                .mark_expired_group_memories_seen(&[memory.id], i64::MAX)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .delete_seen_expired_group_memories("test", "bot", "group", i64::MAX)
+                .unwrap(),
+            0
+        );
+        assert!(manager
+            .set_group_memory("test", "bot", "group", "另一条", Some("内容"), Some(100), 1)
+            .is_err());
+        assert_eq!(
+            manager
+                .get_group_memories("test", "bot", "group")
+                .unwrap()
+                .len(),
+            1
+        );
+        manager
+            .set_group_memory("test", "bot", "group", "长期", None, Some(100), 1)
+            .unwrap();
+        manager
+            .mark_expired_group_memories_seen(&[memory.id], 200)
+            .unwrap();
+        let marked = manager
+            .get_group_memories("test", "bot", "group")
+            .unwrap()
+            .remove(0);
+        assert!(marked.updated_at > 200); // 展示到期状态不修改最后更新时间。
+        manager
+            .set_group_memory("test", "bot", "group", "长期", None, Some(0), 1)
+            .unwrap();
+        assert_eq!(
+            manager
+                .delete_seen_expired_group_memories("test", "bot", "group", i64::MAX)
+                .unwrap(),
+            0
+        );
+        manager
+            .set_group_memory("test", "bot", "group", "长期", Some("修改后"), None, 1)
+            .unwrap();
+        assert_eq!(
+            manager.get_group_memories("test", "bot", "group").unwrap()[0].expires_at,
+            0
+        );
+        manager
+            .insert_user_memory("mem_test", "test", "bot", "user", "原文")
+            .unwrap();
+        manager
+            .conn_pool
+            .get()
+            .unwrap()
+            .execute("UPDATE user_memories SET updated_at = 1", [])
+            .unwrap();
+        manager
+            .update_user_memory("test", "bot", "user", "mem_test", "新内容")
+            .unwrap();
+        assert!(manager.get_user_memories("test", "bot", "user").unwrap()[0].updated_at > 1);
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
     // 验证历史窗口按返回的分块大小滚动。
     #[test]
     fn history_window_rolls_by_the_same_block_size_it_returns() {
@@ -1888,6 +2021,7 @@ mod tests {
             10,
             Local::now(),
             true,
+            30,
         )
         .unwrap()
         .window;
@@ -2170,12 +2304,35 @@ mod tests {
             10,
             now,
             true,
+            30,
         )
         .unwrap();
         assert_eq!(context.window.messages.len(), 1);
         assert_eq!(context.summaries, summaries[..1]);
+        let wider = crate::chat_history::load_chat_history_context(
+            &manager,
+            "test",
+            "conversation",
+            10,
+            now,
+            true,
+            31,
+        )
+        .unwrap();
+        assert_eq!(wider.summaries.len(), 2);
+        let narrower = crate::chat_history::load_chat_history_context(
+            &manager,
+            "test",
+            "conversation",
+            10,
+            now,
+            true,
+            7,
+        )
+        .unwrap();
+        assert!(narrower.summaries.is_empty());
         let empty = crate::chat_history::load_chat_history_context(
-            &manager, "test", "missing", 10, now, true,
+            &manager, "test", "missing", 10, now, true, 30,
         )
         .unwrap();
         assert!(empty.window.messages.is_empty() && empty.summaries.is_empty());
@@ -2186,6 +2343,7 @@ mod tests {
             10,
             now,
             false,
+            30,
         )
         .unwrap();
         assert_eq!(

@@ -4,22 +4,23 @@ use rusqlite::{params, OptionalExtension};
 
 use super::db_manager::QQChatContextManager;
 
-/// 一条按机器人账号和会话隔离的角色记忆。
+/// 一条按机器人账号和会话隔离的群记忆。
 #[derive(Debug, Clone)]
-pub struct CharacterMemoryRecord {
+pub struct GroupMemoryRecord {
     pub id: i64,
     pub title: String,
     pub content: String,
     pub expires_at: i64,
+    pub updated_at: i64,
 }
 
-/// 新建或修改角色记忆后的持久化结果。
-pub struct CharacterMemoryWriteResult {
+/// 新建或修改群记忆后的持久化结果。
+pub struct GroupMemoryWriteResult {
     pub created: bool,
     pub evicted_title: Option<String>,
 }
 
-struct ExistingCharacterMemory {
+struct ExistingGroupMemory {
     id: i64,
     content: String,
     expires_at: i64,
@@ -27,37 +28,38 @@ struct ExistingCharacterMemory {
 }
 
 impl QQChatContextManager {
-    /// 读取当前会话的全部角色记忆，创建顺序保持稳定。
-    pub fn get_character_memories(
+    /// 读取当前会话的全部群记忆，创建顺序保持稳定。
+    pub fn get_group_memories(
         &self,
         source: &str,
         bot_id: &str,
         source_conversation_id: &str,
-    ) -> Result<Vec<CharacterMemoryRecord>> {
+    ) -> Result<Vec<GroupMemoryRecord>> {
         let connection = self.conn_pool.get()?;
         let mut statement = connection.prepare(
             "
-            SELECT id, title, content, expires_at
-            FROM character_memories
+            SELECT id, title, content, expires_at, updated_at
+            FROM group_memories
             WHERE source = ?1 AND bot_id = ?2 AND source_conversation_id = ?3
             ORDER BY id ASC
             ",
         )?;
         let records = statement
             .query_map(params![source, bot_id, source_conversation_id], |row| {
-                Ok(CharacterMemoryRecord {
+                Ok(GroupMemoryRecord {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     content: row.get(2)?,
                     expires_at: row.get(3)?,
+                    updated_at: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(records)
     }
 
-    /// 原子地新建或修改角色记忆，并在新增超限时淘汰最快到期的旧记忆。
-    pub fn set_character_memory(
+    /// 原子地新建或修改群记忆，并在新增超限时淘汰最快到期的旧记忆。
+    pub fn set_group_memory(
         &self,
         source: &str,
         bot_id: &str,
@@ -66,7 +68,7 @@ impl QQChatContextManager {
         content: Option<&str>,
         expires_at: Option<i64>,
         max_memories: usize,
-    ) -> Result<CharacterMemoryWriteResult> {
+    ) -> Result<GroupMemoryWriteResult> {
         let now = Utc::now().timestamp();
         let mut connection = self.conn_pool.get()?;
         let tx = connection.transaction()?;
@@ -74,13 +76,13 @@ impl QQChatContextManager {
             .query_row(
                 "
                 SELECT id, content, expires_at, expired_seen_at
-                FROM character_memories
+                FROM group_memories
                 WHERE source = ?1 AND bot_id = ?2
                   AND source_conversation_id = ?3 AND title = ?4
                 ",
                 params![source, bot_id, source_conversation_id, title],
                 |row| {
-                    Ok(ExistingCharacterMemory {
+                    Ok(ExistingGroupMemory {
                         id: row.get(0)?,
                         content: row.get(1)?,
                         expires_at: row.get(2)?,
@@ -101,7 +103,7 @@ impl QQChatContextManager {
                 };
                 tx.execute(
                     "
-                    UPDATE character_memories
+                    UPDATE group_memories
                     SET content = ?5, expires_at = ?6,
                         expired_seen_at = ?7, updated_at = ?8
                     WHERE source = ?1 AND bot_id = ?2
@@ -122,14 +124,14 @@ impl QQChatContextManager {
             }
             None => {
                 let Some(content) = content else {
-                    anyhow::bail!("新建角色记忆缺少内容");
+                    anyhow::bail!("新建群记忆缺少内容");
                 };
                 let Some(expires_at) = expires_at else {
-                    anyhow::bail!("新建角色记忆缺少期限");
+                    anyhow::bail!("新建群记忆缺少期限");
                 };
                 tx.execute(
                     "
-                    INSERT INTO character_memories (
+                    INSERT INTO group_memories (
                         source, bot_id, source_conversation_id, title, content,
                         expires_at, expired_seen_at, created_at, updated_at
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7)
@@ -152,7 +154,7 @@ impl QQChatContextManager {
         if created {
             let count = tx.query_row(
                 "
-                SELECT COUNT(*) FROM character_memories
+                SELECT COUNT(*) FROM group_memories
                 WHERE source = ?1 AND bot_id = ?2 AND source_conversation_id = ?3
                 ",
                 params![source, bot_id, source_conversation_id],
@@ -162,8 +164,9 @@ impl QQChatContextManager {
                 let mut statement = tx.prepare(
                     "
                     SELECT id, title
-                    FROM character_memories
+                    FROM group_memories
                     WHERE source = ?1 AND bot_id = ?2 AND source_conversation_id = ?3
+                      AND expires_at != 0
                     ORDER BY expires_at ASC, created_at ASC, id ASC
                     LIMIT 2
                     ",
@@ -183,23 +186,27 @@ impl QQChatContextManager {
                 };
                 if let Some((evicted_id, title)) = evicted {
                     tx.execute(
-                        "DELETE FROM character_memories WHERE id = ?1",
+                        "DELETE FROM group_memories WHERE id = ?1",
                         params![evicted_id],
                     )?;
                     evicted_title = Some(title.clone());
+                } else {
+                    anyhow::bail!(
+                        "群记忆数量已达上限，已有长期记忆不会自动淘汰，请先整理或删除记忆"
+                    );
                 }
             }
         }
 
         tx.commit()?;
-        Ok(CharacterMemoryWriteResult {
+        Ok(GroupMemoryWriteResult {
             created,
             evicted_title,
         })
     }
 
-    /// 删除当前会话中由标题精确指定的角色记忆。
-    pub fn delete_character_memory(
+    /// 删除当前会话中由标题精确指定的群记忆。
+    pub fn delete_group_memory(
         &self,
         source: &str,
         bot_id: &str,
@@ -208,7 +215,7 @@ impl QQChatContextManager {
     ) -> Result<bool> {
         let changed = self.conn_pool.get()?.execute(
             "
-            DELETE FROM character_memories
+            DELETE FROM group_memories
             WHERE source = ?1 AND bot_id = ?2
               AND source_conversation_id = ?3 AND title = ?4
             ",
@@ -218,7 +225,7 @@ impl QQChatContextManager {
     }
 
     /// 管理后台使用稳定内部 ID 修改标题、内容和期限，并重置到期展示状态。
-    pub fn update_character_memory_by_id(
+    pub fn update_group_memory_by_id(
         &self,
         source: &str,
         bot_id: &str,
@@ -229,7 +236,7 @@ impl QQChatContextManager {
         expires_at: i64,
     ) -> Result<bool> {
         let changed = self.conn_pool.get()?.execute(
-            "UPDATE character_memories
+            "UPDATE group_memories
              SET title = ?5, content = ?6, expires_at = ?7,
                  expired_seen_at = NULL, updated_at = ?8
              WHERE source = ?1 AND bot_id = ?2
@@ -248,7 +255,7 @@ impl QQChatContextManager {
         Ok(changed != 0)
     }
 
-    pub fn delete_character_memory_by_id(
+    pub fn delete_group_memory_by_id(
         &self,
         source: &str,
         bot_id: &str,
@@ -256,7 +263,7 @@ impl QQChatContextManager {
         memory_id: i64,
     ) -> Result<bool> {
         let changed = self.conn_pool.get()?.execute(
-            "DELETE FROM character_memories
+            "DELETE FROM group_memories
              WHERE source = ?1 AND bot_id = ?2 AND source_conversation_id = ?3 AND id = ?4",
             params![source, bot_id, source_conversation_id, memory_id],
         )?;
@@ -264,7 +271,7 @@ impl QQChatContextManager {
     }
 
     /// 删除此前已经向主模型展示过“即将遗忘”的到期记忆。
-    pub fn delete_seen_expired_character_memories(
+    pub fn delete_seen_expired_group_memories(
         &self,
         source: &str,
         bot_id: &str,
@@ -273,20 +280,16 @@ impl QQChatContextManager {
     ) -> Result<usize> {
         Ok(self.conn_pool.get()?.execute(
             "
-            DELETE FROM character_memories
+            DELETE FROM group_memories
             WHERE source = ?1 AND bot_id = ?2 AND source_conversation_id = ?3
-              AND expires_at <= ?4 AND expired_seen_at IS NOT NULL
+              AND expires_at != 0 AND expires_at <= ?4 AND expired_seen_at IS NOT NULL
             ",
             params![source, bot_id, source_conversation_id, now],
         )?)
     }
 
     /// 只标记本轮确实随成功请求展示、并且之后仍未续期的到期记忆。
-    pub fn mark_expired_character_memories_seen(
-        &self,
-        memory_ids: &[i64],
-        now: i64,
-    ) -> Result<usize> {
+    pub fn mark_expired_group_memories_seen(&self, memory_ids: &[i64], now: i64) -> Result<usize> {
         let mut connection = self.conn_pool.get()?;
         let tx = connection.transaction()?;
         let mut changed = 0;
@@ -294,9 +297,9 @@ impl QQChatContextManager {
         for memory_id in memory_ids {
             changed += tx.execute(
                 "
-                UPDATE character_memories
-                SET expired_seen_at = ?2, updated_at = ?2
-                WHERE id = ?1 AND expires_at <= ?2 AND expired_seen_at IS NULL
+                UPDATE group_memories
+                SET expired_seen_at = ?2
+                WHERE id = ?1 AND expires_at != 0 AND expires_at <= ?2 AND expired_seen_at IS NULL
                 ",
                 params![memory_id, now],
             )?;

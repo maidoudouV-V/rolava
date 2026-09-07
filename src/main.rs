@@ -141,7 +141,7 @@ async fn run_worker() -> Result<WorkerExit> {
     let config_path = admin::config_path();
     admin::ensure_admin_token(&config_path)?;
     let app_config = Arc::new(
-        AppConfig::new(config_path.to_string_lossy().as_ref()).context("配置文件读取失败")?,
+        AppConfig::new(config_path.to_string_lossy().as_ref()).context("加载应用配置失败")?,
     );
     let admin_logs = Arc::new(admin::AdminLogBuffer::new(1000));
     init_tracing(app_config.logging.level.as_str(), admin_logs.clone());

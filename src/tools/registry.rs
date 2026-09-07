@@ -5,10 +5,9 @@ use anyhow::{bail, Result};
 
 use super::{
     AgentWebSearchTool, ContinueConversationTool, CreateScheduledTaskTool, CreateUserMemoryTool,
-    DeleteCharacterMemoryTool, DeleteScheduledTaskTool, DeleteUserMemoryTool, EndConversationTool,
-    GetScheduledTaskTool, SendQqExpressionTool, SetCharacterMemoryTool, Tool, ToolCall,
-    ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool, UpdateUserMemoryTool,
-    WaitForReplyTool,
+    DeleteGroupMemoryTool, DeleteScheduledTaskTool, DeleteUserMemoryTool, EndConversationTool,
+    GetScheduledTaskTool, SendQqExpressionTool, SetGroupMemoryTool, Tool, ToolCall, ToolContext,
+    ToolDefinition, ToolResult, UpdateScheduledTaskTool, UpdateUserMemoryTool, WaitForReplyTool,
 };
 
 /// 管理后台可配置的工具信息；固定启用的内部工具不会出现在这里。
@@ -43,9 +42,9 @@ impl ToolRegistry {
         }
         registry.register(SendQqExpressionTool).unwrap();
         if Self::is_enabled(enabled_optional_tools, MEMORY_MODULE) {
-            // 一个模块开关统一控制角色记忆和用户记忆的全部维护工具。
-            registry.register(SetCharacterMemoryTool).unwrap();
-            registry.register(DeleteCharacterMemoryTool).unwrap();
+            // 一个模块开关统一控制群记忆和用户记忆的全部维护工具。
+            registry.register(SetGroupMemoryTool).unwrap();
+            registry.register(DeleteGroupMemoryTool).unwrap();
             registry.register(CreateUserMemoryTool).unwrap();
             registry.register(UpdateUserMemoryTool).unwrap();
             registry.register(DeleteUserMemoryTool).unwrap();
@@ -73,7 +72,7 @@ impl ToolRegistry {
             OptionalToolDefinition {
                 name: MEMORY_MODULE,
                 display_name: "记忆",
-                description: "允许主模型维护角色记忆和用户记忆。",
+                description: "允许主模型维护群记忆和用户记忆。",
             },
             OptionalToolDefinition {
                 name: SCHEDULED_TASKS_MODULE,

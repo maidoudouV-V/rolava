@@ -19,6 +19,7 @@ pub fn load_chat_history_context(
     max_history_messages: u32,
     now: DateTime<Local>,
     summary_enabled: bool,
+    summary_days: u16,
 ) -> anyhow::Result<ChatHistoryContext> {
     let window = db_manager.get_conversation_history_window(
         source,
@@ -28,7 +29,9 @@ pub fn load_chat_history_context(
     let summaries = match window.messages.first() {
         Some(oldest_message) if summary_enabled => {
             let through_date = summary_date_for_timestamp(oldest_message.event_timestamp)?;
-            let from_date = summary_date_for_timestamp((now - chrono::Days::new(30)).timestamp())?;
+            let from_date = summary_date_for_timestamp(
+                (now - chrono::Days::new(u64::from(summary_days))).timestamp(),
+            )?;
             db_manager.get_conversation_daily_summaries_between(
                 oldest_message.conversation_id,
                 &from_date,

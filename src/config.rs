@@ -77,6 +77,9 @@ pub struct AppSection {
     /// 是否生成并使用历史摘要；默认关闭，重启后生效。
     #[serde(default)]
     pub history_summary_enabled: bool,
+    /// 上下文向前读取摘要的天数，默认 30 天。
+    #[serde(default = "default_history_summary_days")]
+    pub history_summary_days: u16,
     /// 程序启动时为每个群回填的最近历史消息数；0 表示关闭回填。
     #[serde(default = "default_startup_history_fetch_count")]
     pub startup_history_fetch_count: u32,
@@ -118,6 +121,10 @@ impl AppSection {
     pub fn ai_request_max_attempts(&self) -> u32 {
         self.ai_request_retry_count.saturating_add(1).max(1)
     }
+}
+
+pub fn default_history_summary_days() -> u16 {
+    30
 }
 
 fn default_ai_request_retry_count() -> u32 {
@@ -238,7 +245,12 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn new(config_path: &str) -> Result<Self> {
         let config_path = Path::new(config_path);
-        let toml_str = std::fs::read_to_string(config_path)?;
+        let toml_str = std::fs::read_to_string(config_path).with_context(|| {
+            format!(
+                "读取主配置文件失败：{}",
+                diagnostic_path(config_path).display()
+            )
+        })?;
         let TomlConfig {
             app,
             server,
@@ -246,7 +258,12 @@ impl AppConfig {
             models,
             logging,
             admin,
-        } = toml::from_str(&toml_str)?;
+        } = toml::from_str(&toml_str).with_context(|| {
+            format!(
+                "解析主配置文件失败：{}",
+                diagnostic_path(config_path).display()
+            )
+        })?;
 
         if app.startup_history_fetch_count > 999 {
             anyhow::bail!("每群启动历史消息数不能超过 999");
@@ -420,35 +437,38 @@ pub struct PromptConfig {
 }
 impl PromptConfig {
     pub fn new(prompt_dir: &Path) -> Result<Self> {
-        let character_prompt = fs::read_to_string(prompt_dir.join("character.md"))?;
-        let filter_template = fs::read_to_string(prompt_dir.join("internal/filter.md"))?;
+        let read_prompt = |relative_path: &str| {
+            let path = prompt_dir.join(relative_path);
+            fs::read_to_string(&path).with_context(|| {
+                format!("读取提示词文件失败：{}", diagnostic_path(&path).display())
+            })
+        };
+        let character_prompt = read_prompt("character.md")?;
+        let filter_template = read_prompt("internal/filter.md")?;
         let new_config = Self {
-            system_prompt: fs::read_to_string(prompt_dir.join("system.md"))?,
+            system_prompt: read_prompt("system.md")?,
             character_prompt: character_prompt.clone(),
-            reply_rules_prompt: fs::read_to_string(prompt_dir.join("reply_rules.md"))?,
-            instruction_prompt: fs::read_to_string(prompt_dir.join("instruction.md"))?,
+            reply_rules_prompt: read_prompt("reply_rules.md")?,
+            instruction_prompt: read_prompt("instruction.md")?,
             filter_prompt: filter_template.replace("{{character_prompt}}", character_prompt.trim()),
-            image_description_prompt: fs::read_to_string(
-                prompt_dir.join("internal/image_description.md"),
-            )?,
-            web_search_agent_prompt: fs::read_to_string(
-                prompt_dir.join("internal/web_search_agent.md"),
-            )?,
-            scheduled_task_prompt: fs::read_to_string(
-                prompt_dir.join("internal/scheduled_task.md"),
-            )?,
-            scheduled_task_recovery_prompt: fs::read_to_string(
-                prompt_dir.join("internal/scheduled_task_recovery.md"),
-            )?,
-            wait_for_reply_timeout_prompt: fs::read_to_string(
-                prompt_dir.join("internal/wait_for_reply_timeout.md"),
-            )?,
-            chat_history_summary_prompt: fs::read_to_string(
-                prompt_dir.join("internal/chat_history_summary.md"),
-            )?,
+            image_description_prompt: read_prompt("internal/image_description.md")?,
+            web_search_agent_prompt: read_prompt("internal/web_search_agent.md")?,
+            scheduled_task_prompt: read_prompt("internal/scheduled_task.md")?,
+            scheduled_task_recovery_prompt: read_prompt("internal/scheduled_task_recovery.md")?,
+            wait_for_reply_timeout_prompt: read_prompt("internal/wait_for_reply_timeout.md")?,
+            chat_history_summary_prompt: read_prompt("internal/chat_history_summary.md")?,
         };
         Ok(new_config)
     }
+}
+
+/// 错误日志优先展示容器或主机内的绝对路径，便于排查绑定挂载。
+fn diagnostic_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    })
 }
 
 /// 单次扫描提示词模板，插入值不会被再次当作占位符解析。

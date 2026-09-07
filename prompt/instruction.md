@@ -1,6 +1,6 @@
 # 记忆内容
-## 角色记忆内容
-{{character_memories}}
+## 群记忆内容
+{{group_memories}}
 ## 最近活跃用户
 {{recent_user_memories}}
 

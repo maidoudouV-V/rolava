@@ -138,7 +138,7 @@ async function loadStatus() {
   document.getElementById("metric-conversations").textContent = status.conversations;
   document.getElementById("metric-conversation-kinds").textContent = `${status.group_conversations} 个群聊 · ${status.direct_conversations} 个私聊`;
   document.getElementById("metric-messages").textContent = status.messages_today;
-  document.getElementById("metric-memories").textContent = status.user_memories + status.character_memories;
+  document.getElementById("metric-memories").textContent = status.user_memories + status.group_memories;
   document.getElementById("metric-tasks").textContent = status.scheduled_tasks;
 }
 

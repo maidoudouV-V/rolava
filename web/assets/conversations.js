@@ -43,7 +43,7 @@ export class ConversationsController {
     container.innerHTML = this.items.map(item => `<button class="conversation-row ${item.id === this.selectedId ? "active" : ""}" data-conversation-id="${item.id}">
       <span class="avatar ${item.kind === "direct" ? "direct" : ""}">${escapeHtml(initial(item.title))}</span>
       <span><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.latest_sender_name ? `${item.latest_sender_name}：${item.latest_content || ""}` : item.latest_content || "暂无消息")}</small></span>
-      <span>${item.latest_message_at ? `<time>${formatTime(item.latest_message_at)}</time>` : ""}${item.unread_count ? `<b class="unread">${item.unread_count > 99 ? "99+" : item.unread_count}</b>` : ""}</span>
+      <span>${item.latest_message_at ? `<time>${formatTime(item.latest_message_at)}</time>` : ""}</span>
     </button>`).join("");
   }
 
@@ -53,15 +53,15 @@ export class ConversationsController {
     const detail = document.getElementById("conversation-detail");
     detail.innerHTML = '<div class="empty detail-empty"><span class="spinner"></span>正在读取会话</div>';
     try {
-      const [conversation, messages, users, characters, tasks] = await Promise.all([
+      const [conversation, messages, users, groups, tasks] = await Promise.all([
         api.get(`/conversations/${id}`),
         api.get(`/conversations/${id}/messages`),
         api.get(`/conversations/${id}/user-memories`).catch(error => ({ users: [], error: error.message })),
-        api.get(`/conversations/${id}/character-memories`),
+        api.get(`/conversations/${id}/group-memories`),
         api.get(`/conversations/${id}/scheduled-tasks`),
       ]);
       if (this.selectedId !== id) return;
-      this.detailData = { conversation, messages, users, characters, tasks };
+      this.detailData = { conversation, messages, users, groups, tasks };
       this.renderDetail();
     } catch (error) { detail.innerHTML = `<div class="empty detail-empty"><strong>会话读取失败</strong><span>${escapeHtml(error.message)}</span></div>`; }
   }
@@ -71,11 +71,11 @@ export class ConversationsController {
     const title = conversation.title || conversation.source_id;
     document.getElementById("conversation-detail").innerHTML = `
       <header class="detail-header"><div class="detail-identity"><span class="avatar ${conversation.kind === "direct" ? "direct" : ""}">${escapeHtml(initial(title))}</span><div><h2>${escapeHtml(title)}</h2><p>${conversation.kind === "group" ? `群聊${conversation.member_count != null ? ` · ${conversation.member_count} 位成员` : ""}` : "私聊"} · QQ ${escapeHtml(conversation.source_id)}</p></div></div></header>
-      <nav class="detail-tabs"><button class="active" data-tab="messages">聊天记录</button><button data-tab="users">用户记忆</button><button data-tab="characters">角色记忆</button><button data-tab="tasks">定时任务</button></nav>
+      <nav class="detail-tabs"><button class="active" data-tab="messages">聊天记录</button><button data-tab="users">用户记忆</button><button data-tab="groups">群记忆</button><button data-tab="tasks">定时任务</button></nav>
       <div class="detail-body">
         <section class="tab-panel active" data-panel="messages">${this.messagesHtml()}</section>
         <section class="tab-panel" data-panel="users">${this.userMemoriesHtml()}</section>
-        <section class="tab-panel" data-panel="characters">${this.characterMemoriesHtml()}</section>
+        <section class="tab-panel" data-panel="groups">${this.groupMemoriesHtml()}</section>
         <section class="tab-panel" data-panel="tasks">${this.tasksHtml()}</section>
       </div>`;
     this.bindDetailEvents();
@@ -150,9 +150,9 @@ export class ConversationsController {
       <div class="memory-stack">${withMemories.length ? withMemories.map(user => `<div><div class="member-heading"><span class="avatar">${escapeHtml(initial(user.card || user.nickname))}</span><div><strong>${escapeHtml(user.card || user.nickname || user.user_id)}</strong><small>QQ ${escapeHtml(user.user_id)}</small></div></div>${user.memories.map(memory => this.entityHtml(memory.content, memory.id, "user", { userId: user.user_id })).join("")}</div>`).join("") : '<div class="empty">当前群成员没有已保存的用户记忆</div>'}</div>`;
   }
 
-  characterMemoriesHtml() {
-    const items = this.detailData.characters.items;
-    return `<div class="panel-toolbar"><h3>当前会话角色记忆</h3><button class="button small" data-add-character><i data-lucide="plus"></i>添加</button></div><div class="memory-stack">${items.length ? items.map(memory => this.entityHtml(memory.content, memory.title, "character", { id: memory.id, retention: memory.remaining_days || 1, meta: memory.expiring ? "即将遗忘" : `剩余 ${memory.remaining_days} 天` })).join("") : '<div class="empty">当前没有角色记忆</div>'}</div>`;
+  groupMemoriesHtml() {
+    const items = this.detailData.groups.items;
+    return `<div class="panel-toolbar"><h3>当前会话群记忆</h3><button class="button small" data-add-group><i data-lucide="plus"></i>添加</button></div><div class="memory-stack">${items.length ? items.map(memory => this.entityHtml(memory.content, memory.title, "group", { id: memory.id, retention: memory.remaining_days || 1, meta: memory.permanent ? "长期（永不过期）" : memory.expiring ? "即将遗忘" : `剩余 ${memory.remaining_days} 天` })).join("") : '<div class="empty">当前没有群记忆</div>'}</div>`;
   }
 
   tasksHtml() {
@@ -176,7 +176,7 @@ export class ConversationsController {
 
   async handleDetailAction(event) {
     const addUser = event.target.closest("[data-add-user-memory]"); if (addUser) return this.editUserMemory();
-    const addCharacter = event.target.closest("[data-add-character]"); if (addCharacter) return this.editCharacterMemory();
+    const addGroup = event.target.closest("[data-add-group]"); if (addGroup) return this.editGroupMemory();
     const addTask = event.target.closest("[data-add-task]"); if (addTask) return this.editTask();
     const edit = event.target.closest("[data-edit]");
     if (edit) return this.editEntity(edit.dataset.edit, edit.dataset.id, edit.dataset.userId);
@@ -189,7 +189,7 @@ export class ConversationsController {
       const user = this.detailData.users.users.find(item => item.user_id === userId); const memory = user.memories.find(item => item.id === id);
       return this.editUserMemory(user, memory);
     }
-    if (type === "character") return this.editCharacterMemory(this.detailData.characters.items.find(item => String(item.id) === id));
+    if (type === "group") return this.editGroupMemory(this.detailData.groups.items.find(item => String(item.id) === id));
     if (type === "task") return this.editTask(this.detailData.tasks.items.find(item => item.id === id));
   }
 
@@ -208,18 +208,18 @@ export class ConversationsController {
     } catch (error) { toast(error.message, true); }
   }
 
-  async editCharacterMemory(memory = null) {
-    const values = await openDialog({ title: memory ? "修改角色记忆" : "添加角色记忆", eyebrow: "CHARACTER MEMORY", fields: [
+  async editGroupMemory(memory = null) {
+    const values = await openDialog({ title: memory ? "修改群记忆" : "添加群记忆", eyebrow: "GROUP MEMORY", fields: [
       { name: "title", label: "标题", value: memory?.title || "" },
       { name: "content", label: "内容", type: "textarea", value: memory?.content || "", rows: 6 },
-      { name: "retention_days", label: "从现在起保留天数", type: "number", value: memory?.remaining_days || 30, min: 1, max: 365 },
+      { name: "retention_days", label: "保留天数（0 为永不过期）", type: "number", value: memory?.permanent ? 0 : (memory?.remaining_days || 30), min: 0, max: 365 },
     ]});
     if (!values) return;
     values.retention_days = Number(values.retention_days);
     try {
-      if (memory) await api.put(`/conversations/${this.selectedId}/character-memories/${memory.id}`, values);
-      else await api.post(`/conversations/${this.selectedId}/character-memories`, values);
-      toast("角色记忆已保存"); await this.select(this.selectedId);
+      if (memory) await api.put(`/conversations/${this.selectedId}/group-memories/${memory.id}`, values);
+      else await api.post(`/conversations/${this.selectedId}/group-memories`, values);
+      toast("群记忆已保存"); await this.select(this.selectedId);
     } catch (error) { toast(error.message, true); }
   }
 
@@ -241,7 +241,7 @@ export class ConversationsController {
     if (!window.confirm("确认删除这条内容？此操作无法撤销。")) return;
     try {
       if (type === "user") await api.delete(`/conversations/${this.selectedId}/users/${encodeURIComponent(userId)}/memories/${encodeURIComponent(id)}`);
-      if (type === "character") await api.delete(`/conversations/${this.selectedId}/character-memories/${id}`);
+      if (type === "group") await api.delete(`/conversations/${this.selectedId}/group-memories/${id}`);
       if (type === "task") await api.delete(`/conversations/${this.selectedId}/scheduled-tasks/${encodeURIComponent(id)}`);
       toast("已删除"); await this.select(this.selectedId);
     } catch (error) { toast(error.message, true); }

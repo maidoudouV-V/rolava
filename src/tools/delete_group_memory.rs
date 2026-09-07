@@ -5,24 +5,23 @@ use serde_json::{json, Value};
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"删除一条你在当前会话中不再需要保留的角色记忆。
+const DESCRIPTION: &str = r#"删除一条你在当前会话中不再需要保留的群记忆。
 仅当记忆已经失效且没有后续价值，或确认与另一条保留的记忆重复时删除。
-事情已经完成不代表必须删除；如果这段经历仍有值得保留的意义，可以继续保留。
-需要纠正内容、补充进展或续期时，使用 set_character_memory，不要先删除再重建。
-title 必须原样使用当前角色记忆中显示的标题，不要猜测或模糊匹配。
-根据记忆所在的位置选择工具：当前角色记忆中的条目使用本工具；最近活跃用户中列出的个人记忆使用 delete_user_memory。"#;
+事情完成但仍有保留价值时，不必删除。
+需要纠正内容、补充进展或续期时，使用 set_group_memory，不要先删除再重建。
+title 必须原样使用当前群记忆中显示的标题，不要猜测或模糊匹配。"#;
 
 #[derive(Debug, Deserialize)]
-pub struct DeleteCharacterMemoryArgs {
+pub struct DeleteGroupMemoryArgs {
     pub title: String,
 }
 
-pub struct DeleteCharacterMemoryTool;
+pub struct DeleteGroupMemoryTool;
 
 #[async_trait]
-impl Tool for DeleteCharacterMemoryTool {
+impl Tool for DeleteGroupMemoryTool {
     fn name(&self) -> &'static str {
-        "delete_character_memory"
+        "delete_group_memory"
     }
 
     fn description(&self) -> &'static str {
@@ -35,7 +34,7 @@ impl Tool for DeleteCharacterMemoryTool {
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "需要删除的角色记忆标题",
+                    "description": "需要删除的群记忆标题",
                     "minLength": 1,
                     "maxLength": 50
                 }
@@ -46,10 +45,10 @@ impl Tool for DeleteCharacterMemoryTool {
     }
 
     async fn execute(&self, context: &ToolContext, arguments: &str) -> Result<ToolOutput> {
-        let arguments: DeleteCharacterMemoryArgs = parse_arguments(self.name(), arguments)?;
+        let arguments: DeleteGroupMemoryArgs = parse_arguments(self.name(), arguments)?;
         let result = context
             .conversation
-            .character_memory
+            .group_memory
             .delete_memory(&arguments.title)?;
         Ok(ToolOutput::text(result))
     }

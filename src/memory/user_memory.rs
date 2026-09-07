@@ -212,8 +212,10 @@ impl UserMemorySession {
                 for memory in memories {
                     let content = memory.content.replace('\n', "\n        ");
                     output.push_str(&format!(
-                        "    - ID：{}\n      内容：{}\n",
-                        memory.memory_id, content
+                        "    - ID：{}\n      内容：{}\n      最后更新时间：{}\n",
+                        memory.memory_id,
+                        content,
+                        super::format_memory_time(memory.updated_at)?
                     ));
                 }
             }

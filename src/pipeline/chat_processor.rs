@@ -14,7 +14,7 @@ use crate::conversation_context::{ActiveToolHistory, RuntimeContextState, ToolRo
 use crate::conversation_control::ConversationControl;
 use crate::conversation_trigger::{ConversationTrigger, ConversationTriggerSender};
 use crate::history_compression::render_summary_date_heading;
-use crate::memory::{CharacterMemorySession, UserMemorySession};
+use crate::memory::{GroupMemorySession, UserMemorySession};
 use crate::message_enricher::MessageEnricher;
 use crate::repository::db_manager::{ChatMessage, ConversationDailySummary};
 use crate::tools::{
@@ -40,7 +40,7 @@ pub struct ChatProcessor {
     message_target: MessageTarget,
     conversation_control: Arc<ConversationControl>,
     trigger_sender: Arc<dyn ConversationTriggerSender>,
-    character_memory: Arc<CharacterMemorySession>,
+    group_memory: Arc<GroupMemorySession>,
     user_memory: Arc<UserMemorySession>,
     group_info: OnceCell<Option<GroupInfo>>,
     runtime_context: RuntimeContextState,
@@ -50,13 +50,13 @@ struct BuiltContext {
     messages: Vec<ToolChatMessage>,
     unread_message_ids: Vec<i64>,
     unread_message_time: Option<String>,
-    pending_expired_character_memory_ids: Vec<i64>,
+    pending_expired_group_memory_ids: Vec<i64>,
     latest_message_id: Option<i64>,
 }
 
 struct RenderedPrompt {
     content: String,
-    pending_expired_character_memory_ids: Vec<i64>,
+    pending_expired_group_memory_ids: Vec<i64>,
 }
 
 impl ChatProcessor {
@@ -74,7 +74,7 @@ impl ChatProcessor {
             services.app_config.as_ref(),
             services.db_manager.clone(),
         ));
-        let character_memory = Arc::new(CharacterMemorySession::new(
+        let group_memory = Arc::new(GroupMemorySession::new(
             message_target.clone(),
             services.db_manager.clone(),
         ));
@@ -85,7 +85,7 @@ impl ChatProcessor {
             message_target,
             conversation_control,
             trigger_sender,
-            character_memory,
+            group_memory,
             user_memory,
             group_info: OnceCell::new(),
             runtime_context: RuntimeContextState::default(),
@@ -183,9 +183,8 @@ impl ChatProcessor {
 
         let unread_message_time = built_context.unread_message_time.clone();
         let mut request_messages = built_context.messages;
-        let mut pending_expired_character_memory_ids =
-            built_context.pending_expired_character_memory_ids;
-        let mut displayed_expired_character_memory_ids = HashSet::new();
+        let mut pending_expired_group_memory_ids = built_context.pending_expired_group_memory_ids;
+        let mut displayed_expired_group_memory_ids = HashSet::new();
         let tool_definitions = tools.definitions();
         let tool_context = ToolContext {
             conversation: ConversationToolContext {
@@ -194,7 +193,7 @@ impl ChatProcessor {
                 current_messages: conversation_messages.to_vec(),
                 control: self.conversation_control.clone(),
                 trigger_sender: self.trigger_sender.clone(),
-                character_memory: self.character_memory.clone(),
+                group_memory: self.group_memory.clone(),
                 user_memory: self.user_memory.clone(),
             },
             services: self.services.clone(),
@@ -222,8 +221,8 @@ impl ChatProcessor {
                     break;
                 }
             };
-            displayed_expired_character_memory_ids
-                .extend(pending_expired_character_memory_ids.iter().copied());
+            displayed_expired_group_memory_ids
+                .extend(pending_expired_group_memory_ids.iter().copied());
 
             if !messages_marked_read {
                 self.runtime_context.seal_current_tail();
@@ -357,8 +356,8 @@ impl ChatProcessor {
                 !result.is_error
                     && matches!(
                         result.tool_name.as_str(),
-                        "set_character_memory"
-                            | "delete_character_memory"
+                        "set_group_memory"
+                            | "delete_group_memory"
                             | "create_user_memory"
                             | "update_user_memory"
                             | "delete_user_memory"
@@ -369,7 +368,7 @@ impl ChatProcessor {
                     unread_message_time.as_deref(),
                 ) {
                     Ok(pending_ids) => {
-                        pending_expired_character_memory_ids = pending_ids;
+                        pending_expired_group_memory_ids = pending_ids;
                     }
                     Err(error) => {
                         error!(error = %format!("{error:#}"), "刷新记忆提示词失败");
@@ -381,16 +380,16 @@ impl ChatProcessor {
             request_messages.extend(tool_result_messages);
         }
 
-        if !displayed_expired_character_memory_ids.is_empty() {
-            let displayed_ids = displayed_expired_character_memory_ids
+        if !displayed_expired_group_memory_ids.is_empty() {
+            let displayed_ids = displayed_expired_group_memory_ids
                 .into_iter()
                 .collect::<Vec<_>>();
-            match self.character_memory.finish_turn(&displayed_ids) {
+            match self.group_memory.finish_turn(&displayed_ids) {
                 Ok(marked) if marked > 0 => {
-                    debug!(memory_count = marked, "已确认展示本轮未续期的到期角色记忆");
+                    debug!(memory_count = marked, "已确认展示本轮未续期的到期群记忆");
                 }
                 Ok(_) => {}
-                Err(error) => error!(error = %format!("{error:#}"), "确认到期角色记忆展示状态失败"),
+                Err(error) => error!(error = %format!("{error:#}"), "确认到期群记忆展示状态失败"),
             }
         }
 
@@ -516,9 +515,9 @@ impl ChatProcessor {
         current_message_ids: &[i64],
         transient_user_prompt: Option<&str>,
     ) -> anyhow::Result<BuiltContext> {
-        let deleted_memories = self.character_memory.begin_turn()?;
+        let deleted_memories = self.group_memory.begin_turn()?;
         if deleted_memories > 0 {
-            debug!(memory_count = deleted_memories, "已删除确认遗忘的角色记忆");
+            debug!(memory_count = deleted_memories, "已删除确认遗忘的群记忆");
         }
         let supports_vision = self.services.app_config.chat_model_supports_vision();
         let history = load_chat_history_context(
@@ -528,6 +527,7 @@ impl ChatProcessor {
             self.services.app_config.app.max_history_messages,
             Local::now(),
             self.services.app_config.app.history_summary_enabled,
+            self.services.app_config.app.history_summary_days,
         )?;
         let history_window = history.window;
         let daily_summaries = history.summaries;
@@ -657,8 +657,8 @@ impl ChatProcessor {
             messages: context,
             unread_message_ids,
             unread_message_time,
-            pending_expired_character_memory_ids: rendered_instruction_prompt
-                .pending_expired_character_memory_ids,
+            pending_expired_group_memory_ids: rendered_instruction_prompt
+                .pending_expired_group_memory_ids,
             latest_message_id: message_ids.last().copied(),
         })
     }
@@ -860,8 +860,8 @@ impl ChatProcessor {
             .running_tasks(&self.message_target)?;
         let task_summaries = tasks.iter().map(|task| task.summary()).collect::<Vec<_>>();
         let scheduled_tasks_json = serde_json::to_string_pretty(&task_summaries)?;
-        let (character_memories, pending_expired_character_memory_ids) =
-            self.character_memory.render_prompt()?;
+        let (group_memories, pending_expired_group_memory_ids) =
+            self.group_memory.render_prompt()?;
         let recent_user_memories = self.user_memory.render_prompt()?;
         let scene = self.render_scene();
         let instruction_prompt = Self::replace_optional_prompt_line(
@@ -873,11 +873,11 @@ impl ChatProcessor {
             .replace("{{date}}", &date_text)
             .replace("{{scene}}", &scene)
             .replace("{{scheduled_tasks}}", &scheduled_tasks_json)
-            .replace("{{character_memories}}", &character_memories)
+            .replace("{{group_memories}}", &group_memories)
             .replace("{{recent_user_memories}}", &recent_user_memories);
         Ok(RenderedPrompt {
             content,
-            pending_expired_character_memory_ids,
+            pending_expired_group_memory_ids,
         })
     }
 
@@ -959,7 +959,7 @@ impl ChatProcessor {
             anyhow::bail!("工具循环上下文缺少 instruction 提示词");
         };
         *content = instruction_prompt.content;
-        Ok(instruction_prompt.pending_expired_character_memory_ids)
+        Ok(instruction_prompt.pending_expired_group_memory_ids)
     }
 
     fn render_unread_message_time(earliest_unread_timestamp: Option<i64>) -> Option<String> {

@@ -27,6 +27,8 @@ pub struct AdminAppConfig {
     pub max_history_messages: u32,
     #[serde(default)]
     pub history_summary_enabled: bool,
+    #[serde(default = "crate::config::default_history_summary_days")]
+    pub history_summary_days: u16,
     pub startup_history_fetch_count: u32,
     pub vision_image_message_window: usize,
     pub ai_request_retry_count: u32,
@@ -82,6 +84,7 @@ impl AdminConfigView {
                 visual_model_name: config.app.visual_model_name.clone(),
                 max_history_messages: config.app.max_history_messages,
                 history_summary_enabled: config.app.history_summary_enabled,
+                history_summary_days: config.app.history_summary_days,
                 startup_history_fetch_count: config.app.startup_history_fetch_count,
                 vision_image_message_window: config.app.vision_image_message_window,
                 ai_request_retry_count: config.app.ai_request_retry_count,
@@ -284,6 +287,9 @@ fn resolve_prompt_path(config: &AppConfig, prompt_id: &str) -> Result<PathBuf> {
 }
 
 fn validate_update(update: &AdminConfigUpdate) -> Result<()> {
+    if update.app.history_summary_days == 0 {
+        anyhow::bail!("摘要显示天数必须大于 0");
+    }
     if update.app.max_history_messages == 0 {
         anyhow::bail!("历史消息数必须大于 0");
     }
@@ -353,6 +359,7 @@ fn apply_app(document: &mut DocumentMut, app: &AdminAppConfig) {
     table["visual_model_name"] = value(&app.visual_model_name);
     table["max_history_messages"] = value(i64::from(app.max_history_messages));
     table["history_summary_enabled"] = value(app.history_summary_enabled);
+    table["history_summary_days"] = value(i64::from(app.history_summary_days));
     table["startup_history_fetch_count"] = value(i64::from(app.startup_history_fetch_count));
     table["vision_image_message_window"] = value(app.vision_image_message_window as i64);
     table["ai_request_retry_count"] = value(i64::from(app.ai_request_retry_count));

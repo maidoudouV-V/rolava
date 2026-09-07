@@ -11,9 +11,7 @@ use crate::ai_provider::{
 use crate::chat_history::load_chat_history_context;
 use crate::config::{AppConfig, ModelConfig};
 use crate::history_compression::render_summary_date_heading;
-use crate::memory::{
-    CharacterMemorySession, UserMemoryService, MAX_RETENTION_DAYS, SECONDS_PER_DAY,
-};
+use crate::memory::{GroupMemorySession, UserMemoryService, MAX_RETENTION_DAYS, SECONDS_PER_DAY};
 use crate::repository::db_manager::{ConversationRecord, QQChatContextManager};
 use crate::runtime_state::{RuntimeGroupMember, RuntimeState};
 use crate::scheduler::SchedulerService;
@@ -47,6 +45,7 @@ pub struct AdminState {
     app_config: Arc<RwLock<Arc<AppConfig>>>,
     // 与运行中的主模型一致；仅保存配置但未重启时，不提前切换窗口大小。
     context_history_limit: u32,
+    context_summary_days: u16,
     // 使用启动时的值，确保页面与运行中的模型上下文一致。
     context_summary_enabled: bool,
     pub config_path: PathBuf,
@@ -73,6 +72,7 @@ impl AdminState {
     ) -> Self {
         Self {
             context_history_limit: app_config.app.max_history_messages,
+            context_summary_days: app_config.app.history_summary_days,
             context_summary_enabled: app_config.app.history_summary_enabled,
             user_memory: Arc::new(UserMemoryService::new(db_manager.clone())),
             app_config: Arc::new(RwLock::new(app_config)),
@@ -124,12 +124,12 @@ pub fn router(state: Arc<AdminState>) -> Router {
             put(update_user_memory).delete(delete_user_memory),
         )
         .route(
-            "/conversations/{conversation_id}/character-memories",
-            get(character_memories).post(create_character_memory),
+            "/conversations/{conversation_id}/group-memories",
+            get(group_memories).post(create_group_memory),
         )
         .route(
-            "/conversations/{conversation_id}/character-memories/{memory_id}",
-            put(update_character_memory).delete(delete_character_memory),
+            "/conversations/{conversation_id}/group-memories/{memory_id}",
+            put(update_group_memory).delete(delete_group_memory),
         )
         .route(
             "/conversations/{conversation_id}/scheduled-tasks",
@@ -220,7 +220,7 @@ struct StatusResponse {
     direct_conversations: u64,
     messages_today: u64,
     user_memories: u64,
-    character_memories: u64,
+    group_memories: u64,
     scheduled_tasks: u64,
 }
 
@@ -241,7 +241,7 @@ async fn status(State(state): State<Arc<AdminState>>) -> Result<Json<StatusRespo
         direct_conversations: stats.direct_conversations,
         messages_today: stats.messages_today,
         user_memories: stats.user_memories,
-        character_memories: stats.character_memories,
+        group_memories: stats.group_memories,
         scheduled_tasks: stats.scheduled_tasks,
     }))
 }
@@ -760,6 +760,7 @@ async fn conversation_messages(
         state.context_history_limit,
         Local::now(),
         state.context_summary_enabled,
+        state.context_summary_days,
     )?;
     let summaries = history
         .summaries
@@ -906,12 +907,12 @@ async fn delete_user_memory(
     Ok(Json(json!({ "deleted": true })))
 }
 
-async fn character_memories(
+async fn group_memories(
     State(state): State<Arc<AdminState>>,
     Path(conversation_id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
     let conversation = get_conversation(&state, conversation_id)?;
-    let records = state.db_manager.get_character_memories(
+    let records = state.db_manager.get_group_memories(
         &conversation.source,
         &require_bot_id(&state)?,
         &conversation.source_conversation_id,
@@ -922,26 +923,28 @@ async fn character_memories(
         "title": memory.title,
         "content": memory.content,
         "expires_at": memory.expires_at,
+        "updated_at": memory.updated_at,
+        "permanent": memory.expires_at == 0,
         "remaining_days": ((memory.expires_at - now).max(0) + SECONDS_PER_DAY - 1) / SECONDS_PER_DAY,
-        "expiring": memory.expires_at <= now,
+        "expiring": memory.expires_at != 0 && memory.expires_at <= now,
     })).collect::<Vec<_>>();
     Ok(Json(json!({ "items": items })))
 }
 
 #[derive(Deserialize)]
-struct CharacterMemoryWrite {
+struct GroupMemoryWrite {
     title: String,
     content: String,
     retention_days: u16,
 }
 
-async fn create_character_memory(
+async fn create_group_memory(
     State(state): State<Arc<AdminState>>,
     Path(conversation_id): Path<i64>,
-    Json(request): Json<CharacterMemoryWrite>,
+    Json(request): Json<GroupMemoryWrite>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let conversation = get_conversation(&state, conversation_id)?;
-    let session = CharacterMemorySession::new(
+    let session = GroupMemorySession::new(
         message_target(&state, &conversation)?,
         state.db_manager.clone(),
     );
@@ -953,19 +956,25 @@ async fn create_character_memory(
     Ok((StatusCode::CREATED, Json(json!({ "message": result }))))
 }
 
-async fn update_character_memory(
+async fn update_group_memory(
     State(state): State<Arc<AdminState>>,
     Path((conversation_id, memory_id)): Path<(i64, i64)>,
-    Json(request): Json<CharacterMemoryWrite>,
+    Json(request): Json<GroupMemoryWrite>,
 ) -> Result<Json<Value>, ApiError> {
-    CharacterMemorySession::validate_title(request.title.trim())?;
-    CharacterMemorySession::validate_content(request.content.trim())?;
-    if !(1..=MAX_RETENTION_DAYS).contains(&request.retention_days) {
-        return Err(ApiError::bad_request("角色记忆时间必须在 1 到 365 天之间"));
+    GroupMemorySession::validate_title(request.title.trim())?;
+    GroupMemorySession::validate_content(request.content.trim())?;
+    if request.retention_days > MAX_RETENTION_DAYS {
+        return Err(ApiError::bad_request(
+            "群记忆时间必须在 0 到 365 天之间，0 表示永不过期",
+        ));
     }
     let conversation = get_conversation(&state, conversation_id)?;
-    let expires_at = Utc::now().timestamp() + i64::from(request.retention_days) * SECONDS_PER_DAY;
-    let updated = state.db_manager.update_character_memory_by_id(
+    let expires_at = if request.retention_days == 0 {
+        0
+    } else {
+        Utc::now().timestamp() + i64::from(request.retention_days) * SECONDS_PER_DAY
+    };
+    let updated = state.db_manager.update_group_memory_by_id(
         &conversation.source,
         &require_bot_id(&state)?,
         &conversation.source_conversation_id,
@@ -975,24 +984,24 @@ async fn update_character_memory(
         expires_at,
     )?;
     if !updated {
-        return Err(ApiError::not_found("角色记忆不存在"));
+        return Err(ApiError::not_found("群记忆不存在"));
     }
     Ok(Json(json!({ "updated": true })))
 }
 
-async fn delete_character_memory(
+async fn delete_group_memory(
     State(state): State<Arc<AdminState>>,
     Path((conversation_id, memory_id)): Path<(i64, i64)>,
 ) -> Result<Json<Value>, ApiError> {
     let conversation = get_conversation(&state, conversation_id)?;
-    let deleted = state.db_manager.delete_character_memory_by_id(
+    let deleted = state.db_manager.delete_group_memory_by_id(
         &conversation.source,
         &require_bot_id(&state)?,
         &conversation.source_conversation_id,
         memory_id,
     )?;
     if !deleted {
-        return Err(ApiError::not_found("角色记忆不存在"));
+        return Err(ApiError::not_found("群记忆不存在"));
     }
     Ok(Json(json!({ "deleted": true })))
 }

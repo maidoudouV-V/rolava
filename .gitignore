@@ -4,5 +4,4 @@
 *.db
 *.sqlite
 *.sqlite3
-/prompt/character.md
 /received_images/

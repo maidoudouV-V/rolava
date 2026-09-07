@@ -62,7 +62,7 @@
           <div class="metric-grid">
             <article><span class="metric-icon mint"><i data-lucide="messages-square"></i></span><div><small>全部会话</small><strong id="metric-conversations">-</strong><p id="metric-conversation-kinds">等待数据</p></div></article>
             <article><span class="metric-icon blue"><i data-lucide="message-circle-more"></i></span><div><small>今日消息</small><strong id="metric-messages">-</strong><p>数据库已接收消息</p></div></article>
-            <article><span class="metric-icon coral"><i data-lucide="brain"></i></span><div><small>保存记忆</small><strong id="metric-memories">-</strong><p>用户与角色记忆</p></div></article>
+            <article><span class="metric-icon coral"><i data-lucide="brain"></i></span><div><small>保存记忆</small><strong id="metric-memories">-</strong><p>用户与群记忆</p></div></article>
             <article><span class="metric-icon amber"><i data-lucide="calendar-clock"></i></span><div><small>定时任务</small><strong id="metric-tasks">-</strong><p>当前运行中的任务</p></div></article>
           </div>
           <section class="section-block"><div class="section-header"><div><h2>最近会话</h2><p>最近有消息活动的聊天</p></div></div><div class="recent-list" id="recent-conversations"><div class="empty">正在加载会话</div></div></section>
@@ -117,12 +117,12 @@
           <section class="section-block"><div class="optional-tool-row">
             <div class="optional-tool-copy"><span class="optional-tool-icon"><i data-lucide="notebook-text"></i></span><div><strong>历史聊天摘要</strong><p>启用会增加大量 Token 消耗，首次总结历史记录时尤其明显。</p><p>保存并重启后生效。启用后在启动时立即补总结今天之前的记录，之后每天凌晨 3 点执行。关闭后停止生成和使用摘要。</p></div></div>
             <label class="switch" aria-label="启用历史聊天摘要"><input id="history-summary-enabled" type="checkbox"><span></span></label>
-          </div></section>
+          </div><div class="form-grid three"><label>摘要显示天数<input id="history-summary-days" type="number" min="1" max="65535" value="30"><small>AI 上下文与聊天窗口共用；不删除旧摘要，保存并重启后生效。</small></label></div></section>
         </section>
 
         <section class="page" id="page-prompts">
           <div class="page-heading"><div><p class="eyebrow">PROMPTS</p><h1>角色与提示词</h1><p>维护机器人实际加载的 Markdown 提示词。</p></div></div>
-          <div class="prompt-layout"><aside class="prompt-list" id="prompt-list"><div class="empty">正在加载</div></aside><section class="prompt-editor"><header><div><strong id="prompt-title">选择提示词</strong><small id="prompt-meta">Markdown</small></div><button class="button primary small" id="save-prompt" disabled><i data-lucide="save"></i>保存并重启</button></header><label class="sr-only" for="prompt-content">提示词内容</label><textarea id="prompt-content" spellcheck="false" disabled></textarea><div class="placeholder-help"><strong>固定占位符</strong><div><code>{{character_prompt}}</code><span>角色卡正文</span></div><div><code>{{scene}}</code><span>会话类型、群名称与成员数量</span></div><div><code>{{recent_active_users}}</code><span>最近活跃用户及其记忆</span></div><div><code>{{character_memories}}</code><span>当前会话角色记忆</span></div><div><code>{{scheduled_tasks}}</code><span>当前会话运行中的定时任务</span></div><div><code>{{unread_since}}</code><span>本轮未读消息开始时间</span></div></div></section></div>
+          <div class="prompt-layout"><aside class="prompt-list" id="prompt-list"><div class="empty">正在加载</div></aside><section class="prompt-editor"><header><div><strong id="prompt-title">选择提示词</strong><small id="prompt-meta">Markdown</small></div><button class="button primary small" id="save-prompt" disabled><i data-lucide="save"></i>保存并重启</button></header><label class="sr-only" for="prompt-content">提示词内容</label><textarea id="prompt-content" spellcheck="false" disabled></textarea><div class="placeholder-help"><strong>固定占位符</strong><div><code>{{character_prompt}}</code><span>角色卡正文</span></div><div><code>{{scene}}</code><span>会话类型、群名称与成员数量</span></div><div><code>{{recent_active_users}}</code><span>最近活跃用户及其记忆</span></div><div><code>{{group_memories}}</code><span>当前会话群记忆</span></div><div><code>{{scheduled_tasks}}</code><span>当前会话运行中的定时任务</span></div><div><code>{{unread_since}}</code><span>本轮未读消息开始时间</span></div></div></section></div>
         </section>
 
         <section class="page config-page" id="page-access">
