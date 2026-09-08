@@ -156,8 +156,11 @@ pub fn write_enabled_skills(config_path: &Path, enabled_skills: &[String]) -> Re
     let mut document = source
         .parse::<DocumentMut>()
         .context("解析配置 TOML 失败")?;
-    let current = document["app"]["enabled_skills"]
-        .as_array()
+    let current = document
+        .get("app")
+        .and_then(Item::as_table)
+        .and_then(|app| app.get("enabled_skills"))
+        .and_then(Item::as_array)
         .map(|array| {
             array
                 .iter()
