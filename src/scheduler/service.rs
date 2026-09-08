@@ -245,6 +245,8 @@ impl SchedulerService {
             },
             trigger: ConversationTrigger {
                 user_prompt: prompt,
+                memory_review: false,
+                condition: None,
             },
         })
     }

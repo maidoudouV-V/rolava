@@ -179,62 +179,19 @@ pub struct PromptFileSummary {
     pub category: &'static str,
 }
 
-const INTERNAL_PROMPT_FILES: &[&str] = &[
-    "chat_history_summary",
-    "filter",
-    "image_description",
-    "web_search_agent",
-    "scheduled_task",
-    "scheduled_task_recovery",
-    "wait_for_reply_timeout",
-];
-
-pub fn list_prompt_files(config: &AppConfig) -> Result<Vec<PromptFileSummary>> {
-    let mut prompts = vec![
-        PromptFileSummary {
-            id: "system".into(),
-            name: "system.md".into(),
-            category: "core",
-        },
+pub fn list_prompt_files(_config: &AppConfig) -> Result<Vec<PromptFileSummary>> {
+    Ok(vec![
         PromptFileSummary {
             id: "character".into(),
-            name: "character.md".into(),
+            name: "角色卡".into(),
             category: "core",
         },
         PromptFileSummary {
             id: "reply_rules".into(),
-            name: "reply_rules.md".into(),
+            name: "回复规则".into(),
             category: "core",
         },
-        PromptFileSummary {
-            id: "instruction".into(),
-            name: "instruction.md".into(),
-            category: "core",
-        },
-    ];
-    prompts.extend(INTERNAL_PROMPT_FILES.iter().map(|name| PromptFileSummary {
-        id: format!("internal:{}", name),
-        name: format!("{}.md", name),
-        category: "internal",
-    }));
-    let actions_dir = Path::new(&config.app.prompt_dir).join("actions");
-    if actions_dir.exists() {
-        let mut actions = fs::read_dir(actions_dir)?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let path = entry.path();
-                (path.extension().and_then(|value| value.to_str()) == Some("md"))
-                    .then(|| path.file_stem()?.to_str().map(str::to_string))?
-            })
-            .collect::<Vec<_>>();
-        actions.sort();
-        prompts.extend(actions.into_iter().map(|name| PromptFileSummary {
-            id: format!("action:{}", name),
-            name: format!("{}.md", name),
-            category: "action",
-        }));
-    }
-    Ok(prompts)
+    ])
 }
 
 pub fn read_prompt(config: &AppConfig, prompt_id: &str) -> Result<String> {
@@ -255,35 +212,12 @@ pub fn write_prompt(config: &AppConfig, prompt_id: &str, content: &str) -> Resul
 }
 
 fn resolve_prompt_path(config: &AppConfig, prompt_id: &str) -> Result<PathBuf> {
-    let root = Path::new(&config.app.prompt_dir);
-    let path = match prompt_id {
-        "system" | "character" | "reply_rules" | "instruction" => {
-            root.join(format!("{}.md", prompt_id))
+    match prompt_id {
+        "character" | "reply_rules" => {
+            Ok(Path::new(&config.app.prompt_dir).join(format!("{}.md", prompt_id)))
         }
-        _ if prompt_id.starts_with("internal:") => {
-            let name = prompt_id.trim_start_matches("internal:");
-            if !INTERNAL_PROMPT_FILES.contains(&name) {
-                anyhow::bail!("未知运行时提示词 {}", prompt_id);
-            }
-            root.join("internal").join(format!("{}.md", name))
-        }
-        _ => {
-            let name = prompt_id
-                .strip_prefix("action:")
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("未知提示词 {}", prompt_id))?;
-            if !name.chars().all(|character| {
-                character.is_ascii_alphanumeric() || character == '_' || character == '-'
-            }) {
-                anyhow::bail!("动作提示词名称不合法");
-            }
-            root.join("actions").join(format!("{}.md", name))
-        }
-    };
-    if !path.is_file() {
-        anyhow::bail!("提示词不存在：{}", prompt_id);
+        _ => anyhow::bail!("此提示词不支持在管理页面访问：{}", prompt_id),
     }
-    Ok(path)
 }
 
 fn validate_update(update: &AdminConfigUpdate) -> Result<()> {
@@ -311,13 +245,13 @@ fn validate_update(update: &AdminConfigUpdate) -> Result<()> {
         .map(|name| name.trim())
         .collect::<std::collections::HashSet<_>>();
     if enabled_tools.len() != update.app.enabled_actions.len() {
-        anyhow::bail!("启用的可选工具不能重复");
+        anyhow::bail!("启用的可选模块不能重复");
     }
     if let Some(name) = enabled_tools
         .iter()
         .find(|name| !ToolRegistry::is_optional_tool(name))
     {
-        anyhow::bail!("未知的可选工具：{}", name);
+        anyhow::bail!("未知的可选模块：{}", name);
     }
     if enabled_tools.contains("agent_web_search")
         && update.app.web_search_model_name.trim().is_empty()

@@ -87,10 +87,6 @@ impl RuntimeState {
         self.groups.read().get(group_id).cloned()
     }
 
-    pub fn groups(&self) -> Vec<RuntimeGroupInfo> {
-        self.groups.read().values().cloned().collect()
-    }
-
     pub fn cached_group_members(&self, group_id: &str) -> Option<CachedGroupMembers> {
         self.group_members.read().get(group_id).cloned()
     }

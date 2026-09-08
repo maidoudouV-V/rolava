@@ -1,15 +1,5 @@
 use serde_json::Value;
 
-/// transport 层统一入站事件。
-/// 外部平台的原始协议先转换成这个结构，再进入后续业务流程。
-#[derive(Debug, Clone)]
-pub enum IncomingEvent {
-    /// 聊天消息事件。
-    Message(IncomingMessage),
-    /// 系统或平台事件，例如心跳、连接、生命周期变化。
-    System(IncomingSystemEvent),
-}
-
 /// 通用入站消息。
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
@@ -51,10 +41,6 @@ impl From<&IncomingMessage> for MessageTarget {
         }
     }
 }
-
-/// 通用系统事件。
-#[derive(Debug, Clone)]
-pub struct IncomingSystemEvent {}
 
 /// 消息所属会话。
 #[derive(Debug, Clone)]

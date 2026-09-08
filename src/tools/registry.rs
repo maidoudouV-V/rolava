@@ -6,8 +6,9 @@ use anyhow::{bail, Result};
 use super::{
     AgentWebSearchTool, ContinueConversationTool, CreateScheduledTaskTool, CreateUserMemoryTool,
     DeleteGroupMemoryTool, DeleteScheduledTaskTool, DeleteUserMemoryTool, EndConversationTool,
-    GetScheduledTaskTool, SendQqExpressionTool, SetGroupMemoryTool, Tool, ToolCall, ToolContext,
-    ToolDefinition, ToolResult, UpdateScheduledTaskTool, UpdateUserMemoryTool, WaitForReplyTool,
+    GetScheduledTaskTool, ReadContentTool, SendQqExpressionTool, SetGroupMemoryTool, Tool,
+    ToolCall, ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool,
+    UpdateUserMemoryTool, WaitForReplyTool,
 };
 
 /// 管理后台可配置的工具信息；固定启用的内部工具不会出现在这里。
@@ -20,7 +21,6 @@ pub struct OptionalToolDefinition {
 
 const WEB_SEARCH_MODULE: &str = "agent_web_search";
 const MEMORY_MODULE: &str = "memory";
-const SCHEDULED_TASKS_MODULE: &str = "scheduled_tasks";
 
 /// 已注册工具的稳定有序集合。
 #[derive(Default)]
@@ -36,11 +36,11 @@ impl ToolRegistry {
     /// 注册固定工具以及配置中明确启用的可选工具。
     pub fn built_in(enabled_optional_tools: &[String]) -> Self {
         let mut registry = Self::new();
-        // registry.register(super::SendMessageTool).unwrap();
         if Self::is_enabled(enabled_optional_tools, WEB_SEARCH_MODULE) {
             registry.register(AgentWebSearchTool).unwrap();
         }
         registry.register(SendQqExpressionTool).unwrap();
+        registry.register(ReadContentTool).unwrap();
         if Self::is_enabled(enabled_optional_tools, MEMORY_MODULE) {
             // 一个模块开关统一控制群记忆和用户记忆的全部维护工具。
             registry.register(SetGroupMemoryTool).unwrap();
@@ -50,12 +50,10 @@ impl ToolRegistry {
             registry.register(DeleteUserMemoryTool).unwrap();
         }
         registry.register(WaitForReplyTool::new()).unwrap();
-        if Self::is_enabled(enabled_optional_tools, SCHEDULED_TASKS_MODULE) {
-            registry.register(CreateScheduledTaskTool).unwrap();
-            registry.register(GetScheduledTaskTool).unwrap();
-            registry.register(UpdateScheduledTaskTool).unwrap();
-            registry.register(DeleteScheduledTaskTool).unwrap();
-        }
+        registry.register(CreateScheduledTaskTool).unwrap();
+        registry.register(GetScheduledTaskTool).unwrap();
+        registry.register(UpdateScheduledTaskTool).unwrap();
+        registry.register(DeleteScheduledTaskTool).unwrap();
         registry.register(ContinueConversationTool).unwrap();
         registry.register(EndConversationTool).unwrap();
         registry
@@ -67,17 +65,12 @@ impl ToolRegistry {
             OptionalToolDefinition {
                 name: WEB_SEARCH_MODULE,
                 display_name: "网络搜索",
-                description: "让主模型在需要实时信息时查询互联网。",
+                description: "启用网络搜索工具及相关提示词，保存并重启后生效。",
             },
             OptionalToolDefinition {
                 name: MEMORY_MODULE,
                 display_name: "记忆",
-                description: "允许主模型维护群记忆和用户记忆。",
-            },
-            OptionalToolDefinition {
-                name: SCHEDULED_TASKS_MODULE,
-                display_name: "定时任务",
-                description: "允许主模型创建和管理当前会话的定时任务。",
+                description: "启用记忆工具、记忆上下文与提示词及自动整理；关闭不删除已有记忆，保存并重启后生效。",
             },
         ]
     }
@@ -88,7 +81,7 @@ impl ToolRegistry {
             .any(|definition| definition.name == name)
     }
 
-    fn is_enabled(enabled_optional_tools: &[String], module: &str) -> bool {
+    pub fn is_enabled(enabled_optional_tools: &[String], module: &str) -> bool {
         enabled_optional_tools
             .iter()
             .any(|name| name.trim() == module)
@@ -108,6 +101,20 @@ impl ToolRegistry {
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|tool| tool.definition()).collect()
+    }
+
+    /// 按名称选择当前注册器中已有的工具；未注册或未启用的名称会被忽略。
+    /// 返回的注册器仅能定义和执行选中的工具，不会重新启用已关闭的模块。
+    /// 工具实例及其内部状态与原注册器共享，不应跨独立会话复用有状态工具。
+    pub fn select(&self, names: &[&str]) -> Self {
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .filter(|(name, _)| names.contains(name))
+                .map(|(name, tool)| (*name, tool.clone()))
+                .collect(),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {

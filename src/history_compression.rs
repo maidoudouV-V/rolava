@@ -3,16 +3,21 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, TimeZone, Utc, Weekday};
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::ai_provider::{ToolChatMessage, ToolChatResponse, ToolChatUserContent};
+use crate::ai_provider::{
+    run_ai_request_with_timeout, ToolChatMessage, ToolChatResponse, ToolChatUserContent,
+};
 use crate::chat_history::render_history_message_line;
 use crate::config::AppConfig;
+use crate::conversation_trigger::{ConversationTrigger, RoutedConversationTrigger};
 use crate::repository::db_manager::{
     ChatMessage, NewConversationDailySummary, PendingDailySummary, QQChatContextManager,
 };
 use crate::runtime_state::RuntimeState;
+use crate::tools::ToolRegistry;
+use crate::transport::message::{Conversation, ConversationKind, MessageTarget};
 
 const COMPRESSION_RUN_HOUR: u32 = 3;
 
@@ -21,6 +26,7 @@ pub struct HistoryCompressionService {
     app_config: Arc<AppConfig>,
     db_manager: Arc<QQChatContextManager>,
     runtime_state: Arc<RuntimeState>,
+    trigger_tx: tokio::sync::mpsc::UnboundedSender<RoutedConversationTrigger>,
 }
 
 #[derive(Default)]
@@ -35,11 +41,13 @@ impl HistoryCompressionService {
         app_config: Arc<AppConfig>,
         db_manager: Arc<QQChatContextManager>,
         runtime_state: Arc<RuntimeState>,
+        trigger_tx: tokio::sync::mpsc::UnboundedSender<RoutedConversationTrigger>,
     ) -> Self {
         Self {
             app_config,
             db_manager,
             runtime_state,
+            trigger_tx,
         }
     }
 
@@ -160,17 +168,65 @@ impl HistoryCompressionService {
         // 消息已经按事件时间和 ID 排序，首尾 ID 必须反映实际总结输入的顺序。
         let source_first_message_id = messages.first().expect("消息列表已检查为非空").id;
         let source_last_message_id = messages.last().expect("消息列表已检查为非空").id;
-        self.db_manager
-            .insert_conversation_daily_summary(&NewConversationDailySummary {
-                conversation_id: task.conversation_id,
-                summary_date: &task.summary_date,
-                period_start: period_start.timestamp(),
-                period_end: period_end.timestamp(),
-                summary_text: &summary_text,
-                source_message_count: messages.len() as i64,
-                source_first_message_id,
-                source_last_message_id,
+        let inserted =
+            self.db_manager
+                .insert_conversation_daily_summary(&NewConversationDailySummary {
+                    conversation_id: task.conversation_id,
+                    summary_date: &task.summary_date,
+                    period_start: period_start.timestamp(),
+                    period_end: period_end.timestamp(),
+                    summary_text: &summary_text,
+                    source_message_count: messages.len() as i64,
+                    source_first_message_id,
+                    source_last_message_id,
+                })?;
+        if inserted && ToolRegistry::is_enabled(&self.app_config.app.enabled_actions, "memory") {
+            if let Err(error) = self.trigger_memory_review(task, &summary_text) {
+                warn!(error = %format!("{error:#}"), summary_date = %task.summary_date, "摘要已保存，但记忆整理任务投递失败");
+            }
+        }
+        Ok(inserted)
+    }
+
+    fn trigger_memory_review(&self, task: &PendingDailySummary, summary: &str) -> Result<()> {
+        let conversation = self
+            .db_manager
+            .get_conversation_by_id(task.conversation_id)?
+            .context("摘要会话不存在")?;
+        let kind = match conversation.kind.as_str() {
+            "group" => ConversationKind::Group,
+            "direct" => ConversationKind::Direct,
+            kind => anyhow::bail!("未知会话类型：{}", kind),
+        };
+        let user_prompt = crate::config::render_prompt_template(
+            &self.app_config.prompt_config.memory_review_prompt,
+            &[
+                ("summary_date", &task.summary_date),
+                ("daily_summary", summary),
+            ],
+        );
+        self.trigger_tx
+            .send(RoutedConversationTrigger {
+                target: MessageTarget {
+                    source: task.source.clone(),
+                    bot_id: self
+                        .runtime_state
+                        .bot_id()
+                        .context("记忆整理缺少机器人账号")?,
+                    conversation: Conversation {
+                        id: task.source_conversation_id.clone(),
+                        kind,
+                        title: conversation.title,
+                    },
+                },
+                trigger: ConversationTrigger {
+                    user_prompt,
+                    memory_review: true,
+                    condition: None,
+                },
             })
+            .context("投递记忆整理任务失败")?;
+        Ok(())
     }
 
     async fn request_summary(&self, messages: &[ToolChatMessage]) -> Result<String> {
@@ -184,17 +240,8 @@ impl HistoryCompressionService {
                 .get(&self.app_config.app.chat_model_name)
                 .expect("找不到聊天模型配置");
             let request = provider.chat_completions(messages, &[]);
-            let result = if timeout_seconds == 0 {
-                request.await
-            } else {
-                match timeout(Duration::from_secs(timeout_seconds), request).await {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "聊天记录压缩请求超时，超过 {} 秒",
-                        timeout_seconds
-                    )),
-                }
-            };
+            let result =
+                run_ai_request_with_timeout(timeout_seconds, "聊天记录压缩请求", request).await;
             match result.and_then(completed_summary_text) {
                 Ok(content) => return Ok(content),
                 Err(error) => {

@@ -1917,7 +1917,11 @@ impl OneBotHttpServer {
         let conversation_id = target.conversation.id.clone();
         if let Err(error) = self.trigger_tx.send(RoutedConversationTrigger {
             target,
-            trigger: ConversationTrigger { user_prompt },
+            trigger: ConversationTrigger {
+                user_prompt,
+                memory_review: false,
+                condition: None,
+            },
         }) {
             error!(conversation_id, user_id, error = %error, "戳一戳触发会话失败");
         } else {

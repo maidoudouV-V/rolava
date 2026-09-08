@@ -179,8 +179,26 @@ impl UserMemorySession {
         self.apply_candidates(candidates);
     }
 
+    /// 后台整理加载原始聊天窗口内的全部用户，不受普通聊天的扫描条数和人数限制。
+    pub async fn refresh_history_users(&self, history: &[ChatMessage]) {
+        let messages = history.iter().rev().collect::<Vec<_>>();
+        let mut candidates = self.collect_candidates(&messages);
+        self.resolve_missing_profiles(&mut candidates).await;
+        *self.active_users.lock() = candidates
+            .into_iter()
+            .map(|candidate| ActiveMemoryUser {
+                qq_nickname: candidate
+                    .qq_nickname
+                    .unwrap_or_else(|| candidate.user_id.clone()),
+                user_id: candidate.user_id,
+                group_card: candidate.group_card,
+                last_relevant_message_id: candidate.last_relevant_message_id,
+            })
+            .collect();
+    }
+
     /// 渲染 instruction.md 中最近活跃用户的动态内容。
-    pub fn render_prompt(&self) -> Result<String> {
+    pub fn render_prompt(&self, memory_enabled: bool) -> Result<String> {
         let active_users = self.active_users.lock().clone();
         if active_users.is_empty() {
             return Ok("当前没有最近活跃用户".to_string());
@@ -188,24 +206,29 @@ impl UserMemorySession {
 
         let mut output = String::new();
         for user in active_users {
-            let memories = self.db_manager.get_user_memories(
-                &self.target.source,
-                &self.target.bot_id,
-                &user.user_id,
-            )?;
             output.push_str("---\n");
             match self.target.conversation.kind {
                 ConversationKind::Group => output.push_str(&format!(
-                    "- QQ号：{}；账户昵称：{}；当前群昵称：{}\n- 记忆：\n",
+                    "- QQ号：{}；账户昵称：{}；当前群昵称：{}\n",
                     user.user_id,
                     user.qq_nickname,
                     user.group_card.as_deref().unwrap_or(&user.qq_nickname),
                 )),
                 ConversationKind::Direct => output.push_str(&format!(
-                    "- QQ号：{}；账户昵称：{}\n- 记忆：\n",
+                    "- QQ号：{}；账户昵称：{}\n",
                     user.user_id, user.qq_nickname,
                 )),
             }
+            if !memory_enabled {
+                output.push_str("---\n");
+                continue;
+            }
+            let memories = self.db_manager.get_user_memories(
+                &self.target.source,
+                &self.target.bot_id,
+                &user.user_id,
+            )?;
+            output.push_str("- 记忆：\n");
             if memories.is_empty() {
                 output.push_str("    没有关于ta的记忆\n");
             } else {
@@ -281,16 +304,18 @@ impl UserMemorySession {
         let mut candidate_indexes = HashMap::<String, usize>::new();
 
         for message in messages {
-            Self::push_candidate(
-                &mut candidates,
-                &mut candidate_indexes,
-                ActiveUserCandidate {
-                    user_id: message.sender_id.clone(),
-                    qq_nickname: Self::non_empty(message.sender_display_name.clone()),
-                    group_card: message.sender_nickname.clone().and_then(Self::non_empty),
-                    last_relevant_message_id: message.id,
-                },
-            );
+            if message.sender_id != self.target.bot_id {
+                Self::push_candidate(
+                    &mut candidates,
+                    &mut candidate_indexes,
+                    ActiveUserCandidate {
+                        user_id: message.sender_id.clone(),
+                        qq_nickname: Self::non_empty(message.sender_display_name.clone()),
+                        group_card: message.sender_nickname.clone().and_then(Self::non_empty),
+                        last_relevant_message_id: message.id,
+                    },
+                );
+            }
 
             for user_id in Self::stored_message_mentions(message, &self.target.bot_id) {
                 Self::push_candidate(

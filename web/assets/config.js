@@ -9,7 +9,7 @@ export class ConfigController {
     this.catalog = [];
     this.visibleCatalog = [];
     this.catalogModelIndex = null;
-    this.toolIcons = { agent_web_search: "globe-2", memory: "brain", scheduled_tasks: "calendar-clock" };
+    this.toolIcons = { agent_web_search: "globe-2", memory: "brain" };
     document.querySelectorAll(".config-page input,.config-page select,.config-page textarea").forEach(element => element.addEventListener("input", onDirty));
     document.getElementById("add-provider").addEventListener("click", () => this.addProvider());
     document.getElementById("add-model").addEventListener("click", () => this.addModel());
@@ -60,7 +60,7 @@ export class ConfigController {
     document.getElementById("tool-list").innerHTML = this.optionalTools.map(tool => `<div class="optional-tool-row">
       <div class="optional-tool-copy"><span class="optional-tool-icon"><i data-lucide="${this.toolIcons[tool.name] || "wrench"}"></i></span><div><strong>${escapeHtml(tool.display_name)}</strong><p>${escapeHtml(tool.description)}</p></div></div>
       <label class="switch" aria-label="启用${escapeHtml(tool.display_name)}"><input type="checkbox" data-optional-tool="${escapeHtml(tool.name)}" ${enabledTools.has(tool.name) ? "checked" : ""}><span></span></label>
-    </div>`).join("") || '<div class="empty">暂无可选工具</div>';
+    </div>`).join("") || '<div class="empty">暂无可选模块</div>';
     refreshIcons();
   }
 

@@ -1,13 +1,18 @@
+{{#memory}}
 # 记忆内容
 ## 群记忆内容
 {{group_memories}}
+{{/memory}}
+
 ## 最近活跃用户
 {{recent_user_memories}}
 
 # 当前状态
 - 当前对话场景:{{scene}}
 - 当前日期:{{date}}
+{{#unread}}
 - 当前未读消息从 {{unread_message_time}} 开始
+{{/unread}}
 
 # 当前运行中的定时任务
 {{scheduled_tasks}}

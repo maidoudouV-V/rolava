@@ -46,22 +46,19 @@ pub struct ReasoningState {
     pub replay: Option<ReasoningPayload>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ChatResponse {
-    /// 模型最终返回给用户的主回复文本。
-    pub content: String,
-    /// 模型返回的推理信息。
-    pub reasoning: ReasoningState,
-    /// 本次生成结束的原因，例如正常停止或长度截断。
-    pub finish_reason: Option<String>,
-    /// 服务端为本次响应分配的唯一 ID。
-    pub id: Option<String>,
-    /// 服务端实际使用并返回的模型名称。
-    pub model: Option<String>,
-    /// 本次请求的 token 用量统计。
-    pub usage: Option<ChatUsage>,
-    /// 服务端返回的原始 JSON，便于调试和兼容扩展字段。
-    pub raw_response: Value,
+/// 为 AI 请求统一设置超时；0 表示不限时，重试及响应校验仍由调用方负责。
+pub(crate) async fn run_ai_request_with_timeout<T>(
+    timeout_seconds: u64,
+    request_name: &str,
+    request: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if timeout_seconds == 0 {
+        return request.await;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), request).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("{}超时，超过 {} 秒", request_name, timeout_seconds),
+    }
 }
 
 /// 支持 function tools 的通用对话消息。

@@ -834,6 +834,7 @@ async fn user_memories(
         by_user.entry(memory.user_id).or_default().push(json!({
             "id": memory.memory_id,
             "content": memory.content,
+            "updated_date": crate::memory::format_memory_time(memory.updated_at)?,
         }));
     }
     let users = members
@@ -924,6 +925,7 @@ async fn group_memories(
         "content": memory.content,
         "expires_at": memory.expires_at,
         "updated_at": memory.updated_at,
+        "updated_date": chrono::DateTime::from_timestamp(memory.updated_at, 0).map(|time| time.with_timezone(&Local).format("%Y-%m-%d").to_string()),
         "permanent": memory.expires_at == 0,
         "remaining_days": ((memory.expires_at - now).max(0) + SECONDS_PER_DAY - 1) / SECONDS_PER_DAY,
         "expiring": memory.expires_at != 0 && memory.expires_at <= now,

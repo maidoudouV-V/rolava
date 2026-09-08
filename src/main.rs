@@ -15,7 +15,9 @@ mod repository;
 mod resource_cleanup;
 mod runtime_state;
 mod scheduler;
+pub mod skills;
 mod startup_history_sync;
+pub mod text_utils;
 pub mod tools;
 mod transport;
 
@@ -155,6 +157,7 @@ async fn run_worker() -> Result<WorkerExit> {
         app_config.clone(),
         db_manager.clone(),
         runtime.clone(),
+        internal_trigger_tx.clone(),
     ));
     let message_ingestion = Arc::new(MessageIngestionService::new(
         app_config.clone(),

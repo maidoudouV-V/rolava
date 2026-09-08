@@ -14,7 +14,7 @@ export class PromptController {
 
   async load() {
     const response = await api.get("/prompts");
-    const items = response.items.filter(item => item.category === "core");
+    const items = response.items.filter(item => ["character", "reply_rules"].includes(item.id));
     document.getElementById("prompt-list").innerHTML = `
       <p class="prompt-category">核心提示词</p>
       ${items.map(item => `<button class="prompt-button" data-prompt-id="${escapeHtml(item.id)}">${escapeHtml(item.name)}</button>`).join("")}

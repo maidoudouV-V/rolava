@@ -33,7 +33,7 @@ pub struct ConversationFilter {
     message_ingestion: Arc<MessageIngestionService>,
     conversation_control: Arc<ConversationControl>,
     filter_context: Vec<ContextMessage>,
-    filter_context_initialized: bool,
+    last_filter_message_id: Option<i64>,
 }
 
 impl ConversationFilter {
@@ -49,14 +49,14 @@ impl ConversationFilter {
             message_ingestion,
             conversation_control,
             filter_context: Vec::new(),
-            filter_context_initialized: false,
+            last_filter_message_id: None,
         }
     }
 
     /// 清除过滤模型的当前会话缓存；下一条普通消息会从数据库重新初始化。
     pub fn reset_conversation_state(&mut self) {
         self.filter_context.clear();
-        self.filter_context_initialized = false;
+        self.last_filter_message_id = None;
     }
 
     /// 批量完成基础过滤、消息增强和入库，只返回可以进入后续处理的消息。
@@ -139,33 +139,34 @@ impl ConversationFilter {
         }
     }
 
-    /// 首次加载最近 50 条历史，后续只追加新消息；达到 100 条时淘汰最老 50 条。
+    /// 首次加载最近 50 条历史，后续按入库 ID 补入双方新消息；达到 100 条时淘汰最老 50 条。
     fn update_filter_context(
         &mut self,
         incoming_messages: &[FilteredMessage],
     ) -> anyhow::Result<()> {
-        if !self.filter_context_initialized {
-            let conversation = incoming_messages
-                .last()
-                .expect("非空消息批次必须包含最后一条消息")
-                .message
-                .clone();
-            let history = self.db_manager.get_latest_conversation_history(
-                &conversation.source,
-                &conversation.conversation.id,
-                INITIAL_FILTER_CONTEXT_MESSAGES,
-            )?;
-            self.filter_context = history
-                .iter()
-                .map(|message| Self::history_context_message(message, &conversation.bot_id))
-                .collect();
-            self.filter_context_initialized = true;
+        let conversation = &incoming_messages
+            .last()
+            .expect("非空消息批次必须包含最后一条消息")
+            .message;
+        let limit = if self.last_filter_message_id.is_some() {
+            MAX_FILTER_CONTEXT_MESSAGES as u32
         } else {
-            self.filter_context.extend(
-                incoming_messages
-                    .iter()
-                    .map(|message| Self::incoming_context_message(&message.message)),
-            );
+            INITIAL_FILTER_CONTEXT_MESSAGES
+        };
+        let history = self.db_manager.get_latest_conversation_history(
+            &conversation.source,
+            &conversation.conversation.id,
+            limit,
+        )?;
+        let after_message_id = self.last_filter_message_id;
+        self.filter_context.extend(
+            history
+                .iter()
+                .filter(|message| after_message_id.is_none_or(|id| message.id > id))
+                .map(|message| Self::history_context_message(message, &conversation.bot_id)),
+        );
+        if let Some(message) = history.last() {
+            self.last_filter_message_id = Some(message.id);
         }
 
         Self::trim_filter_context(&mut self.filter_context);
@@ -174,7 +175,7 @@ impl ConversationFilter {
     }
 
     fn trim_filter_context(context: &mut Vec<ContextMessage>) {
-        if context.len() >= MAX_FILTER_CONTEXT_MESSAGES {
+        while context.len() >= MAX_FILTER_CONTEXT_MESSAGES {
             let drop_count = FILTER_CONTEXT_DROP_MESSAGES.min(context.len());
             context.drain(..drop_count);
         }
@@ -270,20 +271,6 @@ impl ConversationFilter {
                 role: MessageRole::User,
                 content: format!("{}: {}", sender_name, content),
             }
-        }
-    }
-
-    fn incoming_context_message(message: &IncomingMessage) -> ContextMessage {
-        ContextMessage {
-            role: MessageRole::User,
-            content: format!(
-                "{}: {}",
-                preferred_sender_name(
-                    &message.sender.display_name,
-                    message.sender.nickname.as_deref(),
-                ),
-                message.content.text
-            ),
         }
     }
 

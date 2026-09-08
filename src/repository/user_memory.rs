@@ -20,6 +20,7 @@ pub struct OwnedUserMemoryRecord {
     pub user_id: String,
     pub memory_id: String,
     pub content: String,
+    pub updated_at: i64,
 }
 
 impl QQChatContextManager {
@@ -143,7 +144,7 @@ impl QQChatContextManager {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT user_id, memory_id, content FROM user_memories
+            "SELECT user_id, memory_id, content, updated_at FROM user_memories
              WHERE source = ? AND bot_id = ? AND user_id IN ({})
              ORDER BY user_id ASC, id DESC",
             placeholders
@@ -160,6 +161,7 @@ impl QQChatContextManager {
                     user_id: row.get(0)?,
                     memory_id: row.get(1)?,
                     content: row.get(2)?,
+                    updated_at: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

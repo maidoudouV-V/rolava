@@ -37,6 +37,21 @@ struct PendingWaitTasks {
     targets: HashMap<String, u64>,
 }
 
+impl PendingWaitTasks {
+    fn should_trigger(
+        &mut self,
+        target: &str,
+        task_id: u64,
+        has_replied: impl FnOnce() -> Result<bool>,
+    ) -> Result<bool> {
+        if self.targets.get(target) != Some(&task_id) {
+            return Ok(false);
+        }
+        self.targets.remove(target);
+        Ok(!has_replied()?)
+    }
+}
+
 impl WaitForReplyTool {
     pub fn new() -> Self {
         Self {
@@ -141,48 +156,39 @@ impl Tool for WaitForReplyTool {
                     return;
                 }
 
-                let replied = db_manager.has_sender_message_after(
-                    &source,
-                    &conversation_id,
-                    &task_target,
-                    after_message_id,
-                );
-
-                let is_current = {
+                let user_prompt = render_prompt_template(
+                    &timeout_prompt,
+                    &[("user_id", &task_target), ("reason", &reason)],
+                )
+                .trim()
+                .to_string();
+                let condition_target = task_target.clone();
+                let condition_tasks = pending_tasks.clone();
+                // 校验随事件进入同一会话队列，排在前面的回复先完成入库。
+                let condition = Box::new(move || {
+                    condition_tasks
+                        .lock()
+                        .should_trigger(&condition_target, task_id, || {
+                            db_manager.has_sender_message_after(
+                                &source,
+                                &conversation_id,
+                                &condition_target,
+                                after_message_id,
+                            )
+                        })
+                });
+                if let Err(error) = trigger_sender.send_trigger(ConversationTrigger {
+                    user_prompt,
+                    memory_review: false,
+                    condition: Some(condition),
+                }) {
                     let mut pending = pending_tasks.lock();
-                    if pending.targets.get(&task_target) != Some(&task_id) {
-                        false
-                    } else {
+                    if pending.targets.get(&task_target) == Some(&task_id) {
                         pending.targets.remove(&task_target);
-                        true
                     }
-                };
-                if !is_current {
-                    return;
-                }
-
-                match replied {
-                    Ok(true) => {
-                        info!("目标已在等待期间回复，不再触发模型");
-                    }
-                    Ok(false) => {
-                        let user_prompt = render_prompt_template(
-                            &timeout_prompt,
-                            &[("user_id", &task_target), ("reason", &reason)],
-                        )
-                        .trim()
-                        .to_string();
-                        if let Err(error) =
-                            trigger_sender.send_trigger(ConversationTrigger { user_prompt })
-                        {
-                            error!(error = %format!("{error:#}"), "等待回复到期后触发会话失败");
-                        } else {
-                            info!("等待回复到期，已触发会话");
-                        }
-                    }
-                    Err(error) => {
-                        error!(error = %format!("{error:#}"), "检查目标是否在等待期间回复失败");
-                    }
+                    error!(error = %format!("{error:#}"), "等待回复到期后触发会话失败");
+                } else {
+                    info!("等待回复到期，已排队等待会话校验");
                 }
             }
             .instrument(task_span),

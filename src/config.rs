@@ -72,6 +72,9 @@ pub struct LoggingSection {
 pub struct AppSection {
     /// 模板目录路径
     pub prompt_dir: String,
+    /// Skill 目录，相对路径以主配置文件所在目录为基准。
+    #[serde(default = "default_skills_dir")]
+    pub skills_dir: String,
     /// 发送给模型的最大历史消息数。
     pub max_history_messages: u32,
     /// 是否生成并使用历史摘要；默认关闭，重启后生效。
@@ -104,7 +107,7 @@ pub struct AppSection {
     pub ai_request_timeout_seconds: u64,
     /// 接收到的图片本地保存目录。
     pub received_image_dir: String,
-    /// 启用的可选工具列表；固定工具不需要写入。
+    /// 启用的可选模块列表；定时任务等固定能力不需要写入。
     pub enabled_actions: Vec<String>,
     /// 私聊白名单 QQ 号，空数组表示放行所有私聊。
     pub direct_whitelist: Vec<String>,
@@ -121,6 +124,82 @@ impl AppSection {
     pub fn ai_request_max_attempts(&self) -> u32 {
         self.ai_request_retry_count.saturating_add(1).max(1)
     }
+}
+
+pub fn render_module_sections(template: &str, enabled_modules: &[String]) -> Result<String> {
+    render_prompt_sections(
+        template,
+        &[
+            (
+                "memory",
+                enabled_modules.iter().any(|name| name.trim() == "memory"),
+            ),
+            (
+                "agent_web_search",
+                enabled_modules
+                    .iter()
+                    .any(|name| name.trim() == "agent_web_search"),
+            ),
+        ],
+    )
+}
+
+/// 按显式条件块裁剪模板；未在本阶段求值的条件保留，所有标记均校验配对。
+pub fn render_prompt_sections(template: &str, conditions: &[(&str, bool)]) -> Result<String> {
+    let mut output = String::new();
+    let mut stack = Vec::<(&str, bool, bool)>::new();
+    let mut remaining = template;
+    let mut visible = true;
+    while let Some(start) = remaining.find("{{") {
+        if visible {
+            output.push_str(&remaining[..start]);
+        }
+        let token_start = &remaining[start..];
+        let end = token_start
+            .find("}}")
+            .ok_or_else(|| anyhow::anyhow!("提示词标记缺少结束符：{}", token_start))?;
+        let token = &token_start[2..end];
+        let raw = &token_start[..end + 2];
+        if let Some(name) = token.strip_prefix('#') {
+            if !["memory", "agent_web_search", "unread"].contains(&name) {
+                anyhow::bail!("未知提示词条件：{}", name);
+            }
+            let value = conditions
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| *value);
+            if visible && value.is_none() {
+                output.push_str(raw);
+            }
+            stack.push((name, visible, value.is_none()));
+            visible &= value.unwrap_or(true);
+        } else if let Some(name) = token.strip_prefix('/') {
+            let (opened, parent_visible, preserve) = stack
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("提示词条件缺少开始标记：{}", name))?;
+            if opened != name {
+                anyhow::bail!("提示词条件标记不匹配：{} / {}", opened, name);
+            }
+            visible = parent_visible;
+            if visible && preserve {
+                output.push_str(raw);
+            }
+        } else if visible {
+            output.push_str(raw);
+        }
+        remaining = &token_start[end + 2..];
+    }
+    if let Some((name, _, _)) = stack.last() {
+        anyhow::bail!("提示词条件缺少结束标记：{}", name);
+    }
+    if visible {
+        output.push_str(remaining);
+    }
+    Ok(output)
+}
+
+fn default_skills_dir() -> String {
+    "skills".to_string()
 }
 
 pub fn default_history_summary_days() -> u16 {
@@ -234,6 +313,7 @@ pub struct AppConfig {
     pub model_capabilities: HashMap<String, ModelCapabilities>,
     /// 提示词配置
     pub prompt_config: PromptConfig,
+    pub skills: crate::skills::SkillCatalog,
     /// 日志输出配置。
     pub logging: LoggingSection,
     /// 管理后台认证配置。
@@ -252,7 +332,7 @@ impl AppConfig {
             )
         })?;
         let TomlConfig {
-            app,
+            mut app,
             server,
             providers,
             models,
@@ -269,19 +349,22 @@ impl AppConfig {
             anyhow::bail!("每群启动历史消息数不能超过 999");
         }
 
+        // 定时任务现为固定能力，忽略旧配置中的开关项。
+        app.enabled_actions
+            .retain(|name| name.trim() != "scheduled_tasks");
         let enabled_tools = app
             .enabled_actions
             .iter()
             .map(|name| name.trim())
             .collect::<HashSet<_>>();
         if enabled_tools.len() != app.enabled_actions.len() {
-            anyhow::bail!("启用的可选工具不能为空或重复");
+            anyhow::bail!("启用的可选模块不能为空或重复");
         }
         if let Some(name) = enabled_tools
             .iter()
             .find(|name| !ToolRegistry::is_optional_tool(name))
         {
-            anyhow::bail!("未知的可选工具：{}", name);
+            anyhow::bail!("未知的可选模块：{}", name);
         }
         if enabled_tools.contains("agent_web_search") && app.web_search_model_name.trim().is_empty()
         {
@@ -371,7 +454,23 @@ impl AppConfig {
         }
 
         let prompt_dir = Self::resolve_configured_path(config_path, &app.prompt_dir);
-        let prompt_config = PromptConfig::new(&prompt_dir)?;
+        if app.skills_dir.trim().is_empty() {
+            anyhow::bail!("skills_dir 不能为空");
+        }
+        let skills_dir = Self::resolve_configured_path(config_path, &app.skills_dir);
+        let skills = crate::skills::SkillCatalog::discover(&skills_dir)?;
+        tracing::info!(directory = %skills_dir.display(), count = skills.len(), "Skill 元数据加载完成");
+        let mut prompt_config = PromptConfig::new(&prompt_dir)?;
+        prompt_config.system_prompt =
+            render_module_sections(&prompt_config.system_prompt, &app.enabled_actions)
+                .context("system.md 条件标记错误")?;
+        // Skill 清单只包含启动时发现的元数据和虚拟入口路径，正文由模型按需读取。
+        let skill_list = skills.render_prompt_list();
+        prompt_config.system_prompt =
+            render_prompt_template(&prompt_config.system_prompt, &[("skills", &skill_list)]);
+        prompt_config.instruction_prompt =
+            render_module_sections(&prompt_config.instruction_prompt, &app.enabled_actions)
+                .context("instruction.md 条件标记错误")?;
         // 表情映射与主配置放在同一目录，启动时加载一次供所有消息转换复用。
         let face_id_map_path = config_path
             .parent()
@@ -397,6 +496,7 @@ impl AppConfig {
             models,
             model_capabilities,
             prompt_config,
+            skills,
             logging,
             admin,
             face_id_map,
@@ -433,6 +533,7 @@ pub struct PromptConfig {
     pub scheduled_task_prompt: String,
     pub scheduled_task_recovery_prompt: String,
     pub wait_for_reply_timeout_prompt: String,
+    pub memory_review_prompt: String,
     pub chat_history_summary_prompt: String,
 }
 impl PromptConfig {
@@ -456,6 +557,7 @@ impl PromptConfig {
             scheduled_task_prompt: read_prompt("internal/scheduled_task.md")?,
             scheduled_task_recovery_prompt: read_prompt("internal/scheduled_task_recovery.md")?,
             wait_for_reply_timeout_prompt: read_prompt("internal/wait_for_reply_timeout.md")?,
+            memory_review_prompt: read_prompt("internal/memory_review.md")?,
             chat_history_summary_prompt: read_prompt("internal/chat_history_summary.md")?,
         };
         Ok(new_config)

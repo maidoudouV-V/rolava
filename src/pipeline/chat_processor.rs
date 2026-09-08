@@ -1,12 +1,11 @@
-use crate::ai_provider::{ToolChatMessage, ToolChatResponse, ToolChatUserContent};
+use crate::ai_provider::{
+    run_ai_request_with_timeout, ToolChatMessage, ToolChatResponse, ToolChatUserContent,
+};
 use chrono::{DateTime, Local, Utc};
 use std::collections::HashSet;
-use std::future::Future;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::OnceCell;
-use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
 use crate::chat_history::{load_chat_history_context, render_history_message_line};
@@ -131,6 +130,7 @@ impl ChatProcessor {
             None,
             send_options,
             &current_message_ids,
+            false,
         )
         .await;
     }
@@ -142,11 +142,66 @@ impl ChatProcessor {
         tools: &ToolRegistry,
     ) {
         let send_options = SendOptions::delay_started_now();
-        let ConversationTrigger { user_prompt } = trigger;
+        let ConversationTrigger {
+            user_prompt,
+            memory_review,
+            condition,
+        } = trigger;
+        if let Some(condition) = condition {
+            match condition() {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!("内部触发条件已失效，跳过本次处理");
+                    return;
+                }
+                Err(error) => {
+                    error!(error = %format!("{error:#}"), "检查内部触发条件失败，跳过本次处理");
+                    return;
+                }
+            }
+        }
+        if memory_review {
+            self.process_memory_review(&user_prompt, tools).await;
+            return;
+        }
         info!("收到内部会话触发");
         trace!(prompt = %user_prompt, "内部会话触发完整提示");
-        self.process_conversation(&[], tools, Some(&user_prompt), send_options, &[])
+        self.process_conversation(&[], tools, Some(&user_prompt), send_options, &[], false)
             .await;
+    }
+
+    pub async fn process_memory_review(&mut self, prompt: &str, tools: &ToolRegistry) {
+        // 整理仍使用主 AI 流程，只提供记忆工具和结束工具。
+        let tools = tools.select(&[
+            "set_group_memory",
+            "delete_group_memory",
+            "create_user_memory",
+            "update_user_memory",
+            "delete_user_memory",
+            "end_conversation",
+        ]);
+        if tools.get("set_group_memory").is_none() {
+            return;
+        }
+        let bypassed = self.conversation_control.ai_filter_bypassed();
+        // 整理使用独立用户列表，避免扩大普通聊天的最近活跃用户范围。
+        let review_user_memory = Arc::new(UserMemorySession::new(
+            self.message_target.clone(),
+            self.services.app_config.as_ref(),
+            self.services.db_manager.clone(),
+        ));
+        let regular_user_memory = std::mem::replace(&mut self.user_memory, review_user_memory);
+        self.process_conversation(
+            &[],
+            &tools,
+            Some(prompt),
+            SendOptions::delay_started_now(),
+            &[],
+            true,
+        )
+        .await;
+        self.user_memory = regular_user_memory;
+        self.conversation_control.set_ai_filter_bypassed(bypassed);
     }
 
     async fn process_conversation(
@@ -156,6 +211,7 @@ impl ChatProcessor {
         transient_user_prompt: Option<&str>,
         send_options: SendOptions,
         current_message_ids: &[i64],
+        silent: bool,
     ) {
         if matches!(
             self.message_target.conversation.kind,
@@ -171,6 +227,7 @@ impl ChatProcessor {
                 conversation_messages,
                 current_message_ids,
                 transient_user_prompt,
+                silent,
             )
             .await
         {
@@ -238,7 +295,7 @@ impl ChatProcessor {
 
             let visible_content = Self::non_empty_response_content(response.content.as_deref());
             let mut emitted_message_ids = Vec::new();
-            if let Some(content) = visible_content {
+            if let Some(content) = visible_content.filter(|_| !silent) {
                 match self
                     .services
                     .message_sender
@@ -393,6 +450,9 @@ impl ChatProcessor {
             }
         }
 
+        if silent {
+            return;
+        }
         if conversation_effect == ConversationEffect::End {
             let removed = self.runtime_context.compact_finished_conversation();
             debug!(tool_history_count = removed, "对话结束，已压缩内存工具历史");
@@ -451,7 +511,7 @@ impl ChatProcessor {
                     .ai_models
                     .get(&self.services.app_config.app.chat_model_name)
                     .expect("找不到聊天模型配置");
-                Self::run_ai_request_with_timeout(
+                run_ai_request_with_timeout(
                     self.services.app_config.app.ai_request_timeout_seconds,
                     "聊天模型 API 请求",
                     chat_provider.chat_completions_with_session(
@@ -490,32 +550,21 @@ impl ChatProcessor {
         Err(last_error.expect("AI 请求重试循环至少应执行一次"))
     }
 
-    async fn run_ai_request_with_timeout<T, F>(
-        timeout_seconds: u64,
-        request_name: &str,
-        request: F,
-    ) -> anyhow::Result<T>
-    where
-        F: Future<Output = anyhow::Result<T>>,
-    {
-        if timeout_seconds == 0 {
-            return request.await;
-        }
-
-        match timeout(Duration::from_secs(timeout_seconds), request).await {
-            Ok(result) => result,
-            Err(_) => anyhow::bail!("{}超时，超过 {} 秒", request_name, timeout_seconds),
-        }
-    }
-
     /// 构建发送给聊天模型的完整上下文，包括系统提示词、聊天历史和当前指令。
     async fn build_context(
         &mut self,
         current_messages: &[IncomingMessage],
         current_message_ids: &[i64],
         transient_user_prompt: Option<&str>,
+        memory_review: bool,
     ) -> anyhow::Result<BuiltContext> {
-        let deleted_memories = self.group_memory.begin_turn()?;
+        let memory_enabled =
+            ToolRegistry::is_enabled(&self.services.app_config.app.enabled_actions, "memory");
+        let deleted_memories = if memory_enabled {
+            self.group_memory.begin_turn()?
+        } else {
+            0
+        };
         if deleted_memories > 0 {
             debug!(memory_count = deleted_memories, "已删除确认遗忘的群记忆");
         }
@@ -539,13 +588,19 @@ impl ChatProcessor {
         if self.runtime_context.reconcile_message_ids(&message_ids)? {
             debug!("聊天窗口已淘汰或删除旧记录，重新计算内存分块");
         }
-        self.user_memory
-            .refresh_active_users(
-                &history_window.messages,
-                current_messages,
-                current_message_ids,
-            )
-            .await;
+        if memory_review {
+            self.user_memory
+                .refresh_history_users(&history_window.messages)
+                .await;
+        } else {
+            self.user_memory
+                .refresh_active_users(
+                    &history_window.messages,
+                    current_messages,
+                    current_message_ids,
+                )
+                .await;
+        }
         self.ensure_group_info_loaded().await;
         let earliest_unread_timestamp = history_window
             .messages
@@ -643,15 +698,15 @@ impl ChatProcessor {
             }
         }
 
+        // 动态 instruction 放在聊天历史之后，临时任务说明紧随其后。
+        context.push(ToolChatMessage::System {
+            content: rendered_instruction_prompt.content,
+        });
         if let Some(prompt) = transient_user_prompt {
             context.push(ToolChatMessage::User {
                 content: ToolChatUserContent::text(prompt),
             });
         }
-        // 动态 instruction 放在初始上下文末尾，避免它的变化破坏前面固定内容的缓存。
-        context.push(ToolChatMessage::System {
-            content: rendered_instruction_prompt.content,
-        });
 
         Ok(BuiltContext {
             messages: context,
@@ -798,7 +853,7 @@ impl ChatProcessor {
 
             let result = async {
                 let bytes = fs::read(local_path).await?;
-                let mime_type = Self::image_mime_type_from_path(local_path);
+                let mime_type = MessageEnricher::mime_type_from_path(local_path);
                 MessageEnricher::prepare_vision_image_data_url(&bytes, Some(mime_type))
             }
             .await;
@@ -813,22 +868,6 @@ impl ChatProcessor {
             }
         }
         data_urls
-    }
-
-    fn image_mime_type_from_path(path: &str) -> &'static str {
-        match Path::new(path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("jpg") | Some("jpeg") => "image/jpeg",
-            Some("png") => "image/png",
-            Some("gif") => "image/gif",
-            Some("webp") => "image/webp",
-            Some("bmp") => "image/bmp",
-            _ => "image/jpeg",
-        }
     }
 
     /// 返回允许携带原始图片数据的消息 ID；窗口以正文消息条数计算。
@@ -860,21 +899,30 @@ impl ChatProcessor {
             .running_tasks(&self.message_target)?;
         let task_summaries = tasks.iter().map(|task| task.summary()).collect::<Vec<_>>();
         let scheduled_tasks_json = serde_json::to_string_pretty(&task_summaries)?;
-        let (group_memories, pending_expired_group_memory_ids) =
-            self.group_memory.render_prompt()?;
-        let recent_user_memories = self.user_memory.render_prompt()?;
+        let memory_enabled =
+            ToolRegistry::is_enabled(&self.services.app_config.app.enabled_actions, "memory");
+        let (group_memories, pending_expired_group_memory_ids) = if memory_enabled {
+            self.group_memory.render_prompt()?
+        } else {
+            (String::new(), Vec::new())
+        };
+        let recent_user_memories = self.user_memory.render_prompt(memory_enabled)?;
         let scene = self.render_scene();
-        let instruction_prompt = Self::replace_optional_prompt_line(
+        let instruction_prompt = crate::config::render_prompt_sections(
             &self.services.app_config.prompt_config.instruction_prompt,
-            "{{unread_message_time}}",
-            unread_message_time,
+            &[("unread", unread_message_time.is_some())],
+        )?;
+        let content = crate::config::render_prompt_template(
+            &instruction_prompt,
+            &[
+                ("date", &date_text),
+                ("scene", &scene),
+                ("scheduled_tasks", &scheduled_tasks_json),
+                ("group_memories", &group_memories),
+                ("recent_user_memories", &recent_user_memories),
+                ("unread_message_time", unread_message_time.unwrap_or("")),
+            ],
         );
-        let content = instruction_prompt
-            .replace("{{date}}", &date_text)
-            .replace("{{scene}}", &scene)
-            .replace("{{scheduled_tasks}}", &scheduled_tasks_json)
-            .replace("{{group_memories}}", &group_memories)
-            .replace("{{recent_user_memories}}", &recent_user_memories);
         Ok(RenderedPrompt {
             content,
             pending_expired_group_memory_ids,
@@ -967,20 +1015,5 @@ impl ChatProcessor {
         let dt_utc = DateTime::<Utc>::from_timestamp(timestamp, 0)?;
         let dt_local: DateTime<Local> = DateTime::<Local>::from(dt_utc);
         Some(dt_local.format("%Y-%m-%d %H:%M:%S").to_string())
-    }
-
-    /// 没有可用值时移除占位符所在行，避免向模型发送不完整的动态状态。
-    fn replace_optional_prompt_line(
-        prompt: &str,
-        placeholder: &str,
-        value: Option<&str>,
-    ) -> String {
-        match value {
-            Some(value) => prompt.replace(placeholder, value),
-            None => prompt
-                .split_inclusive('\n')
-                .filter(|line| !line.contains(placeholder))
-                .collect(),
-        }
     }
 }

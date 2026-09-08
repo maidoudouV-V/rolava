@@ -147,12 +147,12 @@ export class ConversationsController {
     if (data.error) return `<div class="panel-toolbar"><h3>已保存的用户记忆</h3></div><div class="empty"><strong>群成员读取失败</strong><span>${escapeHtml(data.error)}</span></div>`;
     const withMemories = data.users.filter(user => user.memories.length);
     return `<div class="panel-toolbar"><h3>已保存的用户记忆${data.stale ? "（使用缓存成员）" : ""}</h3><button class="button small" data-add-user-memory><i data-lucide="plus"></i>添加</button></div>
-      <div class="memory-stack">${withMemories.length ? withMemories.map(user => `<div><div class="member-heading"><span class="avatar">${escapeHtml(initial(user.card || user.nickname))}</span><div><strong>${escapeHtml(user.card || user.nickname || user.user_id)}</strong><small>QQ ${escapeHtml(user.user_id)}</small></div></div>${user.memories.map(memory => this.entityHtml(memory.content, memory.id, "user", { userId: user.user_id })).join("")}</div>`).join("") : '<div class="empty">当前群成员没有已保存的用户记忆</div>'}</div>`;
+      <div class="memory-stack">${withMemories.length ? withMemories.map(user => `<div><div class="member-heading"><span class="avatar">${escapeHtml(initial(user.card || user.nickname))}</span><div><strong>${escapeHtml(user.card || user.nickname || user.user_id)}</strong><small>QQ ${escapeHtml(user.user_id)}</small></div></div>${user.memories.map(memory => this.entityHtml(memory.content, memory.id, "user", { userId: user.user_id, meta: `最后更新：${memory.updated_date}` })).join("")}</div>`).join("") : '<div class="empty">当前群成员没有已保存的用户记忆</div>'}</div>`;
   }
 
   groupMemoriesHtml() {
     const items = this.detailData.groups.items;
-    return `<div class="panel-toolbar"><h3>当前会话群记忆</h3><button class="button small" data-add-group><i data-lucide="plus"></i>添加</button></div><div class="memory-stack">${items.length ? items.map(memory => this.entityHtml(memory.content, memory.title, "group", { id: memory.id, retention: memory.remaining_days || 1, meta: memory.permanent ? "长期（永不过期）" : memory.expiring ? "即将遗忘" : `剩余 ${memory.remaining_days} 天` })).join("") : '<div class="empty">当前没有群记忆</div>'}</div>`;
+    return `<div class="panel-toolbar"><h3>当前会话群记忆</h3><button class="button small" data-add-group><i data-lucide="plus"></i>添加</button></div><div class="memory-stack">${items.length ? items.map(memory => this.entityHtml(memory.content, memory.title, "group", { id: memory.id, retention: memory.remaining_days || 1, meta: `最后更新：${memory.updated_date} · ` + (memory.permanent ? "长期（永不过期）" : memory.expiring ? "即将遗忘" : `剩余 ${memory.remaining_days} 天`) })).join("") : '<div class="empty">当前没有群记忆</div>'}</div>`;
   }
 
   tasksHtml() {

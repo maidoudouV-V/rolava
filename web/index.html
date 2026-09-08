@@ -35,7 +35,7 @@
         <button class="nav-button" data-page="models"><i data-lucide="brain-circuit"></i>模型服务</button>
         <button class="nav-button" data-page="behavior"><i data-lucide="sliders-horizontal"></i>消息行为</button>
         <button class="nav-button" data-page="prompts"><i data-lucide="file-pen-line"></i>角色与提示词</button>
-        <button class="nav-button" data-page="access"><i data-lucide="shield-check"></i>权限与工具</button>
+        <button class="nav-button" data-page="access"><i data-lucide="shield-check"></i>权限与模块</button>
       </nav>
       <div class="sidebar-status"><span class="status-dot" id="sidebar-dot"></span><div><strong id="sidebar-bot">等待状态</strong><small id="sidebar-bot-id">OneBot</small></div></div>
     </aside>
@@ -122,13 +122,13 @@
 
         <section class="page" id="page-prompts">
           <div class="page-heading"><div><p class="eyebrow">PROMPTS</p><h1>角色与提示词</h1><p>维护机器人实际加载的 Markdown 提示词。</p></div></div>
-          <div class="prompt-layout"><aside class="prompt-list" id="prompt-list"><div class="empty">正在加载</div></aside><section class="prompt-editor"><header><div><strong id="prompt-title">选择提示词</strong><small id="prompt-meta">Markdown</small></div><button class="button primary small" id="save-prompt" disabled><i data-lucide="save"></i>保存并重启</button></header><label class="sr-only" for="prompt-content">提示词内容</label><textarea id="prompt-content" spellcheck="false" disabled></textarea><div class="placeholder-help"><strong>固定占位符</strong><div><code>{{character_prompt}}</code><span>角色卡正文</span></div><div><code>{{scene}}</code><span>会话类型、群名称与成员数量</span></div><div><code>{{recent_active_users}}</code><span>最近活跃用户及其记忆</span></div><div><code>{{group_memories}}</code><span>当前会话群记忆</span></div><div><code>{{scheduled_tasks}}</code><span>当前会话运行中的定时任务</span></div><div><code>{{unread_since}}</code><span>本轮未读消息开始时间</span></div></div></section></div>
+          <div class="prompt-layout"><aside class="prompt-list" id="prompt-list"><div class="empty">正在加载</div></aside><section class="prompt-editor"><header><div><strong id="prompt-title">选择提示词</strong><small id="prompt-meta">Markdown</small></div><button class="button primary small" id="save-prompt" disabled><i data-lucide="save"></i>保存并重启</button></header><label class="sr-only" for="prompt-content">提示词内容</label><textarea id="prompt-content" spellcheck="false" disabled></textarea></section></div>
         </section>
 
         <section class="page config-page" id="page-access">
-          <div class="page-heading"><div><p class="eyebrow">ACCESS</p><h1>权限与工具</h1><p>限制允许接入的会话、命令账号和可选工具。</p></div></div>
+          <div class="page-heading"><div><p class="eyebrow">ACCESS</p><h1>权限与模块</h1><p>限制允许接入的会话、命令账号和可选模块。</p></div></div>
           <section class="section-block"><div class="section-header"><div><h2>访问白名单</h2><p>每行填写一个 QQ 号或群号；空私聊/群聊名单表示全部放行</p></div></div><div class="form-grid three"><label>私聊白名单<textarea id="direct-whitelist" rows="7"></textarea></label><label>群聊白名单<textarea id="group-whitelist" rows="7"></textarea></label><label>命令白名单<textarea id="command-whitelist" rows="7"></textarea></label></div></section>
-          <section class="section-block"><div class="section-header"><div><h2>可选工具</h2><p>固定运行所需的内部工具不会在此展示</p></div></div><div class="optional-tool-list" id="tool-list"><div class="empty">正在加载</div></div></section>
+          <section class="section-block"><div class="section-header"><div><h2>可选模块</h2><p>开关控制模块工具、相关提示词及自动功能；定时任务始终启用。保存并重启后生效</p></div></div><div class="optional-tool-list" id="tool-list"><div class="empty">正在加载</div></div></section>
         </section>
       </div>
     </main>

@@ -2,9 +2,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::time::{timeout, Duration};
 use tracing::warn;
 
+use crate::ai_provider::run_ai_request_with_timeout;
 use crate::config::render_prompt_template;
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
@@ -70,22 +70,12 @@ impl Tool for AgentWebSearchTool {
                 .ai_models
                 .get(&context.services.app_config.app.web_search_model_name)
                 .ok_or_else(|| anyhow::anyhow!("找不到联网搜索模型配置"))?;
-            let search_result = if timeout_seconds == 0 {
-                provider.web_search(&search_prompt).await
-            } else {
-                match timeout(
-                    Duration::from_secs(timeout_seconds),
-                    provider.web_search(&search_prompt),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "联网搜索 API 请求超时，超过 {} 秒",
-                        timeout_seconds
-                    )),
-                }
-            };
+            let search_result = run_ai_request_with_timeout(
+                timeout_seconds,
+                "联网搜索 API 请求",
+                provider.web_search(&search_prompt),
+            )
+            .await;
 
             match search_result {
                 Ok(content) => return Ok(ToolOutput::text(content)),

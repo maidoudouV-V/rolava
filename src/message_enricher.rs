@@ -13,9 +13,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::ai_provider::run_ai_request_with_timeout;
 use crate::config::AppConfig;
 use crate::repository::db_manager::{
     NewReceivedImage, QQChatContextManager, ReceivedImageRecord, ReferencedMessage,
@@ -482,8 +482,8 @@ impl MessageEnricher {
         let max_attempts = app_config.app.ai_request_max_attempts();
         let mut last_error = None;
         for attempt in 1..=max_attempts {
-            match Self::run_ai_request_with_timeout(
-                app_config,
+            match run_ai_request_with_timeout(
+                app_config.app.ai_request_timeout_seconds,
                 "图片识别 API 请求",
                 visual_provider.describe_image(
                     &image_data_url,
@@ -501,29 +501,6 @@ impl MessageEnricher {
         }
 
         Err(last_error.expect("视觉识别重试循环至少应执行一次"))
-    }
-
-    async fn run_ai_request_with_timeout<T, F>(
-        app_config: &AppConfig,
-        request_name: &str,
-        request: F,
-    ) -> Result<T>
-    where
-        F: std::future::Future<Output = Result<T>>,
-    {
-        let timeout_seconds = app_config.app.ai_request_timeout_seconds;
-        if timeout_seconds == 0 {
-            return request.await;
-        }
-
-        match timeout(Duration::from_secs(timeout_seconds), request).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "{}超时，超过 {} 秒",
-                request_name,
-                timeout_seconds
-            )),
-        }
     }
 
     /// 为模型准备图片：小图保持原样，大图只按最长边等比例缩小。
@@ -729,7 +706,7 @@ impl MessageEnricher {
         }
     }
 
-    fn mime_type_from_path(path: &str) -> &'static str {
+    pub(crate) fn mime_type_from_path(path: &str) -> &'static str {
         Self::image_format_from_path(path)
             .and_then(Self::image_mime_type)
             .unwrap_or("image/jpeg")
