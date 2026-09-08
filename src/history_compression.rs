@@ -195,7 +195,8 @@ impl HistoryCompressionService {
             .context("摘要会话不存在")?;
         let kind = match conversation.kind.as_str() {
             "group" => ConversationKind::Group,
-            "direct" => ConversationKind::Direct,
+            // 私聊保留每日摘要，但不再根据摘要自动整理记忆。
+            "direct" => return Ok(()),
             kind => anyhow::bail!("未知会话类型：{}", kind),
         };
         let user_prompt = crate::config::render_prompt_template(

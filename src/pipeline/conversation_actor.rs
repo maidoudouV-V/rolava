@@ -8,6 +8,7 @@ use crate::commands::{CommandOutput, CommandRuntimeAction, CommandSystem};
 use crate::conversation_control::ConversationControl;
 use crate::conversation_trigger::ConversationTrigger;
 use crate::tools::ToolRegistry;
+use crate::transport::message::ConversationKind;
 use crate::transport::message::{IncomingMessage, MessageTarget};
 
 use super::chat_processor::ChatProcessor;
@@ -40,12 +41,16 @@ impl ConversationActor {
         commands: Arc<CommandSystem>,
         conversation_control: Arc<ConversationControl>,
         enabled_optional_tools: &[String],
+        conversation_kind: &ConversationKind,
     ) -> Self {
         Self {
             event_rx,
             filter,
             processor,
-            tools: ToolRegistry::built_in(enabled_optional_tools),
+            tools: ToolRegistry::built_in(
+                enabled_optional_tools,
+                matches!(conversation_kind, ConversationKind::Group),
+            ),
             commands,
             conversation_control,
         }

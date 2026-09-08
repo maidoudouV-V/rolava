@@ -50,6 +50,12 @@ impl SkillCatalog {
         self.entries.values()
     }
 
+    /// 只保留配置中明确启用的 Skill；发现本地文件和启用状态彼此独立。
+    pub fn retain_enabled(&mut self, enabled_names: &[String]) {
+        self.entries
+            .retain(|name, _| enabled_names.iter().any(|enabled| enabled == name));
+    }
+
     /// 生成顺序稳定的 Skill 摘要；正文仍由模型按需通过读取工具获取。
     pub fn render_prompt_list(&self) -> String {
         if self.entries.is_empty() {
@@ -128,7 +134,7 @@ impl SkillCatalog {
     }
 }
 
-fn read_metadata(path: &Path) -> Result<SkillMetadata> {
+pub(crate) fn read_metadata(path: &Path) -> Result<SkillMetadata> {
     let mut reader = BufReader::new(File::open(path)?.take(MAX_METADATA_BYTES));
     let mut line = String::new();
     reader.read_line(&mut line)?;

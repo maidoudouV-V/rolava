@@ -3,10 +3,11 @@ import { ConfigController } from "./config.js";
 import { ConversationsController } from "./conversations.js";
 import { LogsController } from "./logs.js";
 import { PromptController } from "./prompts.js";
+import { SkillsController } from "./skills.js";
 import { escapeHtml, formatTime, initial, refreshIcons, toast } from "./ui.js";
 
 const pageNames = {
-  overview: "概览", conversations: "会话管理", logs: "运行日志", connection: "连接配置",
+  overview: "概览", conversations: "会话管理", skills: "Skills", logs: "运行日志", connection: "连接配置",
   models: "模型服务", behavior: "消息行为", prompts: "角色与提示词", access: "权限与工具",
 };
 const configPages = new Set(["connection", "models", "behavior", "access"]);
@@ -39,6 +40,7 @@ const conversations = new ConversationsController();
 new LogsController();
 const config = new ConfigController({ onRestart: restart, onDirty: markDirty });
 const prompts = new PromptController({ onRestart: restart });
+const skills = new SkillsController({ onRestart: restart, onDirty: markSkillDirty });
 
 document.getElementById("login-form").addEventListener("submit", async event => {
   event.preventDefault();
@@ -76,7 +78,7 @@ async function enterApp() {
   refreshIcons();
   if (initialized) return;
   initialized = true;
-  const results = await Promise.allSettled([loadStatus(), loadRecent(), conversations.load(), config.load(), prompts.load()]);
+  const results = await Promise.allSettled([loadStatus(), loadRecent(), conversations.load(), config.load(), prompts.load(), skills.load()]);
   for (const result of results) if (result.status === "rejected") toast(result.reason.message, true);
   refreshIcons();
 }
@@ -96,6 +98,10 @@ function markDirty() {
   setSaveState("有未保存的修改", "dirty");
   document.getElementById("save-config-only").disabled = false;
   document.getElementById("save-config").disabled = false;
+}
+
+function markSkillDirty(message) {
+  setSaveState(message, "dirty");
 }
 
 async function saveConfig(restartAfterSave) {

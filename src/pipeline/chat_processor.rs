@@ -180,7 +180,7 @@ impl ChatProcessor {
             "delete_user_memory",
             "end_conversation",
         ]);
-        if tools.get("set_group_memory").is_none() {
+        if tools.get("create_user_memory").is_none() {
             return;
         }
         let bypassed = self.conversation_control.ai_filter_bypassed();
@@ -560,7 +560,12 @@ impl ChatProcessor {
     ) -> anyhow::Result<BuiltContext> {
         let memory_enabled =
             ToolRegistry::is_enabled(&self.services.app_config.app.enabled_actions, "memory");
-        let deleted_memories = if memory_enabled {
+        let group_memory_enabled = memory_enabled
+            && matches!(
+                self.message_target.conversation.kind,
+                ConversationKind::Group
+            );
+        let deleted_memories = if group_memory_enabled {
             self.group_memory.begin_turn()?
         } else {
             0
@@ -610,9 +615,17 @@ impl ChatProcessor {
         let unread_message_time = Self::render_unread_message_time(earliest_unread_timestamp);
         let rendered_instruction_prompt =
             self.render_instruction_prompt(unread_message_time.as_deref())?;
+        let group_conversation = matches!(
+            self.message_target.conversation.kind,
+            ConversationKind::Group
+        );
+        let system_prompt = crate::config::render_prompt_sections(
+            &self.services.app_config.prompt_config.system_prompt,
+            &[("group_conversation", group_conversation)],
+        )?;
         let mut context = vec![
             ToolChatMessage::System {
-                content: self.services.app_config.prompt_config.system_prompt.clone(),
+                content: system_prompt,
             },
             ToolChatMessage::System {
                 content: self
@@ -901,7 +914,12 @@ impl ChatProcessor {
         let scheduled_tasks_json = serde_json::to_string_pretty(&task_summaries)?;
         let memory_enabled =
             ToolRegistry::is_enabled(&self.services.app_config.app.enabled_actions, "memory");
-        let (group_memories, pending_expired_group_memory_ids) = if memory_enabled {
+        let group_memory_enabled = memory_enabled
+            && matches!(
+                self.message_target.conversation.kind,
+                ConversationKind::Group
+            );
+        let (group_memories, pending_expired_group_memory_ids) = if group_memory_enabled {
             self.group_memory.render_prompt()?
         } else {
             (String::new(), Vec::new())
@@ -910,7 +928,10 @@ impl ChatProcessor {
         let scene = self.render_scene();
         let instruction_prompt = crate::config::render_prompt_sections(
             &self.services.app_config.prompt_config.instruction_prompt,
-            &[("unread", unread_message_time.is_some())],
+            &[
+                ("unread", unread_message_time.is_some()),
+                ("group_memory", group_memory_enabled),
+            ],
         )?;
         let content = crate::config::render_prompt_template(
             &instruction_prompt,

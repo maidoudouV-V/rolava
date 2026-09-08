@@ -1,7 +1,9 @@
 {{#memory}}
 # 记忆内容
+{{#group_memory}}
 ## 群记忆内容
 {{group_memories}}
+{{/group_memory}}
 {{/memory}}
 
 ## 最近活跃用户

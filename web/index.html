@@ -29,6 +29,7 @@
         <p>工作区</p>
         <button class="nav-button active" data-page="overview"><i data-lucide="sparkles"></i>概览</button>
         <button class="nav-button" data-page="conversations"><i data-lucide="messages-square"></i>会话管理</button>
+        <button class="nav-button" data-page="skills"><i data-lucide="blocks"></i>Skills</button>
         <button class="nav-button" data-page="logs"><i data-lucide="scroll-text"></i>运行日志</button>
         <p>机器人设置</p>
         <button class="nav-button" data-page="connection"><i data-lucide="waypoints"></i>连接配置</button>
@@ -95,6 +96,18 @@
               </div>
             </header>
             <div class="log-stream" id="log-stream"><div class="empty log-empty">正在读取日志</div></div>
+          </section>
+        </section>
+
+        <section class="page" id="page-skills">
+          <div class="page-heading"><div><p class="eyebrow">SKILLS</p><h1>Skills</h1><p>发现本地 Skill、控制启用状态并维护目录中的文本文件。</p></div><div class="heading-actions"><button class="button" id="refresh-skills"><i data-lucide="refresh-cw"></i>刷新列表</button><button class="button primary" id="save-enabled-skills" disabled><i data-lucide="save"></i>应用并重启</button></div></div>
+          <div class="skill-workspace">
+            <aside class="skill-panel"><header><strong>本地 Skills</strong><small id="skill-count">正在扫描</small></header><div class="skill-list" id="skill-list"><div class="empty">正在发现本地文件</div></div></aside>
+            <section class="skill-detail" id="skill-detail"><div class="empty detail-empty"><i data-lucide="folder-open"></i><strong>选择一个 Skill</strong><span>查看并编辑该目录中的文件</span></div></section>
+          </div>
+          <section class="skill-environment">
+            <header><div><strong>环境变量</strong><small>密钥不会回显，已有变量留空表示保持原值</small></div><button class="button small" id="add-skill-environment"><i data-lucide="plus"></i>添加变量</button></header>
+            <div class="skill-environment-list" id="skill-environment-list"><div class="empty">正在读取环境变量</div></div>
           </section>
         </section>
 

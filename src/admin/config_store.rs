@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -146,6 +147,61 @@ pub fn ensure_admin_token(config_path: &Path) -> Result<String> {
     document["admin"]["token"] = value(&token);
     persist_document(config_path, &document)?;
     Ok(token)
+}
+
+/// 保存已校验的 Skill 启用列表，并保留配置文件中的注释、顺序和其他字段。
+pub fn write_enabled_skills(config_path: &Path, enabled_skills: &[String]) -> Result<bool> {
+    let source = fs::read_to_string(config_path)
+        .with_context(|| format!("读取配置失败：{}", config_path.display()))?;
+    let mut document = source
+        .parse::<DocumentMut>()
+        .context("解析配置 TOML 失败")?;
+    let current = document["app"]["enabled_skills"]
+        .as_array()
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if current == enabled_skills {
+        return Ok(false);
+    }
+    document["app"]["enabled_skills"] = Item::Value(strings_array(enabled_skills).into());
+    persist_document(config_path, &document)?;
+    Ok(true)
+}
+
+/// 原子保存 Skill 开关与环境变量；候选配置完整加载成功后才替换原文件。
+pub fn write_skill_settings(
+    config_path: &Path,
+    enabled_skills: &[String],
+    environment: &BTreeMap<String, String>,
+) -> Result<AppConfig> {
+    let source = fs::read_to_string(config_path)
+        .with_context(|| format!("读取配置失败：{}", config_path.display()))?;
+    let mut document = source
+        .parse::<DocumentMut>()
+        .context("解析配置 TOML 失败")?;
+    document["app"]["enabled_skills"] = Item::Value(strings_array(enabled_skills).into());
+
+    let mut environment_table = Table::new();
+    for (name, environment_value) in environment {
+        environment_table[name] = value(environment_value);
+    }
+    document["skill_environment"] = Item::Table(environment_table);
+
+    let mut candidate =
+        NamedTempFile::new_in(config_path.parent().unwrap_or_else(|| Path::new(".")))?;
+    candidate.write_all(document.to_string().as_bytes())?;
+    candidate.flush()?;
+    let config =
+        AppConfig::new(candidate.path().to_string_lossy().as_ref()).context("新配置校验失败")?;
+    candidate
+        .persist(config_path)
+        .map_err(|error| error.error)?;
+    Ok(config)
 }
 
 pub fn write_admin_config(config_path: &Path, update: AdminConfigUpdate) -> Result<AppConfig> {

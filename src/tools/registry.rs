@@ -6,8 +6,8 @@ use anyhow::{bail, Result};
 use super::{
     AgentWebSearchTool, ContinueConversationTool, CreateScheduledTaskTool, CreateUserMemoryTool,
     DeleteGroupMemoryTool, DeleteScheduledTaskTool, DeleteUserMemoryTool, EndConversationTool,
-    GetScheduledTaskTool, ReadContentTool, SendQqExpressionTool, SetGroupMemoryTool, Tool,
-    ToolCall, ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool,
+    GetScheduledTaskTool, ReadContentTool, RunScriptTool, SendQqExpressionTool, SetGroupMemoryTool,
+    Tool, ToolCall, ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool,
     UpdateUserMemoryTool, WaitForReplyTool,
 };
 
@@ -34,17 +34,20 @@ impl ToolRegistry {
     }
 
     /// 注册固定工具以及配置中明确启用的可选工具。
-    pub fn built_in(enabled_optional_tools: &[String]) -> Self {
+    pub fn built_in(enabled_optional_tools: &[String], group_conversation: bool) -> Self {
         let mut registry = Self::new();
         if Self::is_enabled(enabled_optional_tools, WEB_SEARCH_MODULE) {
             registry.register(AgentWebSearchTool).unwrap();
         }
         registry.register(SendQqExpressionTool).unwrap();
         registry.register(ReadContentTool).unwrap();
+        registry.register(RunScriptTool).unwrap();
         if Self::is_enabled(enabled_optional_tools, MEMORY_MODULE) {
-            // 一个模块开关统一控制群记忆和用户记忆的全部维护工具。
-            registry.register(SetGroupMemoryTool).unwrap();
-            registry.register(DeleteGroupMemoryTool).unwrap();
+            // 群记忆只属于群聊；用户记忆在群聊和私聊中都可维护。
+            if group_conversation {
+                registry.register(SetGroupMemoryTool).unwrap();
+                registry.register(DeleteGroupMemoryTool).unwrap();
+            }
             registry.register(CreateUserMemoryTool).unwrap();
             registry.register(UpdateUserMemoryTool).unwrap();
             registry.register(DeleteUserMemoryTool).unwrap();
@@ -54,8 +57,11 @@ impl ToolRegistry {
         registry.register(GetScheduledTaskTool).unwrap();
         registry.register(UpdateScheduledTaskTool).unwrap();
         registry.register(DeleteScheduledTaskTool).unwrap();
-        registry.register(ContinueConversationTool).unwrap();
-        registry.register(EndConversationTool).unwrap();
+        if group_conversation {
+            // 这两个状态工具只控制群聊的 AI 前置过滤，私聊不需要注册。
+            registry.register(ContinueConversationTool).unwrap();
+            registry.register(EndConversationTool).unwrap();
+        }
         registry
     }
 

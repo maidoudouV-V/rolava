@@ -5,7 +5,7 @@ use crate::ai_provider::{
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +30,9 @@ struct TomlConfig {
     /// 管理后台认证配置。
     #[serde(default)]
     admin: AdminSection,
+    /// 传递给 Skill 子进程的环境变量；值不会通过管理 API 回显。
+    #[serde(default)]
+    skill_environment: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -75,6 +78,9 @@ pub struct AppSection {
     /// Skill 目录，相对路径以主配置文件所在目录为基准。
     #[serde(default = "default_skills_dir")]
     pub skills_dir: String,
+    /// 明确启用并加载到主模型上下文的 Skill 名称；未列出的 Skill 默认关闭。
+    #[serde(default)]
+    pub enabled_skills: Vec<String>,
     /// 发送给模型的最大历史消息数。
     pub max_history_messages: u32,
     /// 是否生成并使用历史摘要；默认关闭，重启后生效。
@@ -161,7 +167,15 @@ pub fn render_prompt_sections(template: &str, conditions: &[(&str, bool)]) -> Re
         let token = &token_start[2..end];
         let raw = &token_start[..end + 2];
         if let Some(name) = token.strip_prefix('#') {
-            if !["memory", "agent_web_search", "unread"].contains(&name) {
+            if ![
+                "memory",
+                "group_memory",
+                "group_conversation",
+                "agent_web_search",
+                "unread",
+            ]
+            .contains(&name)
+            {
                 anyhow::bail!("未知提示词条件：{}", name);
             }
             let value = conditions
@@ -318,6 +332,8 @@ pub struct AppConfig {
     pub logging: LoggingSection,
     /// 管理后台认证配置。
     pub admin: AdminSection,
+    /// worker 启动时注入、由 Skill 子进程继承的环境变量。
+    pub skill_environment: BTreeMap<String, String>,
     /// QQ 经典表情 ID 到名称的映射。
     pub face_id_map: HashMap<String, String>,
 }
@@ -338,6 +354,7 @@ impl AppConfig {
             models,
             logging,
             admin,
+            skill_environment,
         } = toml::from_str(&toml_str).with_context(|| {
             format!(
                 "解析主配置文件失败：{}",
@@ -348,6 +365,7 @@ impl AppConfig {
         if app.startup_history_fetch_count > 999 {
             anyhow::bail!("每群启动历史消息数不能超过 999");
         }
+        validate_skill_environment(&skill_environment)?;
 
         // 定时任务现为固定能力，忽略旧配置中的开关项。
         app.enabled_actions
@@ -458,8 +476,24 @@ impl AppConfig {
             anyhow::bail!("skills_dir 不能为空");
         }
         let skills_dir = Self::resolve_configured_path(config_path, &app.skills_dir);
-        let skills = crate::skills::SkillCatalog::discover(&skills_dir)?;
-        tracing::info!(directory = %skills_dir.display(), count = skills.len(), "Skill 元数据加载完成");
+        let mut skills = crate::skills::SkillCatalog::discover(&skills_dir)?;
+        let discovered_skill_count = skills.len();
+        // 配置只保留本地仍然存在的唯一名称，避免已删除或改名的 Skill 继续显示为启用。
+        let mut seen_skills = HashSet::new();
+        app.enabled_skills = app
+            .enabled_skills
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty() && skills.get(name).is_some())
+            .filter(|name| seen_skills.insert(name.clone()))
+            .collect();
+        skills.retain_enabled(&app.enabled_skills);
+        tracing::info!(
+            directory = %skills_dir.display(),
+            discovered = discovered_skill_count,
+            enabled = skills.len(),
+            "Skill 元数据加载完成"
+        );
         let mut prompt_config = PromptConfig::new(&prompt_dir)?;
         prompt_config.system_prompt =
             render_module_sections(&prompt_config.system_prompt, &app.enabled_actions)
@@ -499,6 +533,7 @@ impl AppConfig {
             skills,
             logging,
             admin,
+            skill_environment,
             face_id_map,
         })
     }
@@ -509,8 +544,15 @@ impl AppConfig {
             .is_some_and(|capabilities| capabilities.vision.is_enabled())
     }
 
+    /// worker 每次启动时设置一次，后续 Node 等 Skill 子进程会自动继承这些值。
+    pub fn apply_skill_environment(&self) {
+        for (name, value) in &self.skill_environment {
+            std::env::set_var(name, value);
+        }
+    }
+
     /// 相对路径优先相对当前工作目录，管理后台候选配置位于临时文件时也能保持原语义。
-    fn resolve_configured_path(config_path: &Path, configured_path: &str) -> PathBuf {
+    pub(crate) fn resolve_configured_path(config_path: &Path, configured_path: &str) -> PathBuf {
         let path = Path::new(configured_path);
         if path.is_absolute() || path.exists() {
             return path.to_path_buf();
@@ -520,6 +562,37 @@ impl AppConfig {
             .unwrap_or_else(|| Path::new("."))
             .join(path)
     }
+}
+
+pub(crate) fn validate_skill_environment(environment: &BTreeMap<String, String>) -> Result<()> {
+    const MAX_VARIABLES: usize = 100;
+    const MAX_NAME_CHARS: usize = 128;
+    const MAX_VALUE_BYTES: usize = 16 * 1024;
+
+    if environment.len() > MAX_VARIABLES {
+        anyhow::bail!("Skill 环境变量不能超过 {MAX_VARIABLES} 个");
+    }
+    for (name, value) in environment {
+        let mut chars = name.chars();
+        if name.chars().count() > MAX_NAME_CHARS
+            || !chars
+                .next()
+                .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+            || !chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            anyhow::bail!(
+                "Skill 环境变量名只能使用英文字母、数字和下划线，且不能以数字开头：{}",
+                name
+            );
+        }
+        if value.len() > MAX_VALUE_BYTES {
+            anyhow::bail!("Skill 环境变量 {} 的值不能超过 16 KiB", name);
+        }
+        if value.contains('\0') {
+            anyhow::bail!("Skill 环境变量 {} 的值不能包含空字节", name);
+        }
+    }
+    Ok(())
 }
 
 pub struct PromptConfig {

@@ -142,9 +142,13 @@ async fn shutdown_signal() {
 async fn run_worker() -> Result<WorkerExit> {
     let config_path = admin::config_path();
     admin::ensure_admin_token(&config_path)?;
-    let app_config = Arc::new(
-        AppConfig::new(config_path.to_string_lossy().as_ref()).context("加载应用配置失败")?,
-    );
+    let app_config =
+        AppConfig::new(config_path.to_string_lossy().as_ref()).context("加载应用配置失败")?;
+    // 启动时清理已经删除或改名的 Skill，避免无效启用项永久留在配置文件中。
+    admin::write_enabled_skills(&config_path, &app_config.app.enabled_skills)?;
+    // 只在 worker 内设置，使配置删除后的旧值不会被 supervisor 继续传给新进程。
+    app_config.apply_skill_environment();
+    let app_config = Arc::new(app_config);
     let admin_logs = Arc::new(admin::AdminLogBuffer::new(1000));
     init_tracing(app_config.logging.level.as_str(), admin_logs.clone());
 
