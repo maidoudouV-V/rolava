@@ -13,7 +13,7 @@ const DESCRIPTION: &str = r#"读取项目目录中允许访问的文本文件并
 const MAX_CONTENT_BYTES: u64 = 64 * 1024;
 
 // 文件读取权限与工具用途分离；以后开放其他项目目录时只扩展此列表。
-const ALLOWED_DIRECTORIES: &[&str] = &["skills"];
+const ALLOWED_DIRECTORIES: &[&str] = &[crate::skills::DIRECTORY_NAME];
 
 #[derive(Debug, Deserialize)]
 pub struct ReadContentArgs {

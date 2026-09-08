@@ -75,9 +75,6 @@ pub struct LoggingSection {
 pub struct AppSection {
     /// 模板目录路径
     pub prompt_dir: String,
-    /// Skill 目录，相对路径以主配置文件所在目录为基准。
-    #[serde(default = "default_skills_dir")]
-    pub skills_dir: String,
     /// 明确启用并加载到主模型上下文的 Skill 名称；未列出的 Skill 默认关闭。
     #[serde(default)]
     pub enabled_skills: Vec<String>,
@@ -210,10 +207,6 @@ pub fn render_prompt_sections(template: &str, conditions: &[(&str, bool)]) -> Re
         output.push_str(remaining);
     }
     Ok(output)
-}
-
-fn default_skills_dir() -> String {
-    "skills".to_string()
 }
 
 pub fn default_history_summary_days() -> u16 {
@@ -472,11 +465,8 @@ impl AppConfig {
         }
 
         let prompt_dir = Self::resolve_configured_path(config_path, &app.prompt_dir);
-        if app.skills_dir.trim().is_empty() {
-            anyhow::bail!("skills_dir 不能为空");
-        }
-        let skills_dir = Self::resolve_configured_path(config_path, &app.skills_dir);
-        let mut skills = crate::skills::SkillCatalog::discover(&skills_dir)?;
+        let skills_dir = Path::new(crate::skills::DIRECTORY_NAME);
+        let mut skills = crate::skills::SkillCatalog::discover(skills_dir)?;
         let discovered_skill_count = skills.len();
         // 配置只保留本地仍然存在的唯一名称，避免已删除或改名的 Skill 继续显示为启用。
         let mut seen_skills = HashSet::new();
@@ -552,7 +542,7 @@ impl AppConfig {
     }
 
     /// 相对路径优先相对当前工作目录，管理后台候选配置位于临时文件时也能保持原语义。
-    pub(crate) fn resolve_configured_path(config_path: &Path, configured_path: &str) -> PathBuf {
+    fn resolve_configured_path(config_path: &Path, configured_path: &str) -> PathBuf {
         let path = Path::new(configured_path);
         if path.is_absolute() || path.exists() {
             return path.to_path_buf();

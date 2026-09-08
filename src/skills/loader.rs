@@ -109,7 +109,7 @@ impl SkillCatalog {
                     .to_str()
                     .context("Skill 文件路径不是有效的 UTF-8")?
                     .replace('\\', "/");
-                let virtual_path = format!("/skills/{relative_path}");
+                let virtual_path = format!("/{}/{relative_path}", super::DIRECTORY_NAME);
                 let metadata = read_metadata(&path)
                     .with_context(|| format!("加载 Skill 失败：{}", path.display()))?;
                 if let Some(previous) = self.entries.get(&metadata.name) {

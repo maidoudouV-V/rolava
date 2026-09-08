@@ -623,7 +623,7 @@ async fn put_prompt(
 async fn admin_skills(State(state): State<Arc<AdminState>>) -> Result<Json<Value>, ApiError> {
     let app_config = state.app_config();
     let enabled = app_config.app.enabled_skills.clone();
-    let root = AppConfig::resolve_configured_path(&state.config_path, &app_config.app.skills_dir);
+    let root = PathBuf::from(crate::skills::DIRECTORY_NAME);
     let normalized = tokio::task::spawn_blocking({
         let root = root.clone();
         let enabled = enabled.clone();
@@ -685,7 +685,7 @@ async fn put_skill_settings(
     validate_skill_environment(&environment)
         .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
 
-    let root = AppConfig::resolve_configured_path(&state.config_path, &app_config.app.skills_dir);
+    let root = PathBuf::from(crate::skills::DIRECTORY_NAME);
     let enabled =
         tokio::task::spawn_blocking(move || normalize_enabled_names(&root, update.enabled))
             .await??;
@@ -703,12 +703,8 @@ async fn put_skill_settings(
     ))
 }
 
-async fn skill_files(
-    State(state): State<Arc<AdminState>>,
-    Path(skill_name): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let app_config = state.app_config();
-    let root = AppConfig::resolve_configured_path(&state.config_path, &app_config.app.skills_dir);
+async fn skill_files(Path(skill_name): Path<String>) -> Result<Json<Value>, ApiError> {
+    let root = PathBuf::from(crate::skills::DIRECTORY_NAME);
     let files = tokio::task::spawn_blocking(move || list_skill_files(&root, &skill_name)).await??;
     Ok(Json(json!({ "items": files })))
 }
@@ -719,12 +715,10 @@ struct SkillFileQuery {
 }
 
 async fn get_skill_file(
-    State(state): State<Arc<AdminState>>,
     Path(skill_name): Path<String>,
     Query(query): Query<SkillFileQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let app_config = state.app_config();
-    let root = AppConfig::resolve_configured_path(&state.config_path, &app_config.app.skills_dir);
+    let root = PathBuf::from(crate::skills::DIRECTORY_NAME);
     let path = query.path;
     let response_path = path.clone();
     let content =
@@ -738,13 +732,11 @@ struct SkillFileUpdate {
 }
 
 async fn put_skill_file(
-    State(state): State<Arc<AdminState>>,
     Path(skill_name): Path<String>,
     Query(query): Query<SkillFileQuery>,
     Json(update): Json<SkillFileUpdate>,
 ) -> Result<Json<Value>, ApiError> {
-    let app_config = state.app_config();
-    let root = AppConfig::resolve_configured_path(&state.config_path, &app_config.app.skills_dir);
+    let root = PathBuf::from(crate::skills::DIRECTORY_NAME);
     let path = query.path;
     tokio::task::spawn_blocking(move || {
         write_skill_file(&root, &skill_name, &path, &update.content)

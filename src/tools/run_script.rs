@@ -33,7 +33,7 @@ const SCRIPT_RUNTIMES: &[ScriptRuntime] = &[ScriptRuntime {
 }];
 
 // 脚本路径权限与运行类型分离；当前只允许执行项目 skills 目录中的脚本。
-const ALLOWED_SCRIPT_DIRECTORIES: &[&str] = &["skills"];
+const ALLOWED_SCRIPT_DIRECTORIES: &[&str] = &[crate::skills::DIRECTORY_NAME];
 
 #[derive(Debug, Deserialize)]
 pub struct RunScriptArgs {
