@@ -198,6 +198,26 @@ impl RuntimeContextState {
         before - self.active_tool_histories.len()
     }
 
+    /// 删除已经落后于当前聊天窗口过多消息的工具历史。
+    pub fn evict_tool_histories_beyond_newer_messages(
+        &mut self,
+        max_newer_messages: usize,
+    ) -> usize {
+        let before = self.active_tool_histories.len();
+        let message_ids = &self.loaded_message_ids;
+        self.active_tool_histories.retain(|history| {
+            let Some(anchor_id) = history.after_message_id else {
+                return true;
+            };
+            let Some(anchor_index) = message_ids.iter().position(|id| *id == anchor_id) else {
+                return false;
+            };
+            let newer_messages = message_ids.len() - anchor_index - 1;
+            newer_messages <= max_newer_messages
+        });
+        before - self.active_tool_histories.len()
+    }
+
     /// 对话结束后只保留 messages 中已经真实发送的正文，不再保留工具协议。
     pub fn compact_finished_conversation(&mut self) -> usize {
         let removed = self.active_tool_histories.len();

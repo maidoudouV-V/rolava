@@ -7,7 +7,7 @@ use super::skill_store::{
     list_skill_files, list_skills, normalize_enabled_names, read_skill_file, write_skill_file,
 };
 use crate::ai_provider::{
-    google_aistudio::GoogleAIStudioProvider, openai_compatible::OpenAICompatibleProvider,
+    gemini::GeminiProvider, openai_compatible::OpenAICompatibleProvider,
     openai_responses::OpenAIResponsesProvider, openrouter::OpenRouterProvider, AIProvider,
     ToolChatMessage, ToolChatUserContent,
 };
@@ -365,11 +365,12 @@ async fn test_model(
             request.model.max_tokens,
             request.model.reasoning_effort,
         )),
-        "google_aistudio" => Box::new(GoogleAIStudioProvider::new(
+        "gemini" => Box::new(GeminiProvider::new(
             key,
             request.provider.base_url,
             request.model.model,
             request.model.max_tokens,
+            request.model.reasoning_effort,
         )),
         _ => return Err(ApiError::bad_request("不支持的 Provider 类型")),
     };
@@ -411,7 +412,7 @@ async fn provider_models(
         "openai_compatible" | "openai_responses" | "openrouter" => {
             fetch_openai_style_models(&request.provider, &key).await?
         }
-        "google_aistudio" => fetch_google_models(&request.provider, &key).await?,
+        "gemini" => fetch_gemini_models(&request.provider, &key).await?,
         _ => return Err(ApiError::bad_request("不支持的 Provider 类型")),
     };
     Ok(Json(json!({ "items": items })))
@@ -479,7 +480,7 @@ async fn fetch_openai_style_models(
     Ok(normalize_model_items(models))
 }
 
-async fn fetch_google_models(
+async fn fetch_gemini_models(
     provider: &AdminProviderConfig,
     key: &str,
 ) -> Result<Vec<ProviderModelItem>, ApiError> {

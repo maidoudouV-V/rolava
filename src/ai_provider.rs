@@ -1,4 +1,4 @@
-pub mod google_aistudio;
+pub mod gemini;
 pub mod openai_compatible;
 pub mod openai_responses;
 pub mod openrouter;

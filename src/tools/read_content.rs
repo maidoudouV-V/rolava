@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"读取项目目录中允许访问的文本文件并返回完整内容。
+const DESCRIPTION: &str = r#"读取项目目录中允许访问的文本文件并返回正文内容。
+读取 /skills/ 下的 SKILL.md 时，自动省略文件开头的 YAML 元数据。
 路径必须是以项目根目录为起点的虚拟绝对路径，使用正斜杠。
 路径来源必须是上下文中提供的确信路径，不得猜测路径，或尝试遍历未知路径"#;
 const MAX_CONTENT_BYTES: u64 = 64 * 1024;
@@ -89,10 +90,40 @@ impl Tool for ReadContentTool {
         // 工具只返回文本内容，二进制或编码错误的文件不能进入模型上下文。
         let content = String::from_utf8(bytes)
             .with_context(|| format!("文件不是有效的 UTF-8 文本：{}", relative_path.display()))?;
+        // Skill 入口的 YAML 仅用于发现阶段，执行时只向模型提供正文说明。
+        let content = strip_skill_frontmatter(&relative_path, &content)?;
         Ok(ToolOutput::text(crate::text_utils::truncate_long_text(
-            &content,
+            content,
         )))
     }
+}
+
+fn strip_skill_frontmatter<'a>(path: &Path, content: &'a str) -> Result<&'a str> {
+    let is_skill_entry = path.starts_with(crate::skills::DIRECTORY_NAME)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"));
+    if !is_skill_entry {
+        return Ok(content);
+    }
+
+    let mut lines = content.split_inclusive('\n');
+    let Some(first_line) = lines.next() else {
+        return Ok(content);
+    };
+    if first_line.trim_start_matches('\u{feff}').trim() != "---" {
+        return Ok(content);
+    }
+
+    let mut body_offset = first_line.len();
+    for line in lines {
+        body_offset += line.len();
+        if line.trim() == "---" {
+            return Ok(content[body_offset..].trim_start_matches(['\r', '\n']));
+        }
+    }
+    anyhow::bail!("SKILL.md 的 YAML 元数据缺少结束分隔符");
 }
 
 fn validate_relative_path(raw_path: &str) -> Result<PathBuf> {

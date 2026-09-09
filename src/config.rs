@@ -1,5 +1,5 @@
 use crate::ai_provider::{
-    google_aistudio::GoogleAIStudioProvider, openai_compatible::OpenAICompatibleProvider,
+    gemini::GeminiProvider, openai_compatible::OpenAICompatibleProvider,
     openai_responses::OpenAIResponsesProvider, openrouter::OpenRouterProvider, AIProvider,
 };
 use crate::tools::ToolRegistry;
@@ -247,7 +247,7 @@ pub struct ServerSection {
 pub struct ProviderConfig {
     /// 服务商名称，用作唯一标识
     pub name: String,
-    /// 服务商类型，如 openai_compatible、openai_responses、google_aistudio 或 openrouter
+    /// 服务商类型，如 openai_compatible、openai_responses、gemini 或 openrouter
     pub r#type: String,
     /// 服务商访问密钥
     pub key: String,
@@ -434,11 +434,12 @@ impl AppConfig {
                     model_config.max_tokens,
                     model_config.reasoning_effort.clone(),
                 )),
-                "google_aistudio" => Box::new(GoogleAIStudioProvider::new(
+                "gemini" => Box::new(GeminiProvider::new(
                     provider_config.key.clone(),
                     provider_config.base_url.clone(),
                     model_config.model.clone(),
                     model_config.max_tokens,
+                    model_config.reasoning_effort.clone(),
                 )),
                 _ => {
                     return Err(anyhow::anyhow!(

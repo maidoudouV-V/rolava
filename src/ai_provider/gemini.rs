@@ -3,29 +3,33 @@ use crate::ai_provider::{
     ReasoningState, ToolChatMessage, ToolChatResponse,
 };
 use crate::tools::ToolDefinition;
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::trace;
 
+mod chat;
+
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
-pub struct GoogleAIStudioProvider {
+pub struct GeminiProvider {
     http_client: Client,
     api_key: String,
     base_url: String,
     model: String,
     max_tokens: Option<i32>,
+    reasoning_effort: String,
 }
 
-impl GoogleAIStudioProvider {
+impl GeminiProvider {
     pub fn new(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         model: impl Into<String>,
         max_tokens: Option<i32>,
+        reasoning_effort: impl Into<String>,
     ) -> Self {
         let base_url = base_url.into();
         let base_url = if base_url.trim().is_empty() {
@@ -39,6 +43,7 @@ impl GoogleAIStudioProvider {
             base_url,
             model: model.into(),
             max_tokens,
+            reasoning_effort: reasoning_effort.into(),
         }
     }
 
@@ -46,9 +51,34 @@ impl GoogleAIStudioProvider {
         let model = self.model.trim_start_matches("models/");
         format!("{}/models/{}:generateContent", self.base_url, model)
     }
+
+    fn request_body(&self, body: &impl Serialize) -> anyhow::Result<Value> {
+        let mut body = serde_json::to_value(body)?;
+        if let Some(thinking) = thinking_config(&self.reasoning_effort)? {
+            if body.get("generationConfig").is_none() {
+                body["generationConfig"] = serde_json::json!({});
+            }
+            body["generationConfig"]["thinkingConfig"] = thinking;
+        }
+        Ok(body)
+    }
+}
+
+fn thinking_config(effort: &str) -> anyhow::Result<Option<Value>> {
+    use serde_json::json;
+    let level = match effort.trim() {
+        "auto" => return Ok(None),
+        "none" | "minimal" => "minimal",
+        "low" => "low",
+        "medium" => "medium",
+        "high" | "xhigh" => "high",
+        other => return Err(anyhow!("未知的思考强度：{}", other)),
+    };
+    Ok(Some(json!({"thinkingLevel": level})))
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiGenerateContentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     system_instruction: Option<GeminiContent>,
@@ -60,6 +90,7 @@ struct GeminiGenerateContentRequest {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiTool {
     #[serde(skip_serializing_if = "Option::is_none")]
     google_search: Option<GeminiGoogleSearch>,
@@ -73,6 +104,7 @@ struct GeminiGoogleSearch {}
 struct GeminiUrlContext {}
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiGenerationConfig {
     #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<i32>,
@@ -90,6 +122,7 @@ struct GeminiContent {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct GeminiPart {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
@@ -98,6 +131,7 @@ struct GeminiPart {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct GeminiInlineData {
     mime_type: String,
     data: String,
@@ -106,15 +140,11 @@ struct GeminiInlineData {
 #[derive(Deserialize)]
 struct GeminiGenerateContentResponse {
     candidates: Option<Vec<GeminiCandidate>>,
-    #[serde(rename = "usageMetadata")]
-    usage_metadata: Option<GeminiUsageMetadata>,
 }
 
 #[derive(Deserialize)]
 struct GeminiCandidate {
     content: Option<GeminiResponseContent>,
-    #[serde(rename = "finishReason")]
-    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -125,74 +155,27 @@ struct GeminiResponseContent {
 #[derive(Deserialize)]
 struct GeminiResponsePart {
     text: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GeminiUsageMetadata {
-    #[serde(rename = "promptTokenCount")]
-    prompt_token_count: Option<u64>,
-    #[serde(rename = "candidatesTokenCount")]
-    candidates_token_count: Option<u64>,
-    #[serde(rename = "totalTokenCount")]
-    total_token_count: Option<u64>,
+    #[serde(default)]
+    thought: bool,
 }
 
 #[async_trait]
-impl AIProvider for GoogleAIStudioProvider {
+impl AIProvider for GeminiProvider {
     async fn chat_completions(
         &self,
         messages: &[ToolChatMessage],
         tools: &[ToolDefinition],
     ) -> anyhow::Result<ToolChatResponse> {
-        if !tools.is_empty() {
-            bail!("Google AI Studio Provider 尚未接入 function tools");
-        }
-        let request_messages = context_messages_without_tools(messages)?;
-        let (system_instruction, contents) = build_gemini_chat_contents(&request_messages);
-        let body = GeminiGenerateContentRequest {
-            system_instruction,
-            contents,
-            tools: None,
-            generation_config: GeminiGenerationConfig {
-                max_output_tokens: self.max_tokens,
-                response_mime_type: Some("text/plain"),
-                media_resolution: None,
-            },
-        };
+        let body = chat::build_request(messages, tools, self.max_tokens)?;
         trace!(
-            provider = "google_aistudio",
+            provider = "gemini",
             model = %self.model,
             request = %serde_json::to_string_pretty(&body)
                 .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
             "AI Provider 完整请求"
         );
         let response_text = self.send_generate_content(&body).await?;
-        let raw_response: Value = serde_json::from_str(&response_text)?;
-        let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
-            .map_err(|err| anyhow!("解析 Google AI Studio 响应失败：{}", err))?;
-        let content =
-            extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Google AI Studio 响应内容为空"))?;
-        let finish_reason = parsed
-            .candidates
-            .as_ref()
-            .and_then(|candidates| candidates.first())
-            .and_then(|candidate| candidate.finish_reason.clone());
-        let usage = parsed.usage_metadata.map(|usage| ChatUsage {
-            prompt_tokens: usage.prompt_token_count,
-            completion_tokens: usage.candidates_token_count,
-            total_tokens: usage.total_token_count,
-        });
-
-        Ok(ToolChatResponse {
-            content: Some(content),
-            reasoning: ReasoningState::default(),
-            tool_calls: Vec::new(),
-            finish_reason,
-            id: None,
-            model: Some(self.model.clone()),
-            usage,
-            raw_response,
-        })
+        chat::parse_response(&response_text, &self.model)
     }
 
     async fn describe_image(&self, image_data_url: &str, prompt: &str) -> anyhow::Result<String> {
@@ -222,7 +205,7 @@ impl AIProvider for GoogleAIStudioProvider {
             },
         };
         trace!(
-            provider = "google_aistudio",
+            provider = "gemini",
             model = %self.model,
             prompt,
             image_data_bytes,
@@ -232,12 +215,32 @@ impl AIProvider for GoogleAIStudioProvider {
 
         let response_text = self.send_generate_content(&body).await?;
         let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
-            .map_err(|err| anyhow!("解析 Google AI Studio 视觉响应失败：{}", err))?;
-        extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Google AI Studio 视觉响应内容为空"))
+            .map_err(|err| anyhow!("解析 Gemini 视觉响应失败：{}", err))?;
+        extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Gemini 视觉响应内容为空"))
     }
 
     async fn web_search(&self, question: &str) -> anyhow::Result<String> {
-        let body = GeminiGenerateContentRequest {
+        let body = self.web_search_request(question);
+        trace!(
+            provider = "gemini",
+            model = %self.model,
+            request = %serde_json::to_string_pretty(&body)
+                .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
+            "联网搜索 Provider 完整请求"
+        );
+
+        let response_text = self.send_generate_content(&body).await?;
+        let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
+            .map_err(|err| anyhow!("解析 Gemini 联网搜索响应失败：{}", err))?;
+        let answer =
+            extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Gemini 联网搜索响应内容为空"))?;
+        Ok(answer)
+    }
+}
+
+impl GeminiProvider {
+    fn web_search_request(&self, question: &str) -> GeminiGenerateContentRequest {
+        GeminiGenerateContentRequest {
             system_instruction: None,
             contents: vec![GeminiContent {
                 role: Some("user"),
@@ -261,48 +264,44 @@ impl AIProvider for GoogleAIStudioProvider {
                 response_mime_type: None,
                 media_resolution: None,
             },
-        };
-        trace!(
-            provider = "google_aistudio",
-            model = %self.model,
-            request = %serde_json::to_string_pretty(&body)
-                .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
-            "联网搜索 Provider 完整请求"
-        );
-
-        let response_text = self.send_generate_content(&body).await?;
-        let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
-            .map_err(|err| anyhow!("解析 Google AI Studio 联网搜索响应失败：{}", err))?;
-        let answer = extract_gemini_text(&parsed)
-            .ok_or_else(|| anyhow!("Google AI Studio 联网搜索响应内容为空"))?;
-        Ok(answer)
+        }
     }
-}
 
-impl GoogleAIStudioProvider {
     async fn send_generate_content(
         &self,
-        body: &GeminiGenerateContentRequest,
+        body: &(impl Serialize + Sync),
     ) -> anyhow::Result<String> {
+        let body = self.request_body(body)?;
+        let url = self.generate_content_url();
+        trace!(provider = "gemini", model = %self.model, thinking_config = ?body.pointer("/generationConfig/thinkingConfig"), "Gemini 思考配置");
         let resp = self
             .http_client
-            .post(self.generate_content_url())
+            .post(&url)
             .header("x-goog-api-key", &self.api_key)
             .header("Content-Type", "application/json")
-            .json(body)
+            .json(&body)
             .send()
-            .await?;
+            .await
+            .with_context(|| format!("Gemini 请求失败：{}", url))?;
 
         let status = resp.status();
-        let response_text = resp.text().await?;
-        trace!(provider = "google_aistudio", status = %status, response = %response_text, "AI Provider 原始响应");
+        let response_text = resp
+            .text()
+            .await
+            .with_context(|| format!("读取 Gemini 响应失败：{}，HTTP {}", url, status))?;
+        trace!(provider = "gemini", status = %status, response = %response_text, "AI Provider 原始响应");
         if !status.is_success() {
             return Err(anyhow!(
-                "Google AI Studio API 调用失败，状态码 {}：{}",
+                "Gemini API 调用失败，URL {}，状态码 {}：{}",
+                url,
                 status,
                 response_text
             ));
         }
+
+        let raw: Value =
+            serde_json::from_str(&response_text).context("解析 Gemini 响应 JSON 失败")?;
+        chat::validate_response(&raw)?;
 
         Ok(response_text)
     }
@@ -379,6 +378,7 @@ fn extract_gemini_text(response: &GeminiGenerateContentResponse) -> Option<Strin
         .parts
         .as_ref()?
         .iter()
+        .filter(|part| !part.thought)
         .filter_map(|part| part.text.as_deref())
         .collect::<Vec<_>>()
         .join("");
@@ -391,7 +391,7 @@ fn extract_gemini_text(response: &GeminiGenerateContentResponse) -> Option<Strin
 
 fn parse_data_url(image_data_url: &str) -> anyhow::Result<GeminiInlineData> {
     let Some(rest) = image_data_url.strip_prefix("data:") else {
-        return Err(anyhow!("Google AI Studio 视觉请求只支持 data URL 图片"));
+        return Err(anyhow!("Gemini 视觉请求只支持 data URL 图片"));
     };
     let Some((mime_type, data)) = rest.split_once(";base64,") else {
         return Err(anyhow!("图片 data URL 缺少 ;base64, 分隔符"));

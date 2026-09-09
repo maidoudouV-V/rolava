@@ -593,6 +593,21 @@ impl ChatProcessor {
         if self.runtime_context.reconcile_message_ids(&message_ids)? {
             debug!("聊天窗口已淘汰或删除旧记录，重新计算内存分块");
         }
+        if matches!(
+            self.message_target.conversation.kind,
+            ConversationKind::Group
+        ) {
+            let max_newer_messages = self.services.app_config.app.max_history_messages as usize / 3;
+            let removed = self
+                .runtime_context
+                .evict_tool_histories_beyond_newer_messages(max_newer_messages);
+            if removed > 0 {
+                debug!(
+                    tool_history_count = removed,
+                    max_newer_messages, "群聊工具历史已超过保留距离"
+                );
+            }
+        }
         if memory_review {
             self.user_memory
                 .refresh_history_users(&history_window.messages)

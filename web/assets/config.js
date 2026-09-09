@@ -67,9 +67,9 @@ export class ConfigController {
   renderProviders() {
     document.getElementById("provider-rows").innerHTML = this.data.providers.map((provider, index) => `<tr data-index="${index}">
       <td><input data-field="name" value="${escapeHtml(provider.name)}"></td>
-      <td><select data-field="type">${["openai_compatible","openai_responses","openrouter","google_aistudio"].map(type => `<option ${type === provider.type ? "selected" : ""}>${type}</option>`).join("")}</select></td>
+      <td><select data-field="type">${["openai_compatible","openai_responses","openrouter","gemini"].map(type => `<option value="${type}" ${type === provider.type ? "selected" : ""}>${type === "gemini" ? "Gemini" : type}</option>`).join("")}</select></td>
       <td><input data-field="base_url" value="${escapeHtml(provider.base_url)}"></td>
-      <td><input data-field="key" type="password" placeholder="${provider.key_configured ? "已配置" : "未配置"}"></td>
+      <td><input data-field="key" type="password" value="${escapeHtml(provider.key || "")}" placeholder="${provider.key_configured ? "已配置" : "未配置"}"></td>
       <td class="row-actions"><button data-remove-provider="${index}" title="删除"><i data-lucide="trash-2"></i></button></td>
     </tr>`).join("");
   }
@@ -92,8 +92,10 @@ export class ConfigController {
   }
 
   reasoningOptions(providerType, selected) {
-    const automatic = providerType === "google_aistudio" ? "自动（Google 默认）" : providerType === "openrouter" ? "自动（路由默认）" : "自动（模型默认）";
-    const options = [["auto", automatic], ["none", "none"], ["minimal", "minimal"], ["low", "low"], ["medium", "medium"], ["high", "high"], ["xhigh", "xhigh"]];
+    const automatic = providerType === "gemini" ? "自动（Gemini 默认）" : providerType === "openrouter" ? "自动（路由默认）" : "自动（模型默认）";
+    const levels = ["none", "minimal", "low", "medium", "high", "xhigh"];
+    const options = [["auto", automatic], ...levels.map(level => [level, level])];
+    if (!options.some(([value]) => value === selected)) selected = "auto";
     return options.map(([value, label]) => `<option value="${value}" ${value === (selected || "auto") ? "selected" : ""}>${label}</option>`).join("");
   }
 
@@ -276,6 +278,7 @@ export class ConfigController {
     const update = this.buildUpdate();
     await api.put(`/config?restart=${restartAfterSave}`, update);
     if (restartAfterSave) this.onRestart();
+    else await this.load();
   }
 
   async testOneBot() {
