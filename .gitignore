@@ -1,6 +1,6 @@
 /target/
-/config/
 /.idea/
+/data/
 *.db
 *.sqlite
 *.sqlite3

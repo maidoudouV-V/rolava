@@ -156,7 +156,7 @@ async fn run_worker() -> Result<WorkerExit> {
     let runtime = Arc::new(RuntimeState::default());
     let (platform_tx, platform_rx) = mpsc::channel::<IncomingMessage>(MESSAGE_CHANNEL_CAPACITY);
     let (internal_trigger_tx, internal_trigger_rx) = mpsc::unbounded_channel();
-    let db_manager = Arc::new(QQChatContextManager::new("test_chat.db")?);
+    let db_manager = Arc::new(QQChatContextManager::new("data/test_chat.db")?);
     let history_compression = Arc::new(HistoryCompressionService::new(
         app_config.clone(),
         db_manager.clone(),

@@ -4,11 +4,10 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 
 use super::{
-    AgentWebSearchTool, ContinueConversationTool, CreateScheduledTaskTool, CreateUserMemoryTool,
-    DeleteGroupMemoryTool, DeleteScheduledTaskTool, DeleteUserMemoryTool, EndConversationTool,
-    GetScheduledTaskTool, ReadContentTool, RunScriptTool, SendQqExpressionTool, SetGroupMemoryTool,
-    Tool, ToolCall, ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool,
-    UpdateUserMemoryTool, WaitForReplyTool,
+    AgentWebSearchTool, CreateScheduledTaskTool, DeleteGroupMemoryTool, DeleteScheduledTaskTool,
+    DeleteUserMemoryTool, GetScheduledTaskTool, ReadContentTool, RunScriptTool,
+    SendQqExpressionTool, SetConversationStateTool, SetGroupMemoryTool, SetUserMemoryTool, Tool,
+    ToolCall, ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool, WaitForReplyTool,
 };
 
 /// 管理后台可配置的工具信息；固定启用的内部工具不会出现在这里。
@@ -48,8 +47,7 @@ impl ToolRegistry {
                 registry.register(SetGroupMemoryTool).unwrap();
                 registry.register(DeleteGroupMemoryTool).unwrap();
             }
-            registry.register(CreateUserMemoryTool).unwrap();
-            registry.register(UpdateUserMemoryTool).unwrap();
+            registry.register(SetUserMemoryTool).unwrap();
             registry.register(DeleteUserMemoryTool).unwrap();
         }
         registry.register(WaitForReplyTool::new()).unwrap();
@@ -58,9 +56,8 @@ impl ToolRegistry {
         registry.register(UpdateScheduledTaskTool).unwrap();
         registry.register(DeleteScheduledTaskTool).unwrap();
         if group_conversation {
-            // 这两个状态工具只控制群聊的 AI 前置过滤，私聊不需要注册。
-            registry.register(ContinueConversationTool).unwrap();
-            registry.register(EndConversationTool).unwrap();
+            // 状态工具只控制群聊的 AI 前置过滤，私聊不需要注册。
+            registry.register(SetConversationStateTool).unwrap();
         }
         registry
     }

@@ -51,20 +51,58 @@ function normalizePOI(poi) {
     id: value(poi.id),
     name: value(poi.name),
     address: value(poi.address),
-    type: value(poi.type),
     location: value(poi.location),
     amap_url: amapMarkerUrl(poi),
     distance_m: value(poi.distance) !== undefined ? Number(poi.distance) : undefined,
     rating: value(b.rating) !== undefined ? Number(b.rating) : undefined,
     cost_per_person: value(b.cost) !== undefined ? Number(b.cost) : undefined,
-    open_today: value(b.opentime_today),
-    open_week: value(b.opentime_week),
-    tags: value(b.tag),
-    business_area: value(b.business_area),
-    parking_type: value(b.parking_type),
-    district: value(poi.adname),
+    keytag: value(b.keytag),
+    opentime_week: value(b.opentime_week),
   };
   return Object.fromEntries(Object.entries(out).filter(([, v]) => v !== undefined && !Number.isNaN(v)));
+}
+
+function compactPOI(poi) {
+  const out = {
+    id: poi.id,
+    name: poi.name,
+    distance_m: poi.distance_m,
+    rating: poi.rating,
+  };
+  return Object.fromEntries(Object.entries(out).filter(([, v]) => v !== undefined));
+}
+
+async function collectPOIs(search, params, limit, now = Date.now) {
+  const startedAt = now();
+  const pois = [];
+  for (let page = 1; pois.length < limit; page += 1) {
+    const remainingMs = 20000 - (now() - startedAt);
+    if (remainingMs <= 0) break;
+
+    let result;
+    try {
+      result = await search({
+        ...params,
+        page,
+        limit: 25,
+        timeoutMs: Math.min(15000, remainingMs),
+      });
+    } catch (error) {
+      const timedOut = error?.code === 'ECONNABORTED' || error?.code === 'ETIMEDOUT';
+      if (timedOut && now() - startedAt >= 20000) break;
+      throw error;
+    }
+
+    const currentPage = result.pois || [];
+    pois.push(...currentPage.slice(0, limit - pois.length));
+    if (currentPage.length < 25 || now() - startedAt >= 20000) break;
+  }
+  return pois;
+}
+
+function formatPOIs(pois) {
+  const normalized = pois.map(normalizePOI);
+  return normalized.length <= 10 ? normalized : normalized.map(compactPOI);
 }
 
 async function main() {
@@ -72,16 +110,16 @@ async function main() {
   if (!args.keywords && !args.types) {
     throw new Error('至少提供 --keywords 或 --types');
   }
+  if (args.page !== undefined) {
+    throw new Error('不再支持 --page；请使用 --limit=1-200');
+  }
 
-  const limit = integerArg('--limit', args.limit || args.offset, 10, 1, 25);
-  const page = integerArg('--page', args.page, 1, 1);
+  const limit = integerArg('--limit', args.limit, 10, 1, 200);
   const params = {
     keywords: args.keywords || '',
     types: args.types || '',
     city: args.city || '',
     cityLimit: args.cityLimit === 'true',
-    page,
-    limit,
     sort: args.sort || 'distance',
     showFields: 'business',
   };
@@ -90,18 +128,20 @@ async function main() {
     params.radius = integerArg('--radius', args.radius, 5000, 0, 50000);
   }
 
-  const result = await searchPOI(params);
-  const places = (result.pois || []).slice(0, limit).map(normalizePOI);
+  const places = formatPOIs(await collectPOIs(searchPOI, params, limit));
   const payload = {
-    count: Number(result.count || places.length),
-    page: params.page,
+    count: places.length,
     places,
   };
 
   console.log(JSON.stringify(payload));
 }
 
-main().catch(err => {
-  console.error(JSON.stringify({ error: err.message }));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(err => {
+    console.error(JSON.stringify({ error: err.message }));
+    process.exit(1);
+  });
+}
+
+module.exports = { collectPOIs, compactPOI, formatPOIs, normalizePOI };

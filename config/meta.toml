@@ -1,0 +1,39 @@
+providers = []
+models = []
+
+[app]
+chat_model_name = ""
+filter_model_name = ""
+web_search_model_name = ""
+visual_model_name = ""
+prompt_dir = "prompt"
+max_history_messages = 50
+history_summary_enabled = false
+history_summary_days = 30
+startup_history_fetch_count = 0
+vision_image_message_window = 10
+proactive_reply_percent = 0.0
+ai_request_retry_count = 1
+ai_request_timeout_seconds = 0
+received_image_dir = "received_images"
+enabled_actions = []
+enabled_skills = []
+direct_whitelist = []
+group_whitelist = []
+command_whitelist = []
+reply_delay_random_max_secs = 0.0
+
+[server]
+server_host = "0.0.0.0"
+server_port = 8080
+server_token = ""
+onebot_api = ""
+onebot_token = ""
+
+[logging]
+level = "info"
+
+[admin]
+token = ""
+
+[skill_environment]

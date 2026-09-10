@@ -28,10 +28,10 @@ function getKey() {
   return key;
 }
 
-async function amapGet(path, params = {}) {
+async function amapGet(path, params = {}, timeoutMs = 15000) {
   const response = await axios.get(`${BASE}${path}`, {
     params: { key: getKey(), ...params },
-    timeout: 15000,
+    timeout: timeoutMs,
   });
   const data = response.data;
   if (!data) throw new Error('高德 API 返回空响应');
@@ -73,7 +73,7 @@ async function searchPOI(params = {}) {
     request.sortrule = params.sort === 'weight' ? 'weight' : 'distance';
   }
 
-  const result = await amapGet(path, request);
+  const result = await amapGet(path, request, params.timeoutMs);
   return {
     ...result,
     pois: (result.pois || []).map((poi) => {
@@ -87,6 +87,18 @@ async function searchPOI(params = {}) {
       return cleaned;
     }),
   };
+}
+
+async function getPOIDetail(params = {}) {
+  const rawId = typeof params.id === 'string' ? params.id.trim() : '';
+  if (!rawId) throw new Error('getPOIDetail 缺少 id');
+  const ids = rawId.split('|').map(id => id.trim());
+  if (ids.some(id => !id)) throw new Error('getPOIDetail 的 id 不能包含空值');
+  if (ids.length > 10) throw new Error('getPOIDetail 的 id 最多支持 10 个');
+  return amapGet('/v5/place/detail', {
+    id: ids.join('|'),
+    show_fields: params.showFields || 'business',
+  });
 }
 
 async function geocode(params = {}) {
@@ -148,6 +160,7 @@ async function transitRoute(params = {}) {
 
 module.exports = {
   searchPOI,
+  getPOIDetail,
   geocode,
   reverseGeocode,
   walkingRoute,

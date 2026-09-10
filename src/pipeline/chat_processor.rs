@@ -175,12 +175,11 @@ impl ChatProcessor {
         let tools = tools.select(&[
             "set_group_memory",
             "delete_group_memory",
-            "create_user_memory",
-            "update_user_memory",
+            "set_user_memory",
             "delete_user_memory",
-            "end_conversation",
+            "set_conversation_state",
         ]);
-        if tools.get("create_user_memory").is_none() {
+        if tools.get("set_user_memory").is_none() {
             return;
         }
         let bypassed = self.conversation_control.ai_filter_bypassed();
@@ -415,8 +414,7 @@ impl ChatProcessor {
                         result.tool_name.as_str(),
                         "set_group_memory"
                             | "delete_group_memory"
-                            | "create_user_memory"
-                            | "update_user_memory"
+                            | "set_user_memory"
                             | "delete_user_memory"
                     )
             }) {

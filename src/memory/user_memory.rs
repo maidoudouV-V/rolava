@@ -17,6 +17,7 @@ use super::member_profile::OneBotMemberProfileClient;
 const INITIAL_MEMBER_MESSAGE_SCAN: usize = 10;
 const MAX_ACTIVE_MEMORY_USERS: usize = 20;
 const MEMORY_ID_RANDOM_CHARS: usize = 8;
+pub const MAX_USER_MEMORY_CONTENT_CHARS: usize = 1000;
 
 /// 不依赖 Actor 活跃成员状态的用户记忆领域服务。
 pub struct UserMemoryService {
@@ -40,6 +41,7 @@ impl UserMemoryService {
         if user_id.is_empty() || content.is_empty() {
             anyhow::bail!("QQ 号和记忆内容不能为空");
         }
+        Self::validate_content(content)?;
         let memory_id = self.generate_memory_id()?;
         self.db_manager
             .insert_user_memory(&memory_id, source, bot_id, user_id, content)?;
@@ -55,9 +57,7 @@ impl UserMemoryService {
         content: &str,
     ) -> Result<()> {
         let content = content.trim();
-        if content.is_empty() {
-            anyhow::bail!("记忆内容不能为空");
-        }
+        Self::validate_content(content)?;
         if !self.db_manager.update_user_memory(
             source,
             bot_id,
@@ -76,6 +76,16 @@ impl UserMemoryService {
             .delete_user_memory(source, bot_id, user_id.trim(), memory_id.trim())?
         {
             anyhow::bail!("找不到指定的用户记忆");
+        }
+        Ok(())
+    }
+
+    fn validate_content(content: &str) -> Result<()> {
+        if content.is_empty() {
+            anyhow::bail!("记忆内容不能为空");
+        }
+        if content.chars().count() > MAX_USER_MEMORY_CONTENT_CHARS {
+            anyhow::bail!("用户记忆内容不能超过 {} 个字符", MAX_USER_MEMORY_CONTENT_CHARS);
         }
         Ok(())
     }
