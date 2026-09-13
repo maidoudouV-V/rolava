@@ -29,7 +29,6 @@ use sha2::{Digest, Sha256};
 use super::filter::FilteredMessage;
 
 const MAX_TOOL_ROUNDS: usize = 8;
-const DIRECT_TOOL_HISTORY_TURNS: usize = 5;
 
 /// 为单个会话构造上下文、请求 AI 并处理响应。
 pub struct ChatProcessor {
@@ -94,6 +93,12 @@ impl ChatProcessor {
     pub fn reset_conversation_state(&mut self) {
         self.user_memory.reset();
         self.runtime_context.reset();
+    }
+
+    pub fn end_conversation(&mut self) {
+        self.conversation_control.set_ai_filter_bypassed(false);
+        let removed = self.runtime_context.compact_finished_conversation();
+        debug!(tool_history_count = removed, "对话结束，已清除内存工具历史");
     }
 
     /// 处理平台发来的消息。过滤和入库已由当前会话 Actor 在调用前完成。
@@ -212,15 +217,6 @@ impl ChatProcessor {
         current_message_ids: &[i64],
         silent: bool,
     ) {
-        if matches!(
-            self.message_target.conversation.kind,
-            ConversationKind::Direct
-        ) {
-            let removed = self.runtime_context.advance_tool_history_turn();
-            if removed > 0 {
-                debug!(tool_history_count = removed, "私聊工具历史已超过五轮保留期");
-            }
-        }
         let built_context = match self
             .build_context(
                 conversation_messages,
@@ -452,24 +448,18 @@ impl ChatProcessor {
             return;
         }
         if conversation_effect == ConversationEffect::End {
-            let removed = self.runtime_context.compact_finished_conversation();
-            debug!(tool_history_count = removed, "对话结束，已压缩内存工具历史");
-        } else if !tool_round_history.is_empty() {
+            self.end_conversation();
+        } else if matches!(
+            self.message_target.conversation.kind,
+            ConversationKind::Group
+        ) && !tool_round_history.is_empty()
+        {
             match ActiveToolHistory::new(
                 built_context.latest_message_id,
                 tool_round_history,
                 tool_round_message_ids,
             ) {
                 Ok(history) => {
-                    // 私聊减少长期工具协议占用，群聊则继续保留到对话结束或窗口淘汰。
-                    let history = if matches!(
-                        self.message_target.conversation.kind,
-                        ConversationKind::Direct
-                    ) {
-                        history.with_turn_limit(DIRECT_TOOL_HISTORY_TURNS)
-                    } else {
-                        history
-                    };
                     if let Err(error) = self.runtime_context.push_tool_history(history) {
                         error!(error = %format!("{error:#}"), "追加内存工具历史失败");
                     }
@@ -590,21 +580,6 @@ impl ChatProcessor {
             .collect::<Vec<_>>();
         if self.runtime_context.reconcile_message_ids(&message_ids)? {
             debug!("聊天窗口已淘汰或删除旧记录，重新计算内存分块");
-        }
-        if matches!(
-            self.message_target.conversation.kind,
-            ConversationKind::Group
-        ) {
-            let max_newer_messages = self.services.app_config.app.max_history_messages as usize / 3;
-            let removed = self
-                .runtime_context
-                .evict_tool_histories_beyond_newer_messages(max_newer_messages);
-            if removed > 0 {
-                debug!(
-                    tool_history_count = removed,
-                    max_newer_messages, "群聊工具历史已超过保留距离"
-                );
-            }
         }
         if memory_review {
             self.user_memory

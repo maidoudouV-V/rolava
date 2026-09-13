@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep_until, timeout, Duration, Instant};
 use tracing::{debug, info};
 
 use crate::commands::{CommandOutput, CommandRuntimeAction, CommandSystem};
@@ -16,6 +16,7 @@ use super::filter::ConversationFilter;
 
 const MESSAGE_BATCH_WAIT: Duration = Duration::from_secs(2);
 const MESSAGE_BATCH_MAX_MESSAGES: usize = 5;
+const CONVERSATION_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// 单个会话 mailbox 接收的全部事件类型。
 pub enum ConversationEvent {
@@ -58,18 +59,40 @@ impl ConversationActor {
 
     pub async fn run(mut self) {
         let mut pending_event = None;
+        let mut idle_deadline = None;
         loop {
+            if self.conversation_control.ai_filter_bypassed() {
+                idle_deadline.get_or_insert_with(|| Instant::now() + CONVERSATION_IDLE_TIMEOUT);
+            } else {
+                idle_deadline = None;
+            }
             let queued_events = self.event_rx.len() + usize::from(pending_event.is_some());
             let event = match pending_event.take() {
                 Some(event) => event,
-                None => match self.event_rx.recv().await {
-                    Some(event) => event,
-                    None => break,
-                },
+                None => {
+                    let event = if let Some(deadline) = idle_deadline {
+                        tokio::select! {
+                            biased;
+                            event = self.event_rx.recv() => event,
+                            _ = sleep_until(deadline) => {
+                                self.processor.end_conversation();
+                                debug!("连续对话空闲十五分钟，已自动结束");
+                                continue;
+                            }
+                        }
+                    } else {
+                        self.event_rx.recv().await
+                    };
+                    match event {
+                        Some(event) => event,
+                        None => break,
+                    }
+                }
             };
 
             match event {
                 ConversationEvent::IncomingMessage(incoming_message) => {
+                    idle_deadline = Some(Instant::now() + CONVERSATION_IDLE_TIMEOUT);
                     if self.process_command(&incoming_message).await {
                         continue;
                     }
@@ -80,6 +103,7 @@ impl ConversationActor {
                         queued_events,
                     )
                     .await;
+                    idle_deadline = Some(Instant::now() + CONVERSATION_IDLE_TIMEOUT);
                     pending_event = next_event;
                     debug!(message_count = incoming_messages.len(), "会话消息聚合完成");
 

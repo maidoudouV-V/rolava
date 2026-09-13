@@ -73,7 +73,6 @@ pub struct ActiveToolHistory {
     pub after_message_id: Option<i64>,
     rounds: Vec<ToolRoundHistory>,
     suppressed_message_ids: HashSet<i64>,
-    remaining_turns: Option<usize>,
 }
 
 impl ActiveToolHistory {
@@ -89,16 +88,9 @@ impl ActiveToolHistory {
             after_message_id,
             rounds,
             suppressed_message_ids: suppressed_message_ids.into_iter().collect(),
-            remaining_turns: None,
         };
         history.validate()?;
         Ok(history)
-    }
-
-    /// 限制工具历史只参与之后指定数量的会话处理轮次。
-    pub fn with_turn_limit(mut self, turns: usize) -> Self {
-        self.remaining_turns = Some(turns);
-        self
     }
 
     pub fn suppresses_message(&self, message_id: i64) -> bool {
@@ -181,41 +173,6 @@ impl RuntimeContextState {
     pub fn push_tool_history(&mut self, history: ActiveToolHistory) -> Result<()> {
         self.active_tool_histories.push(history);
         self.validate()
-    }
-
-    /// 开始新一轮会话处理，并删除已经用满保留轮次的工具历史。
-    pub fn advance_tool_history_turn(&mut self) -> usize {
-        let before = self.active_tool_histories.len();
-        self.active_tool_histories
-            .retain_mut(|history| match history.remaining_turns.as_mut() {
-                None => true,
-                Some(0) => false,
-                Some(remaining) => {
-                    *remaining -= 1;
-                    true
-                }
-            });
-        before - self.active_tool_histories.len()
-    }
-
-    /// 删除已经落后于当前聊天窗口过多消息的工具历史。
-    pub fn evict_tool_histories_beyond_newer_messages(
-        &mut self,
-        max_newer_messages: usize,
-    ) -> usize {
-        let before = self.active_tool_histories.len();
-        let message_ids = &self.loaded_message_ids;
-        self.active_tool_histories.retain(|history| {
-            let Some(anchor_id) = history.after_message_id else {
-                return true;
-            };
-            let Some(anchor_index) = message_ids.iter().position(|id| *id == anchor_id) else {
-                return false;
-            };
-            let newer_messages = message_ids.len() - anchor_index - 1;
-            newer_messages <= max_newer_messages
-        });
-        before - self.active_tool_histories.len()
     }
 
     /// 对话结束后只保留 messages 中已经真实发送的正文，不再保留工具协议。

@@ -25,12 +25,20 @@ struct ScriptRuntime {
 
 // 运行类型白名单只负责固定解释器和脚本扩展名。即使脚本可信，它接受的参数仍可能触发文件、
 // 网络或子进程操作，因此新增运行类型或脚本能力时仍需检查脚本自身的参数处理逻辑。
-const SCRIPT_RUNTIMES: &[ScriptRuntime] = &[ScriptRuntime {
-    name: "node",
-    program: "node",
-    extensions: &["js", "mjs", "cjs"],
-    removed_environment: &["NODE_OPTIONS", "NODE_PATH"],
-}];
+const SCRIPT_RUNTIMES: &[ScriptRuntime] = &[
+    ScriptRuntime {
+        name: "node",
+        program: "node",
+        extensions: &["js", "mjs", "cjs"],
+        removed_environment: &["NODE_OPTIONS", "NODE_PATH"],
+    },
+    ScriptRuntime {
+        name: "python",
+        program: "python",
+        extensions: &["py"],
+        removed_environment: &["PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONINSPECT"],
+    },
+];
 
 // 脚本路径权限与运行类型分离；当前只允许执行项目 skills 目录中的脚本。
 const ALLOWED_SCRIPT_DIRECTORIES: &[&str] = &[crate::skills::DIRECTORY_NAME];
