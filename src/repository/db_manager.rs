@@ -180,7 +180,23 @@ pub struct NewChatMessage {
     pub event_timestamp: i64,
 }
 
-/// 已接收图片记录。
+/// 图片的文件管理归属。
+#[derive(Debug, Clone, Copy)]
+pub enum ImageSource {
+    Received,
+    Local,
+}
+
+impl ImageSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Local => "local",
+        }
+    }
+}
+
+/// 已登记图片记录。
 #[derive(Debug, Clone)]
 pub struct ReceivedImageRecord {
     /// 图片短 ID，用于提示词和后续引用。
@@ -202,6 +218,7 @@ pub struct AdminImageResource {
 /// 一条待写入的接收图片记录。
 #[derive(Debug, Clone)]
 pub struct NewReceivedImage {
+    pub source: ImageSource,
     /// 图片短 ID。
     pub image_id: String,
     /// 图片内容哈希。
@@ -272,7 +289,7 @@ impl QQChatContextManager {
     pub fn new(db_path: &str) -> Result<Self> {
         let manager = SqliteConnectionManager::file(db_path);
         let conn_pool = Pool::builder().max_size(5).build(manager)?;
-        let conn = conn_pool.get()?;
+        let mut conn = conn_pool.get()?;
 
         // 仅迁移旧表名称，保留已有记忆、会话归属和到期状态。
         let has_legacy_memories: bool = conn.query_row(
@@ -427,7 +444,8 @@ impl QQChatContextManager {
             CREATE TABLE IF NOT EXISTS received_images (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 image_id        TEXT    NOT NULL UNIQUE,
-                content_hash    TEXT    NOT NULL UNIQUE,
+                content_hash    TEXT    NOT NULL,
+                source          TEXT    NOT NULL DEFAULT 'received',
                 local_path      TEXT    NOT NULL,
                 original_url    TEXT,
                 mime_type       TEXT,
@@ -435,12 +453,52 @@ impl QQChatContextManager {
                 description     TEXT    NOT NULL,
                 metadata_json   TEXT    NOT NULL DEFAULT '{}',
                 created_at      INTEGER NOT NULL,
-                updated_at      INTEGER NOT NULL
+                updated_at      INTEGER NOT NULL,
+                last_used_at    INTEGER NOT NULL,
+                UNIQUE (source, content_hash)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_received_images_content_hash
-            ON received_images (content_hash);
             ",
+        )?;
+        let has_source: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('received_images') WHERE name = 'source')",
+            [], |row| row.get(0),
+        )?;
+        if !has_source {
+            let tx = conn.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE received_images_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_id TEXT NOT NULL UNIQUE,
+                    content_hash TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'received',
+                    local_path TEXT NOT NULL,
+                    original_url TEXT,
+                    mime_type TEXT,
+                    file_size INTEGER NOT NULL,
+                    description TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_used_at INTEGER NOT NULL,
+                    UNIQUE (source, content_hash)
+                );
+                INSERT INTO received_images_new
+                SELECT id, image_id,
+                    CASE WHEN content_hash LIKE 'local:%' THEN substr(content_hash, 7) ELSE content_hash END,
+                    CASE WHEN content_hash LIKE 'local:%' THEN 'local' ELSE 'received' END,
+                    local_path, original_url, mime_type, file_size, description, metadata_json,
+                    created_at, updated_at, updated_at
+                FROM received_images;
+                DROP TABLE received_images;
+                ALTER TABLE received_images_new RENAME TO received_images;",
+            )?;
+            tx.commit()?;
+        }
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_received_images_content_hash;
+             CREATE INDEX IF NOT EXISTS idx_received_images_last_used
+             ON received_images(source, last_used_at);",
         )?;
         Ok(Self { conn_pool })
     }
@@ -1521,6 +1579,7 @@ impl QQChatContextManager {
     /// 根据图片内容哈希查询已接收图片，用于重复图片复用描述。
     pub fn get_received_image_by_hash(
         &self,
+        source: ImageSource,
         content_hash: &str,
     ) -> Result<Option<ReceivedImageRecord>> {
         let connection = self.conn_pool.get()?;
@@ -1529,9 +1588,9 @@ impl QQChatContextManager {
                 "
                 SELECT image_id, content_hash, local_path, description
                 FROM received_images
-                WHERE content_hash = ?1
+                WHERE source = ?1 AND content_hash = ?2
                 ",
-                params![content_hash],
+                params![source.as_str(), content_hash],
                 |row| {
                     Ok(ReceivedImageRecord {
                         image_id: row.get(0)?,
@@ -1613,8 +1672,10 @@ impl QQChatContextManager {
                 description,
                 metadata_json,
                 created_at,
-                updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                updated_at,
+                source,
+                last_used_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?10)
             ",
             params![
                 &image.image_id,
@@ -1627,6 +1688,7 @@ impl QQChatContextManager {
                 &image.metadata_json,
                 now_timestamp,
                 now_timestamp,
+                image.source.as_str(),
             ],
         )?;
         Ok(())
@@ -1637,6 +1699,7 @@ impl QQChatContextManager {
         &self,
         image_id: &str,
         description: &str,
+        placeholder_text: &str,
         described_text: &str,
     ) -> Result<usize> {
         let now_timestamp = Utc::now().timestamp();
@@ -1655,6 +1718,10 @@ impl QQChatContextManager {
             return Ok(0);
         }
 
+        let local_path: String = tx.query_row(
+            "SELECT local_path FROM received_images WHERE image_id = ?1",
+            params![image_id], |row| row.get(0),
+        )?;
         // 先筛出可能引用该图片的消息，再用 JSON 结构确认并修改对应图片片段。
         let candidates = {
             let mut statement = tx.prepare(
@@ -1676,7 +1743,6 @@ impl QQChatContextManager {
             rows
         };
 
-        let placeholder_text = format!("![图片](attachment://{})", image_id);
         let mut updated_messages = 0usize;
         for (message_id, content_text, content_parts_json) in candidates {
             let mut parts: Value = serde_json::from_str(&content_parts_json)?;
@@ -1698,17 +1764,18 @@ impl QQChatContextManager {
                 let previous_context = data
                     .get("context_text")
                     .and_then(Value::as_str)
-                    .unwrap_or(&placeholder_text)
+                    .unwrap_or(placeholder_text)
                     .to_string();
                 let next_context = Self::image_context_with_description(
                     &previous_context,
-                    image_id,
+                    placeholder_text,
                     described_text,
                 );
                 data.insert(
                     "description".to_string(),
                     Value::String(description.to_string()),
                 );
+                data.insert("local_path".to_string(), Value::String(local_path.clone()));
                 data.insert(
                     "context_text".to_string(),
                     Value::String(next_context.clone()),
@@ -1745,18 +1812,26 @@ impl QQChatContextManager {
     /// 只替换内部图片占位，保留文件图片的外层文件信息。
     fn image_context_with_description(
         previous_context: &str,
-        image_id: &str,
+        image_placeholder: &str,
         described_text: &str,
     ) -> String {
-        let image_placeholder = format!("![图片](attachment://{})", image_id);
-        if previous_context.contains(&image_placeholder) {
-            previous_context.replace(&image_placeholder, described_text)
+        if previous_context.contains(image_placeholder) {
+            previous_context.replace(image_placeholder, described_text)
         } else {
             described_text.to_string()
         }
     }
 
-    /// 查询创建时间早于截止时间的图片文件，供后台资源清理服务处理。
+    /// 刷新图片使用时间和可用文件路径，保留图片 ID 与描述。
+    pub fn touch_image(&self, image_id: &str, local_path: &str) -> Result<bool> {
+        let changed = self.conn_pool.get()?.execute(
+            "UPDATE received_images SET local_path = ?2, last_used_at = ?3 WHERE image_id = ?1",
+            params![image_id, local_path, Utc::now().timestamp()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// 查询最近使用时间早于截止时间的接收图片。
     pub fn get_received_images_created_before(
         &self,
         cutoff_timestamp: i64,
@@ -1766,8 +1841,8 @@ impl QQChatContextManager {
             "
             SELECT image_id, content_hash, local_path, description
             FROM received_images
-            WHERE created_at < ?1
-            ORDER BY created_at ASC, id ASC
+            WHERE source = 'received' AND last_used_at < ?1
+            ORDER BY last_used_at ASC, id ASC
             ",
         )?;
         let images = statement
@@ -1783,18 +1858,28 @@ impl QQChatContextManager {
         Ok(images)
     }
 
-    /// 文件清理完成后条件删除图片索引，防止误删截止时间之后创建的记录。
-    pub fn delete_received_image_created_before(
+    /// 在写事务内复核使用时间并删除文件，避免清理已重新使用的图片。
+    pub fn delete_expired_received_image(
         &self,
         image_id: &str,
         cutoff_timestamp: i64,
+        remove_file: impl FnOnce(&str) -> Result<()>,
     ) -> Result<bool> {
-        let connection = self.conn_pool.get()?;
-        let changed = connection.execute(
-            "DELETE FROM received_images WHERE image_id = ?1 AND created_at < ?2",
+        let mut connection = self.conn_pool.get()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let path: Option<String> = tx.query_row(
+            "SELECT local_path FROM received_images WHERE image_id = ?1 AND source = 'received' AND last_used_at < ?2",
             params![image_id, cutoff_timestamp],
+            |row| row.get(0),
+        ).optional()?;
+        let Some(path) = path else { return Ok(false); };
+        remove_file(&path)?;
+        tx.execute(
+            "DELETE FROM received_images WHERE image_id = ?1",
+            params![image_id],
         )?;
-        Ok(changed > 0)
+        tx.commit()?;
+        Ok(true)
     }
 
     /// 创建或更新一条会话目录记录，并返回数据库主键。
@@ -1880,6 +1965,60 @@ mod tests {
         NewChatMessage, NewConversationDailySummary, NewReceivedImage, QQChatContextManager,
     };
     use rand::Rng;
+
+    #[test]
+    fn image_schema_migration_preserves_sources_paths_and_descriptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE received_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, image_id TEXT NOT NULL UNIQUE,
+                content_hash TEXT NOT NULL UNIQUE, local_path TEXT NOT NULL, original_url TEXT,
+                mime_type TEXT, file_size INTEGER NOT NULL, description TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+            );
+            INSERT INTO received_images VALUES
+                (1, 'img_received', 'samehash', 'data/received_images/a.png', NULL, 'image/png', 1, '好友图片', '{}', 1, 2),
+                (2, 'img_local', 'local:samehash', 'data/images/b.png', NULL, 'image/png', 1, '生成图片', '{}', 1, 3);",
+        ).unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+            let received = manager.get_received_image_by_hash(super::ImageSource::Received, "samehash").unwrap().unwrap();
+            let local = manager.get_received_image_by_hash(super::ImageSource::Local, "samehash").unwrap().unwrap();
+            assert_eq!(received.image_id, "img_received");
+            assert_eq!(local.image_id, "img_local");
+            assert_eq!(received.local_path, "data/received_images/a.png");
+            assert_eq!(local.local_path, "data/images/b.png");
+            assert_eq!(received.description, "好友图片");
+            assert_eq!(local.description, "生成图片");
+            let conn = manager.conn_pool.get().unwrap();
+            assert_eq!(conn.query_row("SELECT last_used_at FROM received_images WHERE image_id = 'img_local'", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+        }
+    }
+
+    #[test]
+    fn image_recent_use_prevents_candidate_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = QQChatContextManager::new(dir.path().join("test.db").to_str().unwrap()).unwrap();
+        manager.insert_received_image(&NewReceivedImage {
+            source: super::ImageSource::Received, image_id: "img_recent".into(),
+            content_hash: "hash".into(), local_path: "data/received_images/recent.png".into(),
+            original_url: None, mime_type: Some("image/png".into()), file_size: 1,
+            description: String::new(), metadata_json: "{}".into(),
+        }).unwrap();
+        manager.conn_pool.get().unwrap().execute(
+            "UPDATE received_images SET created_at = 1, last_used_at = 1", [],
+        ).unwrap();
+        let cutoff = chrono::Utc::now().timestamp() - 60;
+        assert_eq!(manager.get_received_images_created_before(cutoff).unwrap().len(), 1);
+        manager.touch_image("img_recent", "data/received_images/recent.png").unwrap();
+        assert!(manager.get_received_images_created_before(cutoff).unwrap().is_empty());
+        assert!(!manager.delete_expired_received_image("img_recent", cutoff, |_| {
+            panic!("recently used image must not be deleted")
+        }).unwrap());
+    }
 
     // 验证旧表改名后保留记录与到期状态，且再次启动不会重复迁移。
     #[test]
@@ -2064,6 +2203,7 @@ mod tests {
         let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
         manager
             .insert_received_image(&NewReceivedImage {
+                source: super::ImageSource::Received,
                 image_id: "img_A1b2C3d4".to_string(),
                 content_hash: "hash".to_string(),
                 local_path: "image.jpg".to_string(),
@@ -2076,7 +2216,7 @@ mod tests {
             .unwrap();
         let mut message = test_message(
             "message-image",
-            "看看 ![图片](attachment://img_A1b2C3d4)",
+            "看看 ![图片](/data/received_images/img_A1b2C3d4.jpg)",
             1,
         );
         message.message_type = "image".to_string();
@@ -2093,7 +2233,8 @@ mod tests {
             .complete_received_image_description(
                 "img_A1b2C3d4",
                 "一张测试图片",
-                "![一张测试图片](attachment://img_A1b2C3d4)",
+                "![图片](/data/received_images/img_A1b2C3d4.jpg)",
+                "![一张测试图片](/data/received_images/img_A1b2C3d4.jpg)",
             )
             .unwrap();
 
@@ -2108,7 +2249,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             history[0].content_text.as_deref(),
-            Some("看看 ![一张测试图片](attachment://img_A1b2C3d4)")
+            Some("看看 ![一张测试图片](/data/received_images/img_A1b2C3d4.jpg)")
         );
         let parts: serde_json::Value =
             serde_json::from_str(&history[0].content_parts_json).unwrap();

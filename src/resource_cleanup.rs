@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tokio::fs;
+use std::fs;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
+use crate::message_enricher::RECEIVED_IMAGE_DIRECTORY;
 use crate::repository::db_manager::QQChatContextManager;
 
 const RESOURCE_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -18,7 +19,7 @@ const RESOURCE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// 定期清理过期本地资源；后续其它资源类型继续在该服务中追加清理步骤。
 pub struct ResourceCleanupService {
     db_manager: Arc<QQChatContextManager>,
-    received_image_dir: PathBuf,
+    image_root: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -29,13 +30,17 @@ struct CleanupStats {
 }
 
 impl ResourceCleanupService {
-    pub fn new(
+    pub fn new(db_manager: Arc<QQChatContextManager>) -> Self {
+        Self::with_image_root(db_manager, RECEIVED_IMAGE_DIRECTORY)
+    }
+
+    fn with_image_root(
         db_manager: Arc<QQChatContextManager>,
-        received_image_dir: impl Into<PathBuf>,
+        image_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             db_manager,
-            received_image_dir: received_image_dir.into(),
+            image_root: image_root.into(),
         }
     }
 
@@ -75,29 +80,17 @@ impl ResourceCleanupService {
         };
 
         for image in images {
-            if let Err(error) = self.remove_managed_file(&image.local_path).await {
-                stats.failed += 1;
-                warn!(
-                    image_id = %image.image_id,
-                    path = %image.local_path,
-                    error = %format!("{error:#}"),
-                    "删除过期图片文件失败，保留数据库记录"
-                );
-                continue;
-            }
-
             match self
                 .db_manager
-                .delete_received_image_created_before(&image.image_id, cutoff_timestamp)
+                .delete_expired_received_image(&image.image_id, cutoff_timestamp, |path| self.remove_managed_file(path))
             {
                 Ok(true) => stats.deleted += 1,
                 Ok(false) => {
-                    debug!(image_id = %image.image_id, "过期图片记录已被其它流程删除");
-                    stats.deleted += 1;
+                    debug!(image_id = %image.image_id, "图片已重新使用或已删除，跳过清理");
                 }
                 Err(error) => {
                     stats.failed += 1;
-                    error!(image_id = %image.image_id, error = %format!("{error:#}"), "删除过期图片数据库记录失败");
+                    error!(image_id = %image.image_id, error = %format!("{error:#}"), "清理过期图片失败");
                 }
             }
         }
@@ -106,23 +99,17 @@ impl ResourceCleanupService {
     }
 
     /// 只允许删除配置资源目录中的普通文件；文件已经不存在时也视为清理成功。
-    async fn remove_managed_file(&self, path: impl AsRef<Path>) -> Result<()> {
+    fn remove_managed_file(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let canonical_path = match fs::canonicalize(path).await {
+        let canonical_path = match fs::canonicalize(path) {
             Ok(path) => path,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 return Err(error).with_context(|| format!("读取资源路径失败: {}", path.display()))
             }
         };
-        let canonical_root = fs::canonicalize(&self.received_image_dir)
-            .await
-            .with_context(|| {
-                format!(
-                    "读取图片资源目录失败: {}",
-                    self.received_image_dir.display()
-                )
-            })?;
+        let canonical_root = fs::canonicalize(&self.image_root)
+            .with_context(|| format!("读取图片资源目录失败: {}", self.image_root.display()))?;
         if !canonical_path.starts_with(&canonical_root) {
             anyhow::bail!(
                 "拒绝删除图片资源目录之外的文件: {}",
@@ -131,7 +118,6 @@ impl ResourceCleanupService {
         }
 
         fs::remove_file(&canonical_path)
-            .await
             .with_context(|| format!("删除资源文件失败: {}", canonical_path.display()))?;
         Ok(())
     }
@@ -164,6 +150,7 @@ mod tests {
         let db_manager = Arc::new(QQChatContextManager::new(db_path.to_str().unwrap()).unwrap());
         db_manager
             .insert_received_image(&NewReceivedImage {
+                source: crate::repository::db_manager::ImageSource::Received,
                 image_id: "img_test".to_string(),
                 content_hash: "hash_test".to_string(),
                 local_path: image_path.to_string_lossy().to_string(),
@@ -175,7 +162,20 @@ mod tests {
             })
             .unwrap();
 
-        let service = ResourceCleanupService::new(db_manager.clone(), &image_dir);
+        let service = ResourceCleanupService::with_image_root(db_manager.clone(), &image_dir);
+        let local_path = root.join("generated.png");
+        fs::write(&local_path, b"local image").await.unwrap();
+        db_manager.insert_received_image(&NewReceivedImage {
+            source: crate::repository::db_manager::ImageSource::Local,
+            image_id: "img_local".into(),
+            content_hash: "hash_test".into(),
+            local_path: local_path.to_string_lossy().to_string(),
+            original_url: None,
+            mime_type: Some("image/png".into()),
+            file_size: 11,
+            description: String::new(),
+            metadata_json: "{}".into(),
+        }).unwrap();
         let stats = service
             .cleanup_expired_images(Utc::now().timestamp() + 1)
             .await
@@ -184,6 +184,8 @@ mod tests {
         assert_eq!(stats.scanned, 1);
         assert_eq!(stats.deleted, 1);
         assert_eq!(stats.failed, 0);
+        assert!(local_path.exists());
+        assert!(db_manager.get_received_image_by_id("img_local").unwrap().is_some());
         assert!(!image_path.exists());
         assert!(db_manager
             .get_received_image_by_id("img_test")

@@ -12,27 +12,57 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::ai_provider::run_ai_request_with_timeout;
 use crate::config::AppConfig;
 use crate::repository::db_manager::{
-    NewReceivedImage, QQChatContextManager, ReceivedImageRecord, ReferencedMessage,
+    ImageSource, NewReceivedImage, QQChatContextManager, ReceivedImageRecord, ReferencedMessage,
 };
 use crate::transport::message::{preferred_sender_name, IncomingMessage};
 
 const IMAGE_READ_FAILED_TEXT: &str = "[图片消息 读取失败]";
 const REPLY_MESSAGE_PLACEHOLDER: &str = "[回复消息]";
 const REPLY_PREVIEW_MAX_CHARS: usize = 16;
+pub(crate) const RECEIVED_IMAGE_DIRECTORY: &str = "data/received_images";
+pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BATCH_BYTES: usize = 40 * 1024 * 1024;
+
+pub(crate) fn image_relative_path(path: &str) -> Result<PathBuf> {
+    let suffix = path.strip_prefix("/data/images/")
+        .ok_or_else(|| anyhow::anyhow!("图片路径必须以 /data/images/ 开头"))?;
+    if suffix.contains(['\\', ':', '\0'])
+        || suffix.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        anyhow::bail!("图片路径必须使用正斜杠，且不能包含路径跳转");
+    }
+    Ok(Path::new("data/images").join(suffix))
+}
+
+pub(crate) async fn read_image_bytes(path: &Path) -> Result<Vec<u8>> {
+    let file = fs::File::open(path).await?;
+    if file.metadata().await?.len() > MAX_IMAGE_BYTES as u64 {
+        anyhow::bail!("单张图片不能超过 20 MiB");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_IMAGE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        anyhow::bail!("单张图片不能超过 20 MiB");
+    }
+    Ok(bytes)
+}
 /// 模型请求图片只按像素缩小，最长边不超过 1920px。
 const VISION_IMAGE_MAX_SIDE: u32 = 1920;
 /// 图片发生缩放时使用固定 JPEG 质量，不再按体积逐级降质。
 const VISION_IMAGE_JPEG_QUALITY: u8 = 82;
 
 /// 消息增强器：先处理图片等富内容，再让消息进入聊天流程。
+#[derive(Clone)]
 pub struct MessageEnricher {
-    app_config: Arc<AppConfig>,
     db_manager: Arc<QQChatContextManager>,
     http_client: Client,
     description_tx: Option<mpsc::UnboundedSender<String>>,
@@ -50,7 +80,7 @@ struct DownloadedImage {
     original_url: String,
 }
 
-struct EnrichedImage {
+pub(crate) struct EnrichedImage {
     image_id: String,
     content_hash: String,
     local_path: String,
@@ -68,7 +98,6 @@ impl MessageEnricher {
     pub fn new(app_config: Arc<AppConfig>, db_manager: Arc<QQChatContextManager>) -> Self {
         let description_tx = Self::start_description_worker(&app_config, &db_manager);
         Self {
-            app_config,
             db_manager,
             http_client: Client::new(),
             description_tx,
@@ -257,10 +286,14 @@ impl MessageEnricher {
 
     /// 聊天消息成功入库后再投递描述任务，保证后台结果一定能回写到正文记录。
     pub fn schedule_pending_descriptions(&self, enriched: &EnrichedIncomingMessage) {
+        self.schedule_image_descriptions(&enriched.pending_image_descriptions);
+    }
+
+    pub(crate) fn schedule_image_descriptions(&self, image_ids: &[String]) {
         let Some(description_tx) = &self.description_tx else {
             return;
         };
-        for image_id in &enriched.pending_image_descriptions {
+        for image_id in image_ids {
             if description_tx.send(image_id.clone()).is_err() {
                 error!(image_id, "图片描述后台队列已关闭");
             }
@@ -312,7 +345,7 @@ impl MessageEnricher {
             .get_received_image_by_id(image_id)?
             .with_context(|| format!("找不到待描述图片 ID: {}", image_id))?;
         let description = if image.description.trim().is_empty() {
-            let bytes = fs::read(&image.local_path)
+            let bytes = read_image_bytes(Path::new(&image.local_path))
                 .await
                 .with_context(|| format!("读取待描述图片失败: {}", image.local_path))?;
             Self::describe_image(
@@ -325,10 +358,12 @@ impl MessageEnricher {
             image.description
         };
 
-        let described_text = EnrichedImage::context_text_for(image_id, &description);
+        let placeholder_text = EnrichedImage::context_text_for(&image.local_path, "");
+        let described_text = EnrichedImage::context_text_for(&image.local_path, &description);
         let updated_messages = db_manager.complete_received_image_description(
             image_id,
             &description,
+            &placeholder_text,
             &described_text,
         )?;
         info!(image_id, updated_messages, "后台图片描述已写回数据库");
@@ -352,31 +387,58 @@ impl MessageEnricher {
             mime_type = downloaded_image.mime_type.as_deref().unwrap_or("未知"),
             "图片下载完成"
         );
-        let content_hash = Self::sha256_hex(&downloaded_image.bytes);
-        if let Some(record) = self.db_manager.get_received_image_by_hash(&content_hash)? {
-            info!(image_id = %record.image_id, "图片已存在，复用本地记录");
-            let mut image = EnrichedImage::from(record);
-            image.needs_description = self.description_tx.is_some() && image.description.is_empty();
-            return Ok(Some(image));
+        self.register_image(
+            &downloaded_image.bytes,
+            downloaded_image.mime_type.as_deref(),
+            Some(&downloaded_image.original_url),
+            None,
+            image_data,
+        ).await.map(Some)
+    }
+
+    /// 登记已读取的本地图片原路径，不复制文件，与接收图片独立去重。
+    pub(crate) async fn register_local_image(&self, path: &str, bytes: &[u8]) -> Result<EnrichedImage> {
+        let local_path = image_relative_path(path)?.to_string_lossy().replace('\\', "/");
+        self.register_image(
+            bytes, Self::detect_image_mime_type(bytes), None, Some(&local_path), &json!({ "file": path }),
+        ).await
+    }
+
+    async fn register_image(
+        &self,
+        bytes: &[u8],
+        mime_type: Option<&str>,
+        original_url: Option<&str>,
+        existing_path: Option<&str>,
+        image_data: &Value,
+    ) -> Result<EnrichedImage> {
+        let content_hash = Self::sha256_hex(bytes);
+        let source = if existing_path.is_some() {
+            ImageSource::Local
+        } else {
+            ImageSource::Received
+        };
+        if let Some(record) = self.db_manager.get_received_image_by_hash(source, &content_hash)? {
+            if let Some(image) = self.reuse_image(record, existing_path, bytes, mime_type).await? {
+                return Ok(image);
+            }
         }
 
         let image_id = self.generate_image_id()?;
         info!(image_id = %image_id, "图片处理成功");
-        let local_path = self
-            .save_image_file(
-                &image_id,
-                downloaded_image.mime_type.as_deref(),
-                &downloaded_image.bytes,
-            )
-            .await?;
+        let local_path = match existing_path {
+            Some(path) => path.to_string(),
+            None => self.save_image_file(&image_id, mime_type, bytes).await?,
+        };
 
         let image = NewReceivedImage {
+            source,
             image_id: image_id.clone(),
             content_hash: content_hash.clone(),
             local_path: local_path.clone(),
-            original_url: Some(downloaded_image.original_url),
-            mime_type: downloaded_image.mime_type,
-            file_size: downloaded_image.bytes.len() as i64,
+            original_url: original_url.map(str::to_string),
+            mime_type: mime_type.map(str::to_string),
+            file_size: bytes.len() as i64,
             description: String::new(),
             metadata_json: json!({
                 "source_part_data": image_data
@@ -384,35 +446,65 @@ impl MessageEnricher {
             .to_string(),
         };
         if let Err(err) = self.db_manager.insert_received_image(&image) {
-            if let Err(remove_err) = fs::remove_file(&local_path).await {
-                warn!(path = %local_path, error = %format!("{remove_err:#}"), "清理未入库图片文件失败");
+            if existing_path.is_none() {
+                if let Err(remove_err) = fs::remove_file(&local_path).await {
+                    warn!(path = %local_path, error = %format!("{remove_err:#}"), "清理未入库图片文件失败");
+                }
             }
             // 其它会话可能刚好先写入了同一图片，冲突后直接复用其稳定图片 ID。
-            if let Some(record) = self.db_manager.get_received_image_by_hash(&content_hash)? {
-                let mut image = EnrichedImage::from(record);
-                image.needs_description =
-                    self.description_tx.is_some() && image.description.is_empty();
-                return Ok(Some(image));
+            if let Some(record) = self.db_manager.get_received_image_by_hash(source, &content_hash)? {
+                if let Some(image) = self.reuse_image(record, existing_path, bytes, mime_type).await? {
+                    return Ok(image);
+                }
             }
             return Err(err);
         }
         info!(image_id = %image_id, "图片已入库");
         debug!(image_id = %image_id, path = %local_path, "图片本地文件");
 
-        Ok(Some(EnrichedImage {
+        Ok(EnrichedImage {
             image_id,
             content_hash,
             local_path,
             description: String::new(),
             needs_description: self.description_tx.is_some(),
-        }))
+        })
+    }
+
+    async fn reuse_image(
+        &self,
+        record: ReceivedImageRecord,
+        existing_path: Option<&str>,
+        bytes: &[u8],
+        mime_type: Option<&str>,
+    ) -> Result<Option<EnrichedImage>> {
+        if !self.db_manager.touch_image(&record.image_id, &record.local_path)? {
+            return Ok(None);
+        }
+        let mut image = EnrichedImage::from(record);
+        if !fs::metadata(&image.local_path).await.is_ok_and(|metadata| metadata.is_file()) {
+            image.local_path = match existing_path {
+                Some(path) => path.to_string(),
+                None => self.save_image_file(&image.image_id, mime_type, bytes).await?,
+            };
+            self.db_manager.touch_image(&image.image_id, &image.local_path)?;
+            self.db_manager.complete_received_image_description(
+                &image.image_id,
+                &image.description,
+                &EnrichedImage::context_text_for(&image.local_path, ""),
+                &image.context_text(),
+            )?;
+        }
+        image.needs_description = self.description_tx.is_some() && image.description.is_empty();
+        Ok(Some(image))
     }
 
     /// 下载图片原始内容，用内容哈希做去重依据。
     async fn download_image(&self, image_url: &str) -> Result<DownloadedImage> {
-        let resp = self
+        let mut resp = self
             .http_client
             .get(image_url)
+            .timeout(std::time::Duration::from_secs(20))
             .send()
             .await
             .with_context(|| format!("下载图片失败: {}", image_url))?;
@@ -429,7 +521,16 @@ impl MessageEnricher {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
-        let bytes = resp.bytes().await?.to_vec();
+        if resp.content_length().is_some_and(|size| size > MAX_IMAGE_BYTES as u64) {
+            anyhow::bail!("单张图片不能超过 20 MiB");
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if bytes.len() + chunk.len() > MAX_IMAGE_BYTES {
+                anyhow::bail!("单张图片不能超过 20 MiB");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         if bytes.is_empty() {
             anyhow::bail!("下载到空图片: {}", image_url);
         }
@@ -451,7 +552,7 @@ impl MessageEnricher {
         mime_type: Option<&str>,
         bytes: &[u8],
     ) -> Result<String> {
-        let image_dir = PathBuf::from(&self.app_config.app.received_image_dir);
+        let image_dir = PathBuf::from(RECEIVED_IMAGE_DIRECTORY);
         fs::create_dir_all(&image_dir).await?;
 
         let extension = Self::image_extension(mime_type);
@@ -729,11 +830,21 @@ impl MessageEnricher {
 }
 
 impl EnrichedImage {
-    fn context_text(&self) -> String {
-        Self::context_text_for(&self.image_id, &self.description)
+    pub(crate) fn context_text(&self) -> String {
+        Self::context_text_for(&self.local_path, &self.description)
     }
 
-    fn context_text_for(image_id: &str, description: &str) -> String {
+    pub(crate) fn content_part(&self) -> Value {
+        let mut data = json!({});
+        MessageEnricher::attach_image_info(&mut data, self, &self.context_text());
+        json!({ "kind": "image", "data": data })
+    }
+
+    pub(crate) fn pending_description_id(&self) -> Option<String> {
+        self.needs_description.then(|| self.image_id.clone())
+    }
+
+    fn context_text_for(local_path: &str, description: &str) -> String {
         let alt_text = if description.trim().is_empty() {
             "图片"
         } else {
@@ -743,7 +854,9 @@ impl EnrichedImage {
             .replace('\\', "\\\\")
             .replace('[', "\\[")
             .replace(']', "\\]");
-        format!("![{}](attachment://{})", alt_text, image_id)
+        let markdown_path = local_path.replace('\\', "/");
+        let markdown_path = format!("/{}", markdown_path.trim_start_matches('/'));
+        format!("![{}]({})", alt_text, markdown_path)
     }
 }
 
@@ -765,6 +878,73 @@ mod tests {
     use crate::repository::db_manager::{NewChatMessage, QQChatContextManager};
     use image::{DynamicImage, GenericImageView, RgbImage};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn image_read_rejects_oversized_files_without_loading_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.png");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(super::MAX_IMAGE_BYTES as u64 + 1).unwrap();
+        assert!(super::read_image_bytes(&path).await.unwrap_err().to_string().contains("20 MiB"));
+    }
+
+    #[tokio::test]
+    async fn sent_image_keeps_own_path_and_description_updates_bot_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = std::sync::Arc::new(
+            QQChatContextManager::new(dir.path().join("test.db").to_str().unwrap()).unwrap(),
+        );
+        let bytes = b"existing image bytes";
+        manager.insert_received_image(&crate::repository::db_manager::NewReceivedImage {
+            source: crate::repository::db_manager::ImageSource::Received,
+            image_id: "img_test".into(),
+            content_hash: MessageEnricher::sha256_hex(bytes),
+            local_path: "data/received_images/img_test.png".into(),
+            original_url: None,
+            mime_type: Some("image/png".into()),
+            file_size: bytes.len() as i64,
+            description: String::new(),
+            metadata_json: "{}".into(),
+        }).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let enricher = MessageEnricher {
+            db_manager: manager.clone(), http_client: reqwest::Client::new(), description_tx: Some(tx),
+        };
+        let image = enricher.register_local_image("/data/images/output.png", bytes).await.unwrap();
+        assert_ne!(image.image_id, "img_test");
+        assert_eq!(image.local_path, "data/images/output.png");
+        assert_eq!(image.content_part()["data"]["local_path"], "data/images/output.png");
+        let text = image.context_text();
+        assert_eq!(text, "![图片](/data/images/output.png)");
+        manager.write_message(&NewChatMessage {
+            source: "onebot".into(), source_conversation_id: "group".into(),
+            conversation_kind: "group".into(), conversation_title: None,
+            conversation_metadata_json: "{}".into(), source_message_id: Some("sent".into()),
+            sender_id: "bot".into(), sender_display_name: "bot".into(),
+            sender_nickname: None, sender_role: None, content_text: text.clone(),
+            message_type: "image".into(), content_parts_json: json!([image.content_part()]).to_string(),
+            metadata_json: "{}".into(), event_timestamp: 1,
+        }).unwrap();
+        assert!(rx.try_recv().is_err());
+        enricher.schedule_image_descriptions(&[image.pending_description_id().unwrap()]);
+        assert_eq!(rx.try_recv().unwrap(), image.image_id);
+        let described = super::EnrichedImage::context_text_for(&image.local_path, "一只猫");
+        assert_eq!(manager.complete_received_image_description(&image.image_id, "一只猫", &text, &described).unwrap(), 1);
+        let received = manager.get_received_image_by_id("img_test").unwrap().unwrap();
+        assert!(received.description.is_empty());
+        assert_eq!(received.local_path, "data/received_images/img_test.png");
+        let history = manager.get_conversation_history("onebot", "group", 10).unwrap();
+        assert_eq!(history[0].sender_id, "bot");
+        assert_eq!(history[0].content_text.as_deref(), Some(described.as_str()));
+        let reused = enricher.register_local_image("/data/images/another.png", bytes).await.unwrap();
+        assert_eq!(reused.image_id, image.image_id);
+        assert_eq!(reused.context_text(), described.replace("output.png", "another.png"));
+        let repaired = manager.get_conversation_history("onebot", "group", 10).unwrap();
+        assert_eq!(repaired[0].content_text.as_deref(), Some(reused.context_text().as_str()));
+        let parts: serde_json::Value = serde_json::from_str(&repaired[0].content_parts_json).unwrap();
+        assert_eq!(parts[0]["data"]["local_path"], "data/images/another.png");
+        assert!(reused.pending_description_id().is_none());
+    }
 
     // 验证回复消息会从数据库补全原文上下文。
     #[test]

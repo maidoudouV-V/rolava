@@ -2,9 +2,8 @@ use crate::ai_provider::{
     run_ai_request_with_timeout, ToolChatMessage, ToolChatResponse, ToolChatUserContent,
 };
 use chrono::{DateTime, Local, Utc};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::fs;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
@@ -14,7 +13,7 @@ use crate::conversation_control::ConversationControl;
 use crate::conversation_trigger::{ConversationTrigger, ConversationTriggerSender};
 use crate::history_compression::render_summary_date_heading;
 use crate::memory::{GroupMemorySession, UserMemorySession};
-use crate::message_enricher::MessageEnricher;
+use crate::message_enricher::{read_image_bytes, MessageEnricher};
 use crate::repository::db_manager::{ChatMessage, ConversationDailySummary};
 use crate::tools::{
     ConversationEffect, ConversationToolContext, ToolContext, ToolDefinition, ToolRegistry,
@@ -648,6 +647,7 @@ impl ChatProcessor {
         let mut previous_message_id = None;
         let mut pending_block_boundary = false;
         let active_tool_histories = self.runtime_context.active_tool_histories().to_vec();
+        let mut image_cache = HashMap::new();
         for history in active_tool_histories
             .iter()
             .filter(|history| history.after_message_id.is_none())
@@ -675,7 +675,8 @@ impl ChatProcessor {
                 let image_data_urls = if db_msg.sender_id != self.message_target.bot_id
                     && vision_message_ids.contains(&db_msg.id)
                 {
-                    self.load_message_image_data_urls(db_msg).await
+                    self.load_message_image_data_urls(db_msg, &mut image_cache)
+                        .await
                 } else {
                     Vec::new()
                 };
@@ -804,7 +805,11 @@ impl ChatProcessor {
     }
 
     /// 从消息富文本片段读取图片，并生成本轮请求使用的临时 data URL。
-    async fn load_message_image_data_urls(&self, db_msg: &ChatMessage) -> Vec<String> {
+    async fn load_message_image_data_urls(
+        &self,
+        db_msg: &ChatMessage,
+        cache: &mut HashMap<String, Option<String>>,
+    ) -> Vec<String> {
         let parts = match serde_json::from_str::<serde_json::Value>(&db_msg.content_parts_json) {
             Ok(serde_json::Value::Array(parts)) => parts,
             Ok(_) => {
@@ -834,12 +839,19 @@ impl ChatProcessor {
                 continue;
             };
 
+            if let Some(cached) = cache.get(local_path) {
+                if let Some(data_url) = cached {
+                    data_urls.push(data_url.clone());
+                }
+                continue;
+            }
             let result = async {
-                let bytes = fs::read(local_path).await?;
+                let bytes = read_image_bytes(std::path::Path::new(local_path)).await?;
                 let mime_type = MessageEnricher::mime_type_from_path(local_path);
                 MessageEnricher::prepare_vision_image_data_url(&bytes, Some(mime_type))
             }
             .await;
+            cache.insert(local_path.to_string(), result.as_ref().ok().cloned());
             match result {
                 Ok(data_url) => data_urls.push(data_url),
                 Err(error) => warn!(

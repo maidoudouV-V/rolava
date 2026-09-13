@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -8,11 +8,14 @@ use serde_json::{json, Value};
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 use crate::transport::{QqExpression, QqImage, SendOptions};
+use crate::message_enricher::{image_relative_path, read_image_bytes, MAX_IMAGE_BYTES, MAX_IMAGE_BATCH_BYTES};
 
 const DESCRIPTION: &str = r#"向当前聊天窗口发送一个表情或一张、多张图片，按 type 选择：
 - face：通过 face_name 指定准确的 QQ 表情名称，可用经典表情（如撇嘴、大哭、尴尬）或群友之前发送的表情名称。
 - dice / rps：随机掷骰子 / 包剪锤，无需 face_name。
-- image：通过 image_paths 数组指定图片，不接受 face_name；表情类型不接受 image_paths。
+- image：通过 image_paths 数组指定图片。
+
+仅使用当前 type 对应的参数，忽略其他已定义参数。
 
 image_paths 必须原样使用系统提供的 /data/images/ 下的绝对路径，如 /data/images/example.png，不得使用 URL 或编造路径。
 常用 face_name：流泪、打call、变形、仔细分析、菜汪、崇拜、比心、庆祝、惊吓、花朵脸、打招呼、大怨种、贴贴、蛋糕、鞭炮、烟花、求放过、偷感、给你一拳、散味儿、热化了、比爱心。"#;
@@ -34,9 +37,6 @@ impl SendQqSpecialMessageTool {
         arguments: SendQqSpecialMessageArgs,
         face_id_map: &HashMap<String, String>,
     ) -> Result<QqExpression> {
-        if arguments.image_paths.is_some() {
-            anyhow::bail!("表情类型不接受 image_paths");
-        }
         match arguments.message_type.as_str() {
             "face" => {
                 let face_name = arguments
@@ -54,26 +54,10 @@ impl SendQqSpecialMessageTool {
                     name: face_name.to_string(),
                 })
             }
-            "dice" => {
-                Self::reject_face_name(&arguments.face_name, "dice")?;
-                Ok(QqExpression::Dice)
-            }
-            "rps" => {
-                Self::reject_face_name(&arguments.face_name, "rps")?;
-                Ok(QqExpression::Rps)
-            }
+            "dice" => Ok(QqExpression::Dice),
+            "rps" => Ok(QqExpression::Rps),
             expression => anyhow::bail!("不支持的 QQ 表情类型：{}", expression),
         }
-    }
-
-    fn reject_face_name(face_name: &Option<String>, expression: &str) -> Result<()> {
-        if face_name
-            .as_deref()
-            .is_some_and(|name| !name.trim().is_empty())
-        {
-            anyhow::bail!("{} 不接受 face_name", expression);
-        }
-        Ok(())
     }
 }
 
@@ -104,7 +88,7 @@ impl Tool for SendQqSpecialMessageTool {
                     "type": "array",
                     "minItems": 1,
                     "items": { "type": "string", "minLength": 1 },
-                    "description": "type 为 image 时必填；系统提供的图片绝对路径数组，例如 /data/images/example.png，不接受 URL"
+                    "description": "type 为 image 时必填；系统提供的图片绝对路径数组，例如 /data/images/example.png，不接受 URL；单张不超过 20 MiB，合计不超过 40 MiB"
                 }
             },
             "required": ["type"],
@@ -115,9 +99,6 @@ impl Tool for SendQqSpecialMessageTool {
     async fn execute(&self, context: &ToolContext, arguments: &str) -> Result<ToolOutput> {
         let arguments: SendQqSpecialMessageArgs = parse_arguments(self.name(), arguments)?;
         if arguments.message_type == "image" {
-            if arguments.face_name.is_some() {
-                anyhow::bail!("image 不接受 face_name");
-            }
             let paths = arguments
                 .image_paths
                 .filter(|paths| !paths.is_empty())
@@ -147,20 +128,6 @@ impl Tool for SendQqSpecialMessageTool {
     }
 }
 
-fn image_relative_path(path: &str) -> Result<PathBuf> {
-    let suffix = path
-        .strip_prefix("/data/images/")
-        .ok_or_else(|| anyhow::anyhow!("图片路径必须以 /data/images/ 开头"))?;
-    if suffix.contains(['\\', ':', '\0'])
-        || suffix
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        anyhow::bail!("图片路径必须使用正斜杠，且不能包含路径跳转");
-    }
-    Ok(Path::new("data/images").join(suffix))
-}
-
 async fn load_images(project_root: &Path, paths: &[String]) -> Result<Vec<QqImage>> {
     let relative_paths = paths
         .iter()
@@ -176,6 +143,7 @@ async fn load_images(project_root: &Path, paths: &[String]) -> Result<Vec<QqImag
         anyhow::bail!("图片目录不能指向项目外部");
     }
     let mut images = Vec::with_capacity(paths.len());
+    let mut total_bytes = 0usize;
     for (path, relative_path) in paths.iter().zip(relative_paths) {
         let resolved = tokio::fs::canonicalize(project_root.join(relative_path))
             .await
@@ -189,9 +157,19 @@ async fn load_images(project_root: &Path, paths: &[String]) -> Result<Vec<QqImag
         if !metadata.is_file() {
             anyhow::bail!("图片路径必须指向文件：{}", path);
         }
-        let bytes = tokio::fs::read(&resolved)
+        if metadata.len() > MAX_IMAGE_BYTES as u64 {
+            anyhow::bail!("单张图片不能超过 20 MiB：{}", path);
+        }
+        if metadata.len() > (MAX_IMAGE_BATCH_BYTES - total_bytes) as u64 {
+            anyhow::bail!("单次发送图片合计不能超过 40 MiB");
+        }
+        let bytes = read_image_bytes(&resolved)
             .await
-            .map_err(|_| anyhow::anyhow!("读取图片失败：{}", path))?;
+            .map_err(|error| anyhow::anyhow!("读取图片失败：{}（{}）", path, error))?;
+        total_bytes += bytes.len();
+        if total_bytes > MAX_IMAGE_BATCH_BYTES {
+            anyhow::bail!("单次发送图片合计不能超过 40 MiB");
+        }
         if image::guess_format(&bytes).is_err() {
             anyhow::bail!("文件不是可识别的图片：{}", path);
         }

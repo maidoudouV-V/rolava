@@ -366,6 +366,7 @@ fn apply_app(document: &mut DocumentMut, app: &AdminAppConfig) {
         table.remove("startup_history_message_count");
         table.remove("split_reply_on_newlines");
         table.remove("enable_ai_filter");
+        table.remove("received_image_dir");
     });
 }
 

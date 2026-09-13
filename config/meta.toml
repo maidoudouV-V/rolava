@@ -15,7 +15,6 @@ vision_image_message_window = 10
 proactive_reply_percent = 0.0
 ai_request_retry_count = 1
 ai_request_timeout_seconds = 0
-received_image_dir = "received_images"
 enabled_actions = []
 enabled_skills = []
 direct_whitelist = []

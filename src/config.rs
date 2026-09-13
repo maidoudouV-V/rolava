@@ -108,8 +108,6 @@ pub struct AppSection {
     /// AI 单次请求总超时时间，单位秒；0 表示不设置超时。
     #[serde(default = "default_ai_request_timeout_seconds")]
     pub ai_request_timeout_seconds: u64,
-    /// 接收到的图片本地保存目录。
-    pub received_image_dir: String,
     /// 启用的可选模块列表；定时任务等固定能力不需要写入。
     pub enabled_actions: Vec<String>,
     /// 私聊白名单 QQ 号，空数组表示放行所有私聊。

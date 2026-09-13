@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::message_enricher::MessageEnricher;
 use crate::conversation_trigger::{ConversationTrigger, RoutedConversationTrigger};
 use crate::repository::db_manager::{NewChatMessage, QQChatContextManager};
 use crate::runtime_state::{RuntimeGroupInfo, RuntimeState};
@@ -964,6 +965,7 @@ struct OneBotUserInfoDto {
 
 /// OneBot 出站消息发送器。平台确认发送成功后，负责写入统一聊天记录。
 pub struct OneBotMessageSender {
+    image_enricher: MessageEnricher,
     client: Client,
     onebot_api_url: String,
     onebot_token: Option<String>,
@@ -978,8 +980,10 @@ impl OneBotMessageSender {
         config: &AppConfig,
         db_manager: Arc<QQChatContextManager>,
         runtime_state: Arc<RuntimeState>,
+        image_enricher: MessageEnricher,
     ) -> Self {
         Self {
+            image_enricher,
             client: Client::new(),
             onebot_api_url: config.server.onebot_api.clone(),
             onebot_token: if config.server.onebot_token.is_empty() {
@@ -1467,19 +1471,26 @@ impl MessageSender for OneBotMessageSender {
             bail!("不能发送空图片消息");
         }
         let message = Value::Array(
-            images.iter().map(|image| serde_json::json!({
-                "type": "image",
-                "data": { "file": format!("base64://{}", STANDARD.encode(&image.bytes)) }
-            })).collect(),
+            images
+                .iter()
+                .map(|image| {
+                    serde_json::json!({
+                        "type": "image",
+                        "data": { "file": format!("base64://{}", STANDARD.encode(&image.bytes)) }
+                    })
+                })
+                .collect(),
         );
-        let content_parts = Value::Array(
-            images.iter().map(|image| serde_json::json!({
-                "kind": "image",
-                "data": { "file": image.path }
-            })).collect(),
-        );
-        let text = images.iter()
-            .map(|image| format!("[图片:{}]", image.path))
+        let mut registered_images = Vec::with_capacity(images.len());
+        for image in &images {
+            registered_images.push(self.image_enricher
+                .register_local_image(&image.path, &image.bytes).await?);
+        }
+        let content_parts = Value::Array(registered_images.iter()
+            .map(|image| image.content_part()).collect());
+        let text = registered_images
+            .iter()
+            .map(|image| image.context_text())
             .collect::<Vec<_>>()
             .join("\n");
         drop(images);
@@ -1490,14 +1501,18 @@ impl MessageSender for OneBotMessageSender {
         let (conversation_kind, response) = self
             .send_message_request_with_retry(target, message)
             .await?;
-        self.persist_sent_message(
+        let sent = self.persist_sent_message(
             target,
             conversation_kind,
             &response,
             &text,
             "image",
             content_parts,
-        )
+        )?;
+        let pending = registered_images.iter()
+            .filter_map(|image| image.pending_description_id()).collect::<Vec<_>>();
+        self.image_enricher.schedule_image_descriptions(&pending);
+        Ok(sent)
     }
 
     async fn send_qq_expression(

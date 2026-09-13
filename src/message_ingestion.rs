@@ -20,6 +20,10 @@ pub struct MessageIngestionService {
 }
 
 impl MessageIngestionService {
+    pub(crate) fn image_enricher(&self) -> MessageEnricher {
+        self.message_enricher.clone()
+    }
+
     pub fn new(app_config: Arc<AppConfig>, db_manager: Arc<QQChatContextManager>) -> Self {
         Self {
             db_manager: db_manager.clone(),

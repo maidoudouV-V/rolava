@@ -6,8 +6,9 @@ use anyhow::{bail, Result};
 use super::{
     AgentWebSearchTool, CreateScheduledTaskTool, DeleteGroupMemoryTool, DeleteScheduledTaskTool,
     DeleteUserMemoryTool, GetScheduledTaskTool, ReadContentTool, RunScriptTool,
-    SendQqSpecialMessageTool, SetConversationStateTool, SetGroupMemoryTool, SetUserMemoryTool, Tool,
-    ToolCall, ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool, WaitForReplyTool,
+    SendQqSpecialMessageTool, SetConversationStateTool, SetGroupMemoryTool, SetUserMemoryTool,
+    Tool, ToolCall, ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool,
+    WaitForReplyTool,
 };
 
 /// 管理后台可配置的工具信息；固定启用的内部工具不会出现在这里。

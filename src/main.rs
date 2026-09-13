@@ -176,10 +176,7 @@ async fn run_worker() -> Result<WorkerExit> {
             .scheduled_task_recovery_prompt
             .clone(),
     ));
-    let resource_cleanup = Arc::new(ResourceCleanupService::new(
-        db_manager.clone(),
-        &app_config.app.received_image_dir,
-    ));
+    let resource_cleanup = Arc::new(ResourceCleanupService::new(db_manager.clone()));
 
     let qq_receive_server = Arc::new(OneBotHttpServer::new(
         app_config.as_ref(),
@@ -239,6 +236,7 @@ async fn run_worker() -> Result<WorkerExit> {
         app_config.as_ref(),
         db_manager.clone(),
         runtime,
+        message_ingestion.image_enricher(),
     ));
     let mut conversation_dispatcher = ConversationDispatcher::new(
         app_config,

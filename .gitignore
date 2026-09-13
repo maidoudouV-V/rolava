@@ -4,4 +4,3 @@
 *.db
 *.sqlite
 *.sqlite3
-/received_images/

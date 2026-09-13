@@ -6,12 +6,19 @@ const path = require('node:path');
 
 const MAX_OUTPUT_IMAGES = 1;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 25_000;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 50_000;
 const RANDOM_NAME_ATTEMPTS = 20;
 const RANDOM_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..', '..');
 const IMAGE_DIRECTORY = path.join(PROJECT_ROOT, 'data', 'images');
+const RECEIVED_IMAGE_DIRECTORY = path.join(PROJECT_ROOT, 'data', 'received_images');
 const VIRTUAL_IMAGE_PREFIX = '/data/images/';
+const VIRTUAL_INPUT_ROOTS = [
+  { prefix: VIRTUAL_IMAGE_PREFIX, directory: IMAGE_DIRECTORY },
+  { prefix: '/data/received_images/', directory: RECEIVED_IMAGE_DIRECTORY },
+];
 const OUTPUT_LIMIT_PROMPT = '重要限制：一次只能生成 1 张图片。';
 
 class SkillError extends Error {
@@ -85,17 +92,24 @@ function isInside(root, candidate) {
   return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
 }
 
-async function resolveVirtualImagePath(virtualPath, imageRoot) {
-  if (virtualPath.includes('\\') || !virtualPath.startsWith(VIRTUAL_IMAGE_PREFIX)) {
-    throw new SkillError('INVALID_PATH', '图片路径必须位于 /data/images/');
+async function resolveVirtualImagePath(virtualPath) {
+  const inputRoot = VIRTUAL_INPUT_ROOTS.find(root => virtualPath.startsWith(root.prefix));
+  if (virtualPath.includes('\\') || !inputRoot) {
+    throw new SkillError('INVALID_PATH', '图片路径必须位于 /data/images/ 或 /data/received_images/');
   }
 
-  const relativePath = virtualPath.slice(VIRTUAL_IMAGE_PREFIX.length);
+  const relativePath = virtualPath.slice(inputRoot.prefix.length);
   const segments = relativePath.split('/');
   if (!relativePath || segments.some(segment => !segment || segment === '.' || segment === '..')) {
     throw new SkillError('INVALID_PATH', '图片路径无效');
   }
 
+  let imageRoot;
+  try {
+    imageRoot = await fs.realpath(inputRoot.directory);
+  } catch {
+    throw new SkillError('FILE_NOT_FOUND', `图片不存在：${virtualPath}`);
+  }
   const requestedPath = path.join(imageRoot, ...segments);
   let realPath;
   try {
@@ -104,7 +118,7 @@ async function resolveVirtualImagePath(virtualPath, imageRoot) {
     throw new SkillError('FILE_NOT_FOUND', `图片不存在：${virtualPath}`);
   }
   if (!isInside(imageRoot, realPath)) {
-    throw new SkillError('INVALID_PATH', '图片路径超出 /data/images/');
+    throw new SkillError('INVALID_PATH', '图片路径超出允许的图片目录');
   }
 
   const stat = await fs.stat(realPath);
@@ -135,12 +149,11 @@ function detectImageMimeType(bytes) {
 
 async function loadInputImages(imagePaths) {
   await fs.mkdir(IMAGE_DIRECTORY, { recursive: true });
-  const imageRoot = await fs.realpath(IMAGE_DIRECTORY);
   const images = [];
   let encodedBytes = 0;
 
   for (const virtualPath of imagePaths) {
-    const realPath = await resolveVirtualImagePath(virtualPath, imageRoot);
+    const realPath = await resolveVirtualImagePath(virtualPath);
     const stat = await fs.stat(realPath);
     if (encodedBytes + 4 * Math.ceil(stat.size / 3) > MAX_REQUEST_BYTES) {
       throw new SkillError('PAYLOAD_TOO_LARGE', '图片请求内容过大');
@@ -199,16 +212,30 @@ async function callGeminiGenerateContent(config, requestBody) {
       throw new SkillError('UPSTREAM_ERROR', `图片生成接口返回 HTTP ${response.status}`);
     }
     try {
-      return await response.json();
+      if (Number(response.headers.get('content-length')) > MAX_RESPONSE_BYTES) {
+        throw new SkillError('PAYLOAD_TOO_LARGE', '图片生成响应过大');
+      }
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of response.body) {
+        size += chunk.length;
+        if (size > MAX_RESPONSE_BYTES) {
+          controller.abort();
+          throw new SkillError('PAYLOAD_TOO_LARGE', '图片生成响应过大');
+        }
+        chunks.push(chunk);
+      }
+      return JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
     } catch (error) {
+      if (error instanceof SkillError) throw error;
       if (controller.signal.aborted) throw error;
       throw new SkillError('UPSTREAM_ERROR', '图片生成接口返回了无效 JSON');
     }
   } catch (error) {
+    if (error instanceof SkillError) throw error;
     if (controller.signal.aborted || (error && error.name === 'AbortError')) {
       throw new SkillError('TIMEOUT', '图片生成请求超时');
     }
-    if (error instanceof SkillError) throw error;
     throw new SkillError('UPSTREAM_ERROR', '无法连接图片生成接口');
   } finally {
     clearTimeout(timer);
@@ -228,6 +255,9 @@ function decodeBase64Image(inlineData) {
   }
 
   const bytes = Buffer.from(encoded, 'base64');
+  if (bytes.length > MAX_IMAGE_BYTES) {
+    throw new SkillError('PAYLOAD_TOO_LARGE', '单张图片不能超过 20 MiB');
+  }
   const detectedMimeType = detectImageMimeType(bytes);
   if (!detectedMimeType || detectedMimeType !== mimeType) {
     throw new SkillError('UPSTREAM_ERROR', '图片生成接口返回的图片格式无效');

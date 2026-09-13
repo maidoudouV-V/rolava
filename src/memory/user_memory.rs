@@ -85,7 +85,10 @@ impl UserMemoryService {
             anyhow::bail!("记忆内容不能为空");
         }
         if content.chars().count() > MAX_USER_MEMORY_CONTENT_CHARS {
-            anyhow::bail!("用户记忆内容不能超过 {} 个字符", MAX_USER_MEMORY_CONTENT_CHARS);
+            anyhow::bail!(
+                "用户记忆内容不能超过 {} 个字符",
+                MAX_USER_MEMORY_CONTENT_CHARS
+            );
         }
         Ok(())
     }
