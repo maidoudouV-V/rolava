@@ -755,7 +755,7 @@ impl ChatProcessor {
         image_data_urls: Vec<String>,
     ) {
         if db_msg.sender_id == bot_id {
-            Self::append_assistant_history_message(context, db_msg, starts_new_block);
+            Self::append_assistant_history_message(context, db_msg);
             return;
         }
         if !db_msg.is_read {
@@ -795,26 +795,8 @@ impl ChatProcessor {
         context.push(ToolChatMessage::User { content });
     }
 
-    fn append_assistant_history_message(
-        context: &mut Vec<ToolChatMessage>,
-        db_msg: &ChatMessage,
-        starts_new_block: bool,
-    ) {
+    fn append_assistant_history_message(context: &mut Vec<ToolChatMessage>, db_msg: &ChatMessage) {
         let message = db_msg.content_text.clone().unwrap_or_default();
-        if !starts_new_block {
-            if let Some(ToolChatMessage::Assistant {
-                content: Some(content),
-                tool_calls,
-                ..
-            }) = context.last_mut()
-            {
-                if tool_calls.is_empty() {
-                    content.push('\n');
-                    content.push_str(&message);
-                    return;
-                }
-            }
-        }
         context.push(ToolChatMessage::Assistant {
             content: Some(message),
             reasoning: None,

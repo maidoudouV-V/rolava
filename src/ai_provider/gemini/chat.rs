@@ -62,7 +62,10 @@ fn push_content(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
         return;
     }
     // 相邻工具结果合并为同一 user turn，原样保留每个 part 的边界。
-    if let Some(last) = contents.last_mut().filter(|last| last["role"] == role) {
+    if let Some(last) = contents
+        .last_mut()
+        .filter(|last| role == "user" && last["role"] == role)
+    {
         last["parts"].as_array_mut().unwrap().extend(parts);
     } else {
         contents.push(json!({"role": role, "parts": parts}));

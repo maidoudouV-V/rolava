@@ -216,6 +216,11 @@ async fn run_worker() -> Result<WorkerExit> {
         }
     }
 
+    // Worker 每次启动都独立加载 Bot 资料，不依赖可选的历史消息同步。
+    if let Err(error) = qq_receive_server.fetch_login_user_id().await {
+        warn!(error = %format!("{error:#}"), "启动时加载 Bot 资料失败");
+    }
+
     // 启动时读取一次完整群列表，后续管理页面只使用这份运行时缓存。
     if let Err(error) = qq_receive_server.fetch_group_ids().await {
         warn!(error = %format!("{error:#}"), "启动时加载群资料失败");

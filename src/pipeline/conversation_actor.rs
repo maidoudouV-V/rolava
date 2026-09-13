@@ -59,6 +59,7 @@ impl ConversationActor {
     pub async fn run(mut self) {
         let mut pending_event = None;
         loop {
+            let queued_events = self.event_rx.len() + usize::from(pending_event.is_some());
             let event = match pending_event.take() {
                 Some(event) => event,
                 None => match self.event_rx.recv().await {
@@ -76,6 +77,7 @@ impl ConversationActor {
                         &mut self.event_rx,
                         self.commands.as_ref(),
                         incoming_message,
+                        queued_events,
                     )
                     .await;
                     pending_event = next_event;
@@ -129,27 +131,41 @@ impl ConversationActor {
         }
     }
 
-    /// 收集当前会话的连续平台消息；每收到一条就重新等待两秒，最多五条。
+    /// 空闲时每条消息重置两秒等待，最多五条；积压消息按队列快照立即合批。
     async fn collect_message_batch(
         event_rx: &mut mpsc::UnboundedReceiver<ConversationEvent>,
         commands: &CommandSystem,
         first_message: IncomingMessage,
+        queued_events: usize,
     ) -> (Vec<IncomingMessage>, Option<ConversationEvent>) {
         let mut messages = vec![first_message];
+        let max_messages = if queued_events > 0 {
+            queued_events
+        } else {
+            MESSAGE_BATCH_MAX_MESSAGES
+        };
 
-        while messages.len() < MESSAGE_BATCH_MAX_MESSAGES {
-            match timeout(MESSAGE_BATCH_WAIT, event_rx.recv()).await {
-                Ok(Some(ConversationEvent::IncomingMessage(message))) => {
+        while messages.len() < max_messages {
+            let event = if queued_events > 0 {
+                event_rx.try_recv().ok()
+            } else {
+                timeout(MESSAGE_BATCH_WAIT, event_rx.recv())
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            match event {
+                Some(ConversationEvent::IncomingMessage(message)) => {
                     if commands.is_command_message(&message) {
                         // 命令是聚合边界，先处理已经收集的普通消息，再单独执行命令。
                         return (messages, Some(ConversationEvent::IncomingMessage(message)));
                     }
                     messages.push(message);
                 }
-                Ok(Some(event @ ConversationEvent::InternalTrigger(_))) => {
+                Some(event @ ConversationEvent::InternalTrigger(_)) => {
                     return (messages, Some(event));
                 }
-                Ok(None) | Err(_) => break,
+                None => break,
             }
         }
 

@@ -350,7 +350,7 @@ fn build_gemini_chat_contents(
 
 fn push_gemini_text_content(contents: &mut Vec<GeminiContent>, role: &'static str, text: &str) {
     if let Some(last) = contents.last_mut() {
-        if last.role == Some(role) {
+        if role == "user" && last.role == Some(role) {
             last.parts.push(GeminiPart {
                 text: Some(text.to_string()),
                 inline_data: None,

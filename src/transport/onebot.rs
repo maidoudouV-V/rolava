@@ -1260,7 +1260,21 @@ impl OneBotMessageSender {
     }
 
     fn text_segments(text: &str) -> Vec<&str> {
-        text.lines()
+        let mut segments = Vec::new();
+        let mut start = 0;
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let content = line.strip_suffix('\n').unwrap_or(line);
+            let content = content.strip_suffix('\r').unwrap_or(content);
+            if content == "---" {
+                segments.push(&text[start..offset]);
+                start = offset + line.len();
+            }
+            offset += line.len();
+        }
+        segments.push(&text[start..]);
+        segments
+            .into_iter()
             .map(str::trim)
             .filter(|segment| !segment.is_empty())
             .collect()
@@ -2067,6 +2081,29 @@ mod tests {
     use super::OneBotEventDto;
     use crate::transport::message::ConversationKind;
     use serde_json::json;
+
+    #[test]
+    fn text_splits_only_on_exact_separator_lines() {
+        for newline in ["\n", "\r\n"] {
+            let body = [
+                "第一行",
+                "",
+                "第二行",
+                " ---",
+                "--- ",
+                "正文---正文",
+                "----",
+            ]
+            .join(newline);
+            let text =
+                format!("---{newline}{body}{newline}---{newline}---{newline}末条{newline}---");
+            assert_eq!(
+                super::OneBotMessageSender::text_segments(&text),
+                vec![body.as_str(), "末条"]
+            );
+        }
+        assert!(super::OneBotMessageSender::text_segments("---").is_empty());
+    }
 
     // 验证指向机器人的群戳一戳可解析为会话触发。
     #[test]
