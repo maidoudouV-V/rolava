@@ -1266,7 +1266,7 @@ impl OneBotMessageSender {
         for line in text.split_inclusive('\n') {
             let content = line.strip_suffix('\n').unwrap_or(line);
             let content = content.strip_suffix('\r').unwrap_or(content);
-            if content == "---" {
+            if content == "<split>" {
                 segments.push(&text[start..offset]);
                 start = offset + line.len();
             }
@@ -2089,20 +2089,20 @@ mod tests {
                 "第一行",
                 "",
                 "第二行",
-                " ---",
-                "--- ",
-                "正文---正文",
-                "----",
+                " <split>",
+                "<split> ",
+                "正文<split>正文",
+                "---",
             ]
             .join(newline);
             let text =
-                format!("---{newline}{body}{newline}---{newline}---{newline}末条{newline}---");
+                format!("<split>{newline}{body}{newline}<split>{newline}<split>{newline}末条{newline}<split>");
             assert_eq!(
                 super::OneBotMessageSender::text_segments(&text),
                 vec![body.as_str(), "末条"]
             );
         }
-        assert!(super::OneBotMessageSender::text_segments("---").is_empty());
+        assert!(super::OneBotMessageSender::text_segments("<split>").is_empty());
     }
 
     // 验证指向机器人的群戳一戳可解析为会话触发。
