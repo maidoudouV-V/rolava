@@ -12,7 +12,7 @@ use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
 const DESCRIPTION: &str = r#"运行项目中一个已存在且允许执行的脚本，并返回退出状态、标准输出和错误输出。
 type 必须是受支持的脚本类型，script 必须是上下文中提供的确定路径，不得猜测或遍历路径。"#;
-const EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+const EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ARGUMENTS: usize = 64;
 const MAX_ARGUMENT_CHARS: usize = 4_096;
 
@@ -223,7 +223,7 @@ fn validate_virtual_path(raw_path: &str) -> Result<PathBuf> {
     let relative_path = path
         .strip_prefix('/')
         .filter(|path| !path.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("script 必须是以 / 开头的虚拟绝对路径"))?;
+        .ok_or_else(|| anyhow::anyhow!("script 必须是以 / 开头的绝对路径"))?;
     let path = Path::new(relative_path);
     if path
         .components()

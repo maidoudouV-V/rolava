@@ -6,7 +6,7 @@ use crate::transport::message::{
     preferred_sender_name, Conversation, ConversationKind, IncomingMessage, MessageContent,
     MessagePart, MessageTarget, Participant,
 };
-use crate::transport::{GroupInfo, MessageSender, QqExpression, SendOptions, SentMessage};
+use crate::transport::{GroupInfo, MessageSender, QqExpression, QqImage, SendOptions, SentMessage};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -14,6 +14,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Redirect;
 use axum::{routing::get, Router};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
@@ -1078,7 +1079,15 @@ impl OneBotMessageSender {
         message: Value,
     ) -> Result<(&'static str, OneBotActionResponse<OneBotSendMessageData>)> {
         let (api_path, conversation_kind, payload) = Self::request_parts(target, message);
-        trace!(api_path, payload = %payload, "OneBot 发送消息完整请求");
+        if payload
+            .get("message")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image"))
+        {
+            trace!(api_path, "OneBot 发送图片消息请求");
+        } else {
+            trace!(api_path, payload = %payload, "OneBot 发送消息完整请求");
+        }
         let request_url = format!("{}/{}", self.onebot_api_url, api_path);
         let mut request = self.client.post(&request_url).json(&payload);
         if let Some(token) = &self.onebot_token {
@@ -1443,6 +1452,52 @@ impl MessageSender for OneBotMessageSender {
             self.send_text_segment(target, segment, false).await?;
         }
         Ok(())
+    }
+
+    async fn send_qq_images(
+        &self,
+        target: &MessageTarget,
+        images: Vec<QqImage>,
+        options: SendOptions,
+    ) -> Result<SentMessage> {
+        if target.source != "onebot" {
+            bail!("OneBot 发送器不支持消息来源：{}", target.source);
+        }
+        if images.is_empty() {
+            bail!("不能发送空图片消息");
+        }
+        let message = Value::Array(
+            images.iter().map(|image| serde_json::json!({
+                "type": "image",
+                "data": { "file": format!("base64://{}", STANDARD.encode(&image.bytes)) }
+            })).collect(),
+        );
+        let content_parts = Value::Array(
+            images.iter().map(|image| serde_json::json!({
+                "kind": "image",
+                "data": { "file": image.path }
+            })).collect(),
+        );
+        let text = images.iter()
+            .map(|image| format!("[图片:{}]", image.path))
+            .collect::<Vec<_>>()
+            .join("\n");
+        drop(images);
+        let delay = self.reply_delay(options);
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        let (conversation_kind, response) = self
+            .send_message_request_with_retry(target, message)
+            .await?;
+        self.persist_sent_message(
+            target,
+            conversation_kind,
+            &response,
+            &text,
+            "image",
+            content_parts,
+        )
     }
 
     async fn send_qq_expression(

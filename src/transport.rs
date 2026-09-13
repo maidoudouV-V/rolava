@@ -31,6 +31,12 @@ pub enum QqExpression {
     Rps,
 }
 
+/// 已读取的本地图片；path 使用项目根目录下的绝对路径。
+pub struct QqImage {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
 /// 单次消息发送的行为选项。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SendOptions {
@@ -70,6 +76,14 @@ pub trait MessageSender: Send + Sync {
         &self,
         target: &MessageTarget,
         expression: QqExpression,
+        options: SendOptions,
+    ) -> Result<SentMessage>;
+
+    /// 将多张图片按顺序发送为一条消息，并持久化图片路径。
+    async fn send_qq_images(
+        &self,
+        target: &MessageTarget,
+        images: Vec<QqImage>,
         options: SendOptions,
     ) -> Result<SentMessage>;
 }

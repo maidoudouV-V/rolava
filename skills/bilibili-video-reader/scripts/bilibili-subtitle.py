@@ -264,7 +264,7 @@ def timed_subtitle_to_text(raw_value: object) -> str:
         text = clean_cue_text("\n".join(lines[timestamp_index + 1 :]))
         if text and (not cues or text != cues[-1]):
             cues.append(text)
-    return "\n".join(cues)
+    return " ".join(cues)
 
 
 def ass_to_text(raw_value: object) -> str:
@@ -279,7 +279,7 @@ def ass_to_text(raw_value: object) -> str:
         text = clean_cue_text(",".join(fields[9:]))
         if text and (not cues or text != cues[-1]):
             cues.append(text)
-    return "\n".join(cues)
+    return " ".join(cues)
 
 
 def json_subtitle_to_text(raw_value: object) -> str:
@@ -290,7 +290,7 @@ def json_subtitle_to_text(raw_value: object) -> str:
     body = data.get("body", []) if isinstance(data, dict) else []
     if not isinstance(body, list):
         body = []
-    return "\n".join(
+    return " ".join(
         text
         for item in body
         if isinstance(item, dict)

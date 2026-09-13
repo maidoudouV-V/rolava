@@ -9,7 +9,7 @@ use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
 const DESCRIPTION: &str = r#"读取项目目录中允许访问的文本文件并返回正文内容。
 读取 /skills/ 下的 SKILL.md 时，自动省略文件开头的 YAML 元数据。
-路径必须是以项目根目录为起点的虚拟绝对路径，使用正斜杠。
+路径必须是以 / 为根目录的绝对路径，使用正斜杠，例如 /skills/example/SKILL.md。
 路径来源必须是上下文中提供的确信路径，不得猜测路径，或尝试遍历未知路径"#;
 const MAX_CONTENT_BYTES: u64 = 64 * 1024;
 
@@ -60,36 +60,36 @@ impl Tool for ReadContentTool {
         // 规范化目标路径会确认路径存在，并解析其中可能包含的符号链接。
         let target_path = tokio::fs::canonicalize(project_root.join(&relative_path))
             .await
-            .with_context(|| format!("读取路径不存在：{}", relative_path.display()))?;
+            .with_context(|| format!("读取路径不存在：{}", arguments.path.trim()))?;
 
         // 规范化后再次检查边界，避免通过符号链接或路径跳转访问允许目录之外的文件。
         let allowed = allowed_roots(&project_root).await?;
         if !allowed.iter().any(|root| target_path.starts_with(root)) {
-            anyhow::bail!("没有权限读取该路径：{}", relative_path.display());
+            anyhow::bail!("没有权限读取该路径：{}", arguments.path.trim());
         }
 
         let metadata = tokio::fs::metadata(&target_path)
             .await
-            .with_context(|| format!("读取文件信息失败：{}", relative_path.display()))?;
+            .with_context(|| format!("读取文件信息失败：{}", arguments.path.trim()))?;
         // 只允许读取普通文件，目录和其他文件系统对象均不接受。
         if !metadata.is_file() {
-            anyhow::bail!("读取路径不是文件：{}", relative_path.display());
+            anyhow::bail!("读取路径不是文件：{}", arguments.path.trim());
         }
         // 在分配读取缓冲区前限制文件大小，避免把超大文件整个放入模型上下文。
         if metadata.len() > MAX_CONTENT_BYTES {
             anyhow::bail!(
                 "文件超过读取上限 {} KiB：{}",
                 MAX_CONTENT_BYTES / 1024,
-                relative_path.display()
+                arguments.path.trim()
             );
         }
 
         let bytes = tokio::fs::read(&target_path)
             .await
-            .with_context(|| format!("读取文件失败：{}", relative_path.display()))?;
+            .with_context(|| format!("读取文件失败：{}", arguments.path.trim()))?;
         // 工具只返回文本内容，二进制或编码错误的文件不能进入模型上下文。
         let content = String::from_utf8(bytes)
-            .with_context(|| format!("文件不是有效的 UTF-8 文本：{}", relative_path.display()))?;
+            .with_context(|| format!("文件不是有效的 UTF-8 文本：{}", arguments.path.trim()))?;
         // Skill 入口的 YAML 仅用于发现阶段，执行时只向模型提供正文说明。
         let content = strip_skill_frontmatter(&relative_path, &content)?;
         Ok(ToolOutput::text(crate::text_utils::truncate_long_text(

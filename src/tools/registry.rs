@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 use super::{
     AgentWebSearchTool, CreateScheduledTaskTool, DeleteGroupMemoryTool, DeleteScheduledTaskTool,
     DeleteUserMemoryTool, GetScheduledTaskTool, ReadContentTool, RunScriptTool,
-    SendQqExpressionTool, SetConversationStateTool, SetGroupMemoryTool, SetUserMemoryTool, Tool,
+    SendQqSpecialMessageTool, SetConversationStateTool, SetGroupMemoryTool, SetUserMemoryTool, Tool,
     ToolCall, ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool, WaitForReplyTool,
 };
 
@@ -38,7 +38,7 @@ impl ToolRegistry {
         if Self::is_enabled(enabled_optional_tools, WEB_SEARCH_MODULE) {
             registry.register(AgentWebSearchTool).unwrap();
         }
-        registry.register(SendQqExpressionTool).unwrap();
+        registry.register(SendQqSpecialMessageTool).unwrap();
         registry.register(ReadContentTool).unwrap();
         registry.register(RunScriptTool).unwrap();
         if Self::is_enabled(enabled_optional_tools, MEMORY_MODULE) {
