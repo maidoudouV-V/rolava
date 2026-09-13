@@ -1260,21 +1260,7 @@ impl OneBotMessageSender {
     }
 
     fn text_segments(text: &str) -> Vec<&str> {
-        let mut segments = Vec::new();
-        let mut start = 0;
-        let mut offset = 0;
-        for line in text.split_inclusive('\n') {
-            let content = line.strip_suffix('\n').unwrap_or(line);
-            let content = content.strip_suffix('\r').unwrap_or(content);
-            if content == "<split>" {
-                segments.push(&text[start..offset]);
-                start = offset + line.len();
-            }
-            offset += line.len();
-        }
-        segments.push(&text[start..]);
-        segments
-            .into_iter()
+        text.split("<split>")
             .map(str::trim)
             .filter(|segment| !segment.is_empty())
             .collect()
@@ -2083,23 +2069,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn text_splits_only_on_exact_separator_lines() {
+    fn text_splits_on_marker_anywhere() {
         for newline in ["\n", "\r\n"] {
-            let body = [
-                "第一行",
-                "",
-                "第二行",
-                " <split>",
-                "<split> ",
-                "正文<split>正文",
-                "---",
-            ]
-            .join(newline);
+            let body = ["第一行", "", "第二行", "---"].join(newline);
             let text =
-                format!("<split>{newline}{body}{newline}<split>{newline}<split>{newline}末条{newline}<split>");
+                format!("<split>{newline}{body}{newline}<split> 行内<split>分隔 <split>{newline}<split>{newline}末条{newline}<split>");
             assert_eq!(
                 super::OneBotMessageSender::text_segments(&text),
-                vec![body.as_str(), "末条"]
+                vec![body.as_str(), "行内", "分隔", "末条"]
             );
         }
         assert!(super::OneBotMessageSender::text_segments("<split>").is_empty());
