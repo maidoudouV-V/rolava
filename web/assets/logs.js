@@ -8,6 +8,7 @@ export class LogsController {
   constructor() {
     this.entries = [];
     this.afterId = null;
+    this.instanceId = null;
     this.polling = false;
     this.paused = false;
     this.minimumLevel = "INFO";
@@ -30,7 +31,16 @@ export class LogsController {
     try {
       const query = new URLSearchParams({ limit: "200" });
       if (this.afterId != null) query.set("after_id", String(this.afterId));
-      const response = await api.get(`/logs?${query}`);
+      let response = await api.get(`/logs?${query}`);
+      if ((this.instanceId != null && response.instance_id !== this.instanceId)
+        || (this.afterId != null && response.latest_id < this.afterId)) {
+        this.entries = [];
+        this.afterId = null;
+        this.instanceId = null;
+        this.render();
+        response = await api.get("/logs?limit=200");
+      }
+      this.instanceId = response.instance_id;
       if (response.items.length) {
         this.entries.push(...response.items);
         if (this.entries.length > MAX_CLIENT_ENTRIES) this.entries.splice(0, this.entries.length - MAX_CLIENT_ENTRIES);

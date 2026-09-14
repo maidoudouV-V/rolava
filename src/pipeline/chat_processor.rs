@@ -4,6 +4,7 @@ use crate::ai_provider::{
 use chrono::{DateTime, Local, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
@@ -353,10 +354,12 @@ impl ChatProcessor {
                     tool_name = %tool_call.name,
                     tool_call_id = %tool_call.id
                 );
+                let started_at = Instant::now();
                 let result = tools
                     .execute(&tool_context, tool_call)
                     .instrument(tool_span)
                     .await;
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
                 if result.is_error {
                     warn!(
                         tool_name = %result.tool_name,
@@ -364,6 +367,7 @@ impl ChatProcessor {
                         requires_ai_response = result.requires_ai_response,
                         arguments = %tool_arguments,
                         error = %result.content,
+                        elapsed_ms,
                         "工具调用失败"
                     );
                 } else {
@@ -371,6 +375,7 @@ impl ChatProcessor {
                         tool_name = %result.tool_name,
                         tool_call_id = %result.tool_call_id,
                         requires_ai_response = result.requires_ai_response,
+                        elapsed_ms,
                         "工具调用完成"
                     );
                 }
@@ -491,6 +496,7 @@ impl ChatProcessor {
         let mut last_error = None;
 
         for attempt in 1..=max_attempts {
+            let started_at = Instant::now();
             let chat_result = {
                 let chat_provider = self
                     .services
@@ -510,10 +516,12 @@ impl ChatProcessor {
                 .await
             };
 
+            let elapsed_ms = started_at.elapsed().as_millis() as u64;
             match chat_result {
                 Ok(resp) => {
                     info!(
                         attempt,
+                        elapsed_ms,
                         model = ?resp.model,
                         finish_reason = ?resp.finish_reason,
                         tool_call_count = resp.tool_calls.len(),
@@ -528,7 +536,7 @@ impl ChatProcessor {
                     return Ok(resp);
                 }
                 Err(err) => {
-                    warn!(attempt, max_attempts, error = %format!("{err:#}"), "AI 请求失败，准备重试");
+                    warn!(attempt, max_attempts, elapsed_ms, error = %format!("{err:#}"), "AI 请求失败，准备重试");
                     last_error = Some(err);
                 }
             }

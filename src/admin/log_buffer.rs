@@ -24,6 +24,7 @@ pub struct AdminLogEntry {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AdminLogPage {
+    pub instance_id: String,
     pub items: Vec<AdminLogEntry>,
     pub latest_id: u64,
     /// 客户端游标早于当前最老日志时为 true，表示中间日志已经被覆盖。
@@ -37,6 +38,7 @@ struct AdminLogState {
 
 /// 固定容量的内存日志；写满后移除最老记录，内存不会随运行时间无限增长。
 pub struct AdminLogBuffer {
+    instance_id: String,
     capacity: usize,
     state: Mutex<AdminLogState>,
 }
@@ -44,6 +46,7 @@ pub struct AdminLogBuffer {
 impl AdminLogBuffer {
     pub fn new(capacity: usize) -> Self {
         Self {
+            instance_id: format!("{:032x}", rand::random::<u128>()),
             capacity: capacity.max(1),
             state: Mutex::new(AdminLogState {
                 next_id: 1,
@@ -90,6 +93,7 @@ impl AdminLogBuffer {
                 .collect(),
         };
         AdminLogPage {
+            instance_id: self.instance_id.clone(),
             items,
             latest_id: state.entries.back().map(|entry| entry.id).unwrap_or(0),
             truncated,
