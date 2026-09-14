@@ -47,7 +47,8 @@ const GROUP_MEMBER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 pub struct AdminState {
     app_config: Arc<RwLock<Arc<AppConfig>>>,
     // 与运行中的主模型一致；仅保存配置但未重启时，不提前切换窗口大小。
-    context_history_limit: u32,
+    group_context_history_limit: u32,
+    direct_context_history_limit: u32,
     context_summary_days: u16,
     // 使用启动时的值，确保页面与运行中的模型上下文一致。
     context_summary_enabled: bool,
@@ -74,7 +75,8 @@ impl AdminState {
         restart: CancellationToken,
     ) -> Self {
         Self {
-            context_history_limit: app_config.app.max_history_messages,
+            group_context_history_limit: app_config.app.group_max_history_messages,
+            direct_context_history_limit: app_config.app.direct_max_history_messages,
             context_summary_days: app_config.app.history_summary_days,
             context_summary_enabled: app_config.app.history_summary_enabled,
             user_memory: Arc::new(UserMemoryService::new(db_manager.clone())),
@@ -893,7 +895,11 @@ async fn conversation_messages(
         &state.db_manager,
         &conversation.source,
         &conversation.source_conversation_id,
-        state.context_history_limit,
+        if conversation.kind == "group" {
+            state.group_context_history_limit
+        } else {
+            state.direct_context_history_limit
+        },
         Local::now(),
         state.context_summary_enabled,
         state.context_summary_days,

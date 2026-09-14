@@ -573,7 +573,12 @@ impl ChatProcessor {
             &self.services.db_manager,
             &self.message_target.source,
             &self.message_target.conversation.id,
-            self.services.app_config.app.max_history_messages,
+            match self.message_target.conversation.kind {
+                ConversationKind::Group => self.services.app_config.app.group_max_history_messages,
+                ConversationKind::Direct => {
+                    self.services.app_config.app.direct_max_history_messages
+                }
+            },
             Local::now(),
             self.services.app_config.app.history_summary_enabled,
             self.services.app_config.app.history_summary_days,

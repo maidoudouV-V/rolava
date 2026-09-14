@@ -25,7 +25,8 @@ pub struct AdminAppConfig {
     pub filter_model_name: String,
     pub web_search_model_name: String,
     pub visual_model_name: String,
-    pub max_history_messages: u32,
+    pub group_max_history_messages: u32,
+    pub direct_max_history_messages: u32,
     #[serde(default)]
     pub history_summary_enabled: bool,
     #[serde(default = "crate::config::default_history_summary_days")]
@@ -83,7 +84,8 @@ impl AdminConfigView {
                 filter_model_name: config.app.filter_model_name.clone(),
                 web_search_model_name: config.app.web_search_model_name.clone(),
                 visual_model_name: config.app.visual_model_name.clone(),
-                max_history_messages: config.app.max_history_messages,
+                group_max_history_messages: config.app.group_max_history_messages,
+                direct_max_history_messages: config.app.direct_max_history_messages,
                 history_summary_enabled: config.app.history_summary_enabled,
                 history_summary_days: config.app.history_summary_days,
                 startup_history_fetch_count: config.app.startup_history_fetch_count,
@@ -283,8 +285,8 @@ fn validate_update(update: &AdminConfigUpdate) -> Result<()> {
     if update.app.history_summary_days == 0 {
         anyhow::bail!("摘要显示天数必须大于 0");
     }
-    if update.app.max_history_messages == 0 {
-        anyhow::bail!("历史消息数必须大于 0");
+    if update.app.group_max_history_messages == 0 || update.app.direct_max_history_messages == 0 {
+        anyhow::bail!("群聊和私聊历史消息数必须大于 0");
     }
     if update.app.startup_history_fetch_count > 999 {
         anyhow::bail!("每群启动历史消息数不能超过 999");
@@ -350,7 +352,8 @@ fn apply_app(document: &mut DocumentMut, app: &AdminAppConfig) {
     table["filter_model_name"] = value(&app.filter_model_name);
     table["web_search_model_name"] = value(&app.web_search_model_name);
     table["visual_model_name"] = value(&app.visual_model_name);
-    table["max_history_messages"] = value(i64::from(app.max_history_messages));
+    table["group_max_history_messages"] = value(i64::from(app.group_max_history_messages));
+    table["direct_max_history_messages"] = value(i64::from(app.direct_max_history_messages));
     table["history_summary_enabled"] = value(app.history_summary_enabled);
     table["history_summary_days"] = value(i64::from(app.history_summary_days));
     table["startup_history_fetch_count"] = value(i64::from(app.startup_history_fetch_count));
@@ -363,6 +366,7 @@ fn apply_app(document: &mut DocumentMut, app: &AdminAppConfig) {
     table["command_whitelist"] = Item::Value(strings_array(&app.command_whitelist).into());
     table["reply_delay_random_max_secs"] = value(app.reply_delay_random_max_secs);
     table.as_table_mut().map(|table| {
+        table.remove("max_history_messages");
         table.remove("startup_history_message_count");
         table.remove("split_reply_on_newlines");
         table.remove("enable_ai_filter");

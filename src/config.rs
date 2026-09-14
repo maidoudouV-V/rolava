@@ -35,6 +35,19 @@ struct TomlConfig {
     skill_environment: BTreeMap<String, String>,
 }
 
+fn parse_toml_config(text: &str) -> Result<TomlConfig> {
+    let mut document: toml::Value = toml::from_str(text)?;
+    if let Some(app) = document.get_mut("app").and_then(toml::Value::as_table_mut) {
+        if let Some(shared_limit) = app.remove("max_history_messages") {
+            app.entry("group_max_history_messages")
+                .or_insert_with(|| shared_limit.clone());
+            app.entry("direct_max_history_messages")
+                .or_insert(shared_limit);
+        }
+    }
+    Ok(document.try_into()?)
+}
+
 #[derive(Deserialize, Debug, Default)]
 pub struct AdminSection {
     /// 管理 API 使用的 bearer token；空值会在启动时自动生成。
@@ -78,8 +91,10 @@ pub struct AppSection {
     /// 明确启用并加载到主模型上下文的 Skill 名称；未列出的 Skill 默认关闭。
     #[serde(default)]
     pub enabled_skills: Vec<String>,
-    /// 发送给模型的最大历史消息数。
-    pub max_history_messages: u32,
+    /// 群聊发送给模型的最大历史消息数。
+    pub group_max_history_messages: u32,
+    /// 私聊发送给模型的最大历史消息数。
+    pub direct_max_history_messages: u32,
     /// 是否生成并使用历史摘要；默认关闭，重启后生效。
     #[serde(default)]
     pub history_summary_enabled: bool,
@@ -346,13 +361,16 @@ impl AppConfig {
             logging,
             admin,
             skill_environment,
-        } = toml::from_str(&toml_str).with_context(|| {
+        } = parse_toml_config(&toml_str).with_context(|| {
             format!(
                 "解析主配置文件失败：{}",
                 diagnostic_path(config_path).display()
             )
         })?;
 
+        if app.group_max_history_messages == 0 || app.direct_max_history_messages == 0 {
+            anyhow::bail!("群聊和私聊历史消息数必须大于 0");
+        }
         if app.startup_history_fetch_count > 999 {
             anyhow::bail!("每群启动历史消息数不能超过 999");
         }

@@ -42,7 +42,8 @@ export class ConfigController {
     document.getElementById("server-token").placeholder = server.server_token_configured ? "已配置，留空保持不变" : "未配置";
     document.getElementById("onebot-api").value = server.onebot_api;
     document.getElementById("onebot-token").placeholder = server.onebot_token_configured ? "已配置，留空保持不变" : "未配置";
-    document.getElementById("max-history").value = app.max_history_messages;
+    document.getElementById("group-max-history").value = app.group_max_history_messages;
+    document.getElementById("direct-max-history").value = app.direct_max_history_messages;
     document.getElementById("history-summary-enabled").checked = app.history_summary_enabled;
     document.getElementById("history-summary-days").value = app.history_summary_days;
     document.getElementById("startup-history-fetch-count").value = app.startup_history_fetch_count;
@@ -251,7 +252,8 @@ export class ConfigController {
       filter_model_name: document.getElementById("filter-model").value,
       web_search_model_name: document.getElementById("web-model").value,
       visual_model_name: document.getElementById("visual-model").value,
-      max_history_messages: Number(document.getElementById("max-history").value),
+      group_max_history_messages: Number(document.getElementById("group-max-history").value),
+      direct_max_history_messages: Number(document.getElementById("direct-max-history").value),
       history_summary_enabled: document.getElementById("history-summary-enabled").checked,
       history_summary_days: Number(document.getElementById("history-summary-days").value),
       startup_history_fetch_count: Number(document.getElementById("startup-history-fetch-count").value),
