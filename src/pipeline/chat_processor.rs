@@ -579,7 +579,6 @@ impl ChatProcessor {
                     self.services.app_config.app.direct_max_history_messages
                 }
             },
-            Local::now(),
             self.services.app_config.app.history_summary_enabled,
             self.services.app_config.app.history_summary_days,
         )?;

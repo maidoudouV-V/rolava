@@ -51,7 +51,7 @@ impl HistoryCompressionService {
         }
     }
 
-    /// 启动时若已启用，立即补偿今天之前的记录，之后在本地时间 03:00 执行。
+    /// 启动时若已启用，补偿原始消息窗口边界内已结束日期的记录，之后在本地时间 03:00 检查。
     pub async fn run(self: Arc<Self>) {
         if !self.app_config.app.history_summary_enabled {
             // 保持受主进程监管的任务存活，关闭摘要不应触发整个服务退出。
@@ -95,7 +95,11 @@ impl HistoryCompressionService {
             last_closed_boundary(now)?
         }
         .timestamp();
-        let tasks = self.db_manager.get_pending_daily_summaries(closed_before)?;
+        let tasks = self.db_manager.get_pending_window_daily_summaries(
+            closed_before,
+            self.app_config.app.group_max_history_messages,
+            self.app_config.app.direct_max_history_messages,
+        )?;
         let mut stats = CompressionStats {
             pending: tasks.len(),
             ..CompressionStats::default()

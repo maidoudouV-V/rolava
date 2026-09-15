@@ -76,9 +76,16 @@ fn build_contents(messages: &[ToolChatMessage]) -> anyhow::Result<(Value, Value)
     let mut system = Vec::new();
     let mut contents = Vec::new();
     let mut pending = HashMap::new();
+    let mut conversation_started = false;
     for message in messages {
+        conversation_started |= !matches!(message, ToolChatMessage::System { .. });
         match message {
-            ToolChatMessage::System { content } => system.push(content.as_str()),
+            ToolChatMessage::System { content } if !conversation_started => {
+                system.push(content.as_str())
+            }
+            ToolChatMessage::System { content } => {
+                push_content(&mut contents, "user", vec![json!({"text": content})]);
+            }
             ToolChatMessage::User { content } => {
                 let parts = content
                     .parts()
@@ -260,6 +267,27 @@ mod tests {
 
     fn response(parts: Value) -> Value {
         json!({"candidates": [{"finishReason": "STOP", "content": {"role": "model", "parts": parts}}]})
+    }
+
+    #[test]
+    fn trailing_system_stays_in_conversation_for_both_conversion_paths() {
+        let messages = vec![
+            ToolChatMessage::System { content: "rules".into() },
+            ToolChatMessage::System { content: "character".into() },
+            ToolChatMessage::User { content: ToolChatUserContent::text("history") },
+            ToolChatMessage::System { content: "memory".into() },
+            ToolChatMessage::User { content: ToolChatUserContent::text("review") },
+        ];
+        let expected_system = json!({"parts": [{"text": "rules\n\ncharacter"}]});
+        let expected_contents = json!([{"role": "user", "parts": [
+            {"text": "history"}, {"text": "memory"}, {"text": "review"}
+        ]}]);
+        let plain = build_request(&messages, &[], None).unwrap();
+        assert_eq!(plain["systemInstruction"], expected_system);
+        assert_eq!(plain["contents"], expected_contents);
+        let (system, contents) = build_contents(&messages).unwrap();
+        assert_eq!(system, expected_system);
+        assert_eq!(contents, expected_contents);
     }
 
     #[test]

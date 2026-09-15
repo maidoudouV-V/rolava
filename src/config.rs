@@ -98,7 +98,7 @@ pub struct AppSection {
     /// 是否生成并使用历史摘要；默认关闭，重启后生效。
     #[serde(default)]
     pub history_summary_enabled: bool,
-    /// 上下文向前读取摘要的天数，默认 30 天。
+    /// 从原始消息窗口最早日期向前读取摘要的天数，包含该日期，默认 30 天。
     #[serde(default = "default_history_summary_days")]
     pub history_summary_days: u16,
     /// 程序启动时为每个群回填的最近历史消息数；0 表示关闭回填。

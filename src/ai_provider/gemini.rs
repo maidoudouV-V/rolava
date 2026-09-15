@@ -312,10 +312,17 @@ fn build_gemini_chat_contents(
 ) -> (Option<GeminiContent>, Vec<GeminiContent>) {
     let mut system_texts = Vec::new();
     let mut contents = Vec::new();
+    let mut conversation_started = false;
 
     for message in request_messages {
+        conversation_started |= !matches!(message.role, MessageRole::System);
         match message.role {
-            MessageRole::System => system_texts.push(message.content.as_str()),
+            MessageRole::System if !conversation_started => {
+                system_texts.push(message.content.as_str())
+            }
+            MessageRole::System => {
+                push_gemini_text_content(&mut contents, "user", &message.content)
+            }
             MessageRole::User => push_gemini_text_content(&mut contents, "user", &message.content),
             MessageRole::Assistant => {
                 push_gemini_text_content(&mut contents, "model", &message.content)

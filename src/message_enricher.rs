@@ -366,8 +366,7 @@ impl MessageEnricher {
             &placeholder_text,
             &described_text,
         )?;
-        info!(image_id, updated_messages, "后台图片描述已写回数据库");
-        debug!(image_id, description = %description, "后台图片描述内容");
+        info!(image_id, updated_messages, description = %description, "后台图片描述已写回数据库");
         Ok(())
     }
 
@@ -425,7 +424,6 @@ impl MessageEnricher {
         }
 
         let image_id = self.generate_image_id()?;
-        info!(image_id = %image_id, "图片处理成功");
         let local_path = match existing_path {
             Some(path) => path.to_string(),
             None => self.save_image_file(&image_id, mime_type, bytes).await?,
@@ -459,7 +457,6 @@ impl MessageEnricher {
             }
             return Err(err);
         }
-        info!(image_id = %image_id, "图片已入库");
         debug!(image_id = %image_id, path = %local_path, "图片本地文件");
 
         Ok(EnrichedImage {

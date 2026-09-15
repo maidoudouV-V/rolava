@@ -1,6 +1,6 @@
 use crate::scheduler::ScheduledTask;
 use crate::transport::message::{ConversationKind, IncomingMessage};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -1062,6 +1062,40 @@ impl QQChatContextManager {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(summaries)
+    }
+
+    /// 只生成原始消息窗口最早日期及之前的缺失摘要，每个会话共用一次窗口查询。
+    pub fn get_pending_window_daily_summaries(
+        &self,
+        closed_before_timestamp: i64,
+        group_max_history_messages: u32,
+        direct_max_history_messages: u32,
+    ) -> Result<Vec<PendingDailySummary>> {
+        let mut boundaries = std::collections::HashMap::new();
+        let mut pending = Vec::new();
+        for task in self.get_pending_daily_summaries(closed_before_timestamp)? {
+            if let std::collections::hash_map::Entry::Vacant(entry) = boundaries.entry(task.conversation_id) {
+                let conversation = self.get_conversation_by_id(task.conversation_id)?
+                    .context("摘要会话不存在")?;
+                let limit = match conversation.kind.as_str() {
+                    "group" => group_max_history_messages,
+                    "direct" => direct_max_history_messages,
+                    kind => anyhow::bail!("未知会话类型：{}", kind),
+                };
+                let window = self.get_conversation_history_window(
+                    &task.source, &task.source_conversation_id, limit,
+                )?;
+                let boundary = window.messages.first()
+                    .map(|message| crate::history_compression::summary_date_for_timestamp(message.event_timestamp))
+                    .transpose()?;
+                entry.insert(boundary);
+            }
+            if boundaries[&task.conversation_id].as_ref()
+                .is_some_and(|boundary| task.summary_date.as_str() <= boundary.as_str()) {
+                pending.push(task);
+            }
+        }
+        Ok(pending)
     }
 
     /// 读取一个会话统计日的全部消息，并按平台时间和数据库 ID 排序。
@@ -2158,7 +2192,6 @@ mod tests {
             "test",
             "conversation",
             10,
-            Local::now(),
             true,
             30,
         )
@@ -2326,6 +2359,41 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn summary_generation_follows_window_boundary() {
+        let path = temporary_db_path();
+        let manager = QQChatContextManager::new(path.to_str().unwrap()).unwrap();
+        let timestamp = |day| Local.with_ymd_and_hms(2026, 9, day, 12, 0, 0)
+            .single().unwrap().timestamp();
+        for day in 12..=14 {
+            manager.write_message_internal(&test_message(
+                &format!("message-{day}"), "正文", timestamp(day),
+            )).unwrap();
+        }
+        let tasks = manager.get_pending_window_daily_summaries(timestamp(15), 5, 1).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].summary_date, "2026-09-12");
+        manager.insert_conversation_daily_summary(&NewConversationDailySummary {
+            conversation_id: tasks[0].conversation_id,
+            summary_date: "2026-09-12",
+            period_start: 0, period_end: 86_400, summary_text: "摘要",
+            source_message_count: 1, source_first_message_id: 1, source_last_message_id: 1,
+        }).unwrap();
+        for day in 15..=16 {
+            manager.write_message_internal(&test_message(
+                &format!("message-{day}"), "正文", timestamp(day),
+            )).unwrap();
+        }
+        assert!(manager.get_pending_window_daily_summaries(timestamp(17), 5, 1).unwrap().is_empty());
+        manager.write_message_internal(&test_message("message-17", "正文", timestamp(17))).unwrap();
+        let tasks = manager.get_pending_window_daily_summaries(timestamp(18), 5, 1).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].summary_date, "2026-09-13");
+        assert!(manager.get_pending_window_daily_summaries(timestamp(12) - 43_200, 5, 1).unwrap().is_empty());
+        drop(manager);
+        fs::remove_file(path).unwrap();
+    }
+
     // 摘要一旦存在，即使后来补入同一统计日的消息也不会重新进入候选列表。
     #[test]
     fn existing_daily_summary_skips_late_messages() {
@@ -2434,30 +2502,26 @@ mod tests {
         );
         assert!(summaries.iter().all(|s| s.summary_text == "conversation"));
         // 共用入口还应排除原始消息窗口之后的摘要，且无消息时不显示摘要。
-        let now = Local
-            .with_ymd_and_hms(2026, 8, 31, 12, 0, 0)
-            .single()
-            .unwrap();
         let context = crate::chat_history::load_chat_history_context(
             &manager,
             "test",
             "conversation",
             10,
-            now,
             true,
             30,
         )
         .unwrap();
         assert_eq!(context.window.messages.len(), 1);
-        assert_eq!(context.summaries, summaries[..1]);
+        assert_eq!(context.summaries.len(), 2);
+        assert_eq!(context.summaries[0].summary_date, "2026-07-31");
+        assert_eq!(context.summaries[1].summary_date, "2026-08-01");
         let wider = crate::chat_history::load_chat_history_context(
             &manager,
             "test",
             "conversation",
             10,
-            now,
             true,
-            31,
+            16,
         )
         .unwrap();
         assert_eq!(wider.summaries.len(), 2);
@@ -2466,14 +2530,13 @@ mod tests {
             "test",
             "conversation",
             10,
-            now,
             true,
-            7,
+            15,
         )
         .unwrap();
-        assert!(narrower.summaries.is_empty());
+        assert_eq!(narrower.summaries, summaries[..1]);
         let empty = crate::chat_history::load_chat_history_context(
-            &manager, "test", "missing", 10, now, true, 30,
+            &manager, "test", "missing", 10, true, 30,
         )
         .unwrap();
         assert!(empty.window.messages.is_empty() && empty.summaries.is_empty());
@@ -2482,7 +2545,6 @@ mod tests {
             "test",
             "conversation",
             10,
-            now,
             false,
             30,
         )

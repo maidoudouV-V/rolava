@@ -900,7 +900,6 @@ async fn conversation_messages(
         } else {
             state.direct_context_history_limit
         },
-        Local::now(),
         state.context_summary_enabled,
         state.context_summary_days,
     )?;
