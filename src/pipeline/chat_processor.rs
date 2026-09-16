@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use super::filter::FilteredMessage;
 
-const MAX_TOOL_ROUNDS: usize = 8;
+const TOOL_ROUND_REMINDER_THRESHOLD: usize = 8;
 
 /// 为单个会话构造上下文、请求 AI 并处理响应。
 pub struct ChatProcessor {
@@ -255,7 +255,7 @@ impl ChatProcessor {
         let mut tool_round_message_ids = Vec::new();
         let mut conversation_effect = ConversationEffect::None;
 
-        for tool_round in 0..=MAX_TOOL_ROUNDS {
+        for tool_round in 0.. {
             let ai_span = info_span!(
                 "ai_request",
                 round = tool_round + 1,
@@ -312,28 +312,6 @@ impl ChatProcessor {
             }
 
             tool_round_message_ids.extend(emitted_message_ids);
-
-            if tool_round == MAX_TOOL_ROUNDS {
-                warn!(
-                    max_tool_rounds = MAX_TOOL_ROUNDS,
-                    "连续工具调用达到上限，停止继续请求 AI"
-                );
-                let tool_results = tool_calls
-                    .iter()
-                    .map(|tool_call| ToolChatMessage::Tool {
-                        tool_call_id: tool_call.id.clone(),
-                        content: format!(
-                            "工具 {} 未执行：连续工具调用已达到最大轮数",
-                            tool_call.name
-                        ),
-                    })
-                    .collect();
-                match ToolRoundHistory::new(assistant_message, tool_results) {
-                    Ok(round) => tool_round_history.push(round),
-                    Err(error) => error!(error = %format!("{error:#}"), "保存内存工具轮次失败"),
-                }
-                break;
-            }
 
             let mut tool_results = Vec::new();
             for tool_call in tool_calls {
@@ -433,6 +411,15 @@ impl ChatProcessor {
 
             request_messages.push(assistant_message);
             request_messages.extend(tool_result_messages);
+            if tool_round + 1 == TOOL_ROUND_REMINDER_THRESHOLD {
+                warn!(
+                    tool_rounds = TOOL_ROUND_REMINDER_THRESHOLD,
+                    "连续工具调用次数较多，已追加最终答复提示"
+                );
+                request_messages.push(ToolChatMessage::System {
+                    content: "系统提示：当前工具调用次数过多，请尽快回复最终答案".to_string(),
+                });
+            }
         }
 
         if !displayed_expired_group_memory_ids.is_empty() {

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,6 +105,8 @@ impl HistoryCompressionService {
             pending: tasks.len(),
             ..CompressionStats::default()
         };
+        let memory_enabled = ToolRegistry::is_enabled(&self.app_config.app.enabled_actions, "memory");
+        let mut review_batches: BTreeMap<i64, (PendingDailySummary, String)> = BTreeMap::new();
 
         // 每个统计日独立失败，不能让一条超长记录阻塞其它会话的补偿任务。
         for task in tasks {
@@ -114,8 +117,18 @@ impl HistoryCompressionService {
                 "开始压缩会话当日聊天记录"
             );
             match self.compress_task(&task).await {
-                Ok(true) => stats.inserted += 1,
-                Ok(false) => {}
+                Ok(Some(summary)) => {
+                    stats.inserted += 1;
+                    if memory_enabled {
+                        let (_, summaries) = review_batches.entry(task.conversation_id)
+                            .or_insert_with(|| (task.clone(), String::new()));
+                        if !summaries.is_empty() {
+                            summaries.push_str("\n\n");
+                        }
+                        summaries.push_str(&format!("### {}\n{}", task.summary_date, summary));
+                    }
+                }
+                Ok(None) => {}
                 Err(error) => {
                     stats.failed += 1;
                     warn!(
@@ -128,15 +141,22 @@ impl HistoryCompressionService {
                 }
             }
         }
+        // 每个会话本批成功保存的摘要合并为一次整理任务。
+        for (_, (task, summaries)) in review_batches {
+            if let Err(error) = self.trigger_memory_review(&task, &summaries) {
+                warn!(error = %format!("{error:#}"), conversation_id = %task.source_conversation_id,
+                    "本批摘要已保存，但记忆整理任务投递失败");
+            }
+        }
         Ok(stats)
     }
 
-    async fn compress_task(&self, task: &PendingDailySummary) -> Result<bool> {
+    async fn compress_task(&self, task: &PendingDailySummary) -> Result<Option<String>> {
         let messages = self
             .db_manager
             .get_daily_summary_source_messages(task.conversation_id, &task.summary_date)?;
         if messages.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let (period_start, period_end) = summary_period(&task.summary_date)?;
         let previous_date = period_start
@@ -184,12 +204,7 @@ impl HistoryCompressionService {
                     source_first_message_id,
                     source_last_message_id,
                 })?;
-        if inserted && ToolRegistry::is_enabled(&self.app_config.app.enabled_actions, "memory") {
-            if let Err(error) = self.trigger_memory_review(task, &summary_text) {
-                warn!(error = %format!("{error:#}"), summary_date = %task.summary_date, "摘要已保存，但记忆整理任务投递失败");
-            }
-        }
-        Ok(inserted)
+        Ok(inserted.then_some(summary_text))
     }
 
     fn trigger_memory_review(&self, task: &PendingDailySummary, summary: &str) -> Result<()> {
@@ -205,10 +220,7 @@ impl HistoryCompressionService {
         };
         let user_prompt = crate::config::render_prompt_template(
             &self.app_config.prompt_config.memory_review_prompt,
-            &[
-                ("summary_date", &task.summary_date),
-                ("daily_summary", summary),
-            ],
+            &[("daily_summaries", summary)],
         );
         self.trigger_tx
             .send(RoutedConversationTrigger {
