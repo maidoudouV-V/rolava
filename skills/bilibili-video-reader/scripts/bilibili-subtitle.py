@@ -20,6 +20,7 @@ MAX_SUBTITLE_CHARS = 12_000
 SUBTITLE_EDGE_CHARS = 6_000
 YTDLP_TIMEOUT_SECONDS = 25
 MAX_PROCESS_OUTPUT_CHARS = 1_000_000
+MAX_YTDLP_ERROR_CHARS = 100
 BVID_PATTERN = re.compile(r"^BV[0-9A-Za-z]{10}$")
 SUBTITLE_EXTENSIONS = {"srt", "vtt", "json", "ass", "txt"}
 
@@ -222,18 +223,48 @@ def run_ytdlp(
 
 
 def looks_like_login_error(output: object) -> bool:
-    return bool(re.search(r"login|logged in|cookie|account|登录|账号", str(output or ""), re.I))
+    return bool(
+        re.search(
+            r"login (?:is )?required|please (?:log|sign) in|sign in to confirm|"
+            r"only available (?:for|to) (?:registered|logged-in) users|"
+            r"cookies? (?:are|is) (?:no longer valid|invalid|expired)|"
+            r"需要登录|请先登录|登录后(?:才能|可)",
+            str(output or ""),
+            re.I,
+        )
+    )
+
+
+def extract_ytdlp_error(output: object) -> str:
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(output or ""))
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    error_lines = []
+    for line in lines:
+        match = re.search(r"(?:^|\s)ERROR:\s*(.+)", line, re.I)
+        if match:
+            error_lines.append(match.group(1).strip())
+    reason = error_lines[-1] if error_lines else (lines[-1] if lines else "读取B站字幕失败")
+    reason = re.sub(
+        r"(?:[A-Za-z]:)?[^\s\"']*bilibili-subtitle-[^\s\"']*",
+        "[临时文件]",
+        reason,
+        flags=re.I,
+    )
+    if len(reason) > MAX_YTDLP_ERROR_CHARS:
+        reason = reason[: MAX_YTDLP_ERROR_CHARS - 3] + "..."
+    return reason
 
 
 def map_ytdlp_failure(result: Mapping[str, object]) -> None:
     if result.get("timed_out"):
         raise SkillError("TIMEOUT", "读取B站字幕超时")
     output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
-    if looks_like_login_error(output):
-        raise SkillError("LOGIN_REQUIRED", "BILIBILI_COOKIE 已失效或当前账号无权读取该视频字幕")
+    reason = extract_ytdlp_error(output)
     if re.search(r"unsupported url|invalid url", output, re.I):
-        raise SkillError("INVALID_INPUT", "B站视频链接无效或暂不支持")
-    raise SkillError("UPSTREAM_ERROR", "读取B站字幕失败")
+        raise SkillError("INVALID_INPUT", reason)
+    if looks_like_login_error(output):
+        raise SkillError("LOGIN_REQUIRED", reason)
+    raise SkillError("UPSTREAM_ERROR", reason)
 
 
 def clean_cue_text(value: object) -> str:
@@ -392,10 +423,7 @@ def read_subtitle(
         if not subtitle_files:
             output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
             if looks_like_login_error(output):
-                raise SkillError(
-                    "LOGIN_REQUIRED",
-                    "BILIBILI_COOKIE 已失效或当前账号无权读取该视频字幕",
-                )
+                raise SkillError("LOGIN_REQUIRED", extract_ytdlp_error(output))
             raise SkillError("NO_SUBTITLE", "该视频没有可读取的字幕")
 
         selected = subtitle_files[0]

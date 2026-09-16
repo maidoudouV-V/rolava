@@ -28,4 +28,4 @@ python scripts/bilibili-subtitle.py --url="https://www.bilibili.com/video/BV..."
 - 用户要求读取、总结或分析B站视频时调用字幕脚本。
 - 只根据成功取得的字幕回答，不把标题、简介、评论或弹幕当作视频正文。
 - `truncated=true` 表示只取得字幕首尾，不得声称已经完整阅读或总结整个视频。
-- `LOGIN_REQUIRED` 时提示更新 `BILIBILI_COOKIE`；`NO_SUBTITLE` 时说明视频没有可读取字幕。
+- 并非每个视频都有字幕；`NO_SUBTITLE` 时如实说明，`LOGIN_REQUIRED` 时提示更新 `BILIBILI_COOKIE`。
