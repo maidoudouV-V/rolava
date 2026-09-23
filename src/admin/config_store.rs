@@ -448,6 +448,9 @@ fn apply_models(document: &mut DocumentMut, models: &[ModelConfig]) {
         }
         table["reasoning_effort"] = value(model.reasoning_effort.trim());
         table["vision"] = value(model.vision.as_str());
+        if !model.extra_body.trim().is_empty() {
+            table["extra_body"] = value(model.extra_body.trim());
+        }
         tables.push(table);
     }
     document["models"] = Item::ArrayOfTables(tables);

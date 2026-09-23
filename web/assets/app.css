@@ -204,3 +204,12 @@ label { display: grid; gap: 6px; color: #44524e; font-size: 12px; font-weight: 6
   .hero-copy { align-items: flex-start; }.pulse-orbit { width: 50px; height: 50px; flex-basis: 50px; }.hero-copy h2 { font-size: 19px; }
   .conversation-row { grid-template-columns: 34px minmax(0,1fr) auto; }.detail-header { padding: 12px; }.detail-body { padding: 14px; }.chat-copy { max-width: 88%; }
 }
+.extra-fields-dialog { width: min(620px,calc(100% - 30px)); max-height: calc(100vh - 40px); overflow: hidden; }
+.extra-fields-body { max-height: calc(100vh - 200px); overflow-y: auto; padding: 18px; }
+.extra-fields-body > p { margin: 0 0 14px; color: var(--muted); font-size: 12px; }
+.extra-field-rows { display: grid; gap: 8px; }
+.extra-field-row { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr) 30px; align-items: center; gap: 8px; }
+.extra-field-row input { width: 100%; min-width: 0; }
+.extra-field-row button { display: grid; width: 30px; height: 30px; place-items: center; border: 0; color: var(--red); background: transparent; cursor: pointer; }
+.extra-field-row svg { width: 15px; }
+.extra-fields-body > button { margin-top: 12px; }

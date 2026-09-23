@@ -1,6 +1,6 @@
 use crate::ai_provider::{
-    AIProvider, ChatUsage, ReasoningPayload, ReasoningState, ToolChatContentPart, ToolChatMessage,
-    ToolChatResponse, ToolChatUserContent,
+    AIProvider, ChatUsage, ExtraBody, ReasoningPayload, ReasoningState, ToolChatContentPart,
+    ToolChatMessage, ToolChatResponse, ToolChatUserContent,
 };
 use crate::tools::{ToolCall, ToolDefinition};
 use anyhow::{anyhow, bail};
@@ -24,6 +24,7 @@ pub struct OpenRouterProvider {
     model: String,
     max_tokens: Option<i32>,
     reasoning_effort: String,
+    extra_body: ExtraBody,
 }
 
 impl OpenRouterProvider {
@@ -41,7 +42,17 @@ impl OpenRouterProvider {
             model: model.into(),
             max_tokens,
             reasoning_effort: reasoning_effort.into(),
+            extra_body: ExtraBody::default(),
         }
+    }
+
+    pub fn with_extra_body(mut self, extra_body: ExtraBody) -> Self {
+        self.extra_body = extra_body;
+        self
+    }
+
+    fn request_body(&self, body: impl Serialize) -> anyhow::Result<Value> {
+        self.extra_body.merge(body)
     }
 
     async fn send_chat_completions(
@@ -51,14 +62,14 @@ impl OpenRouterProvider {
         session_id: Option<&str>,
     ) -> anyhow::Result<ToolChatResponse> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = build_openrouter_chat_request(
+        let body = self.request_body(build_openrouter_chat_request(
             &self.model,
             self.max_tokens,
             &self.reasoning_effort,
             messages,
             tools,
             session_id,
-        );
+        ))?;
         trace!(
             provider = "openrouter",
             model = %self.model,
@@ -395,7 +406,7 @@ impl AIProvider for OpenRouterProvider {
 
     async fn describe_image(&self, image_data_url: &str, prompt: &str) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = OpenRouterVisionRequest {
+        let body = self.request_body(OpenRouterVisionRequest {
             model: &self.model,
             messages: vec![OpenRouterVisionMessage {
                 role: "user",
@@ -414,7 +425,7 @@ impl AIProvider for OpenRouterProvider {
                 effort: Some(VISION_REASONING_EFFORT),
                 summary: "auto",
             },
-        };
+        })?;
         debug!(
             provider = "openrouter",
             model = %self.model,

@@ -1,6 +1,36 @@
 import { api } from "./api.js";
 import { escapeHtml, lines, refreshIcons, toast } from "./ui.js";
 
+const JSON_NUMBER = /^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+
+export function parseExtraFields(text) {
+  if (!text?.trim()) return [];
+  const fields = JSON.parse(text);
+  if (!fields || Array.isArray(fields) || typeof fields !== "object") throw new Error("请求附加字段必须是 JSON 对象");
+  return Object.entries(fields).map(([key, value]) => {
+    if (typeof value !== "string" && typeof value !== "number") throw new Error(`附加字段 ${key} 的值只能是字符串或数字`);
+    return { key, value: String(value) };
+  });
+}
+
+export function serializeExtraFields(entries, modelName = "模型") {
+  const fields = Object.create(null);
+  for (const entry of entries) {
+    const key = entry.key.trim();
+    if (!key) throw new Error(`${modelName} 的附加字段名不能为空`);
+    if (Object.hasOwn(fields, key)) throw new Error(`${modelName} 的附加字段名重复：${key}`);
+    const value = entry.value.trim();
+    if (JSON_NUMBER.test(value)) {
+      const number = Number(value);
+      if (!Number.isFinite(number) || (Number.isInteger(number) && !Number.isSafeInteger(number))) throw new Error(`${modelName} 的附加字段 ${key} 数字超出精确范围`);
+      fields[key] = number;
+    } else {
+      fields[key] = entry.value;
+    }
+  }
+  return entries.length ? JSON.stringify(fields) : "";
+}
+
 export class ConfigController {
   constructor({ onRestart, onDirty }) {
     this.onRestart = onRestart;
@@ -9,6 +39,7 @@ export class ConfigController {
     this.catalog = [];
     this.visibleCatalog = [];
     this.catalogModelIndex = null;
+    this.extraFieldEditIndex = null;
     this.toolIcons = { agent_web_search: "globe-2", memory: "brain" };
     document.querySelectorAll(".config-page input,.config-page select,.config-page textarea").forEach(element => element.addEventListener("input", onDirty));
     document.getElementById("add-provider").addEventListener("click", () => this.addProvider());
@@ -26,6 +57,9 @@ export class ConfigController {
     document.getElementById("model-picker-query").addEventListener("input", () => this.renderModelCatalog());
     document.getElementById("model-picker-results").addEventListener("click", event => this.selectCatalogModel(event));
     document.getElementById("close-model-picker").addEventListener("click", () => document.getElementById("model-picker").close());
+    const extraDialog = document.getElementById("extra-fields-dialog");
+    extraDialog.addEventListener("click", event => this.handleExtraFieldAction(event));
+    extraDialog.addEventListener("close", () => { this.extraFieldEditIndex = null; });
   }
 
   async load() {
@@ -54,6 +88,7 @@ export class ConfigController {
     document.getElementById("direct-whitelist").value = app.direct_whitelist.join("\n");
     document.getElementById("group-whitelist").value = app.group_whitelist.join("\n");
     document.getElementById("command-whitelist").value = app.command_whitelist.join("\n");
+    this.extraFieldDrafts = this.data.models.map(model => parseExtraFields(model.extra_body));
     this.renderProviders();
     this.renderModels();
     this.renderAssignments();
@@ -86,6 +121,7 @@ export class ConfigController {
       <td><input data-field="max_tokens" type="number" min="1" value="${model.max_tokens ?? ""}" placeholder="默认"></td>
       <td><select data-field="reasoning_effort">${this.reasoningOptions(providerType, model.reasoning_effort)}</select></td>
       <td><select data-field="vision"><option value="disable" ${model.vision === "disable" ? "selected" : ""}>禁用</option><option value="enable" ${model.vision === "enable" ? "selected" : ""}>启用</option></select></td>
+      <td><button type="button" class="button small" data-edit-extra="${index}">设置${this.extraFieldDrafts[index].length ? `（${this.extraFieldDrafts[index].length}）` : ""}</button></td>
       <td class="row-actions"><button data-test-model="${index}" title="测试"><i data-lucide="flask-conical"></i></button><button data-remove-model="${index}" title="删除"><i data-lucide="trash-2"></i></button></td>
     </tr>`;
     }).join("");
@@ -130,7 +166,8 @@ export class ConfigController {
 
   addModel() {
     this.syncRows();
-    this.data.models.push({ name: `model-${this.data.models.length + 1}`, provider: this.data.providers[0]?.name || "", model: "", max_tokens: null, reasoning_effort: "auto", vision: "disable" });
+    this.data.models.push({ name: `model-${this.data.models.length + 1}`, provider: this.data.providers[0]?.name || "", model: "", max_tokens: null, reasoning_effort: "auto", vision: "disable", extra_body: "" });
+    this.extraFieldDrafts.push([]);
     this.renderModels(); this.renderAssignments(); this.onDirty();
   }
 
@@ -140,19 +177,84 @@ export class ConfigController {
   }
 
   async handleModelAction(event) {
+    const editExtra = event.target.closest("[data-edit-extra]");
+    if (editExtra) { this.openExtraFieldDialog(Number(editExtra.dataset.editExtra)); return; }
     const remove = event.target.closest("[data-remove-model]");
-    if (remove) { this.syncRows(); this.data.models.splice(Number(remove.dataset.removeModel), 1); this.renderModels(); this.renderAssignments(); this.onDirty(); return; }
+    if (remove) { this.syncRows(); const index = Number(remove.dataset.removeModel); this.data.models.splice(index, 1); this.extraFieldDrafts.splice(index, 1); this.renderModels(); this.renderAssignments(); this.onDirty(); return; }
     const test = event.target.closest("[data-test-model]");
     if (test) {
       this.syncRows();
-      const model = this.data.models[Number(test.dataset.testModel)];
+      const index = Number(test.dataset.testModel);
+      const model = this.data.models[index];
       const provider = this.data.providers.find(item => item.name === model.provider);
       if (!provider) return toast("模型引用的 Provider 不存在", true);
-      try { toast(`正在测试 ${model.name}`); await api.post("/test/model", { provider, model }); toast(`${model.name} 连接正常`); }
+      try { model.extra_body = serializeExtraFields(this.extraFieldDrafts[index], model.name); toast(`正在测试 ${model.name}`); await api.post("/test/model", { provider, model }); toast(`${model.name} 连接正常`); }
       catch (error) { toast(error.message, true); }
     }
     const picker = event.target.closest("[data-pick-model]");
     if (picker) await this.openModelPicker(Number(picker.dataset.pickModel));
+  }
+
+  openExtraFieldDialog(index) {
+    this.syncRows();
+    this.extraFieldEditIndex = index;
+    document.getElementById("extra-fields-model-name").textContent = this.data.models[index].name;
+    document.getElementById("extra-fields-error").hidden = true;
+    this.renderExtraFieldDialog(this.extraFieldDrafts[index]);
+    document.getElementById("extra-fields-dialog").showModal();
+  }
+
+  readExtraFieldDialog() {
+    return [...document.querySelectorAll("#extra-field-rows [data-extra-entry]")].map(entry => ({
+      key: entry.querySelector("[data-extra-key]").value,
+      value: entry.querySelector("[data-extra-value]").value,
+    }));
+  }
+
+  renderExtraFieldDialog(entries) {
+    document.getElementById("extra-field-rows").innerHTML = entries.map((entry, index) => `<div class="extra-field-row" data-extra-entry>
+      <input data-extra-key aria-label="字段名" value="${escapeHtml(entry.key)}" placeholder="字段名">
+      <input data-extra-value aria-label="值" value="${escapeHtml(entry.value)}" placeholder="值">
+      <button type="button" data-remove-extra="${index}" title="删除字段"><i data-lucide="x"></i></button>
+    </div>`).join("");
+    refreshIcons();
+  }
+
+  handleExtraFieldAction(event) {
+    const dialog = document.getElementById("extra-fields-dialog");
+    if (event.target.closest("[data-cancel-extra]")) { dialog.close(); return; }
+    const add = event.target.closest("[data-add-extra]");
+    if (add) {
+      const entries = this.readExtraFieldDialog();
+      entries.push({ key: "", value: "" });
+      this.renderExtraFieldDialog(entries);
+      document.querySelector("#extra-field-rows [data-extra-entry]:last-child [data-extra-key]").focus();
+      return;
+    }
+    const remove = event.target.closest("[data-remove-extra]");
+    if (remove) {
+      const entries = this.readExtraFieldDialog();
+      entries.splice(Number(remove.dataset.removeExtra), 1);
+      this.renderExtraFieldDialog(entries);
+      return;
+    }
+    if (event.target.closest("[data-confirm-extra]")) {
+      const index = this.extraFieldEditIndex;
+      if (index === null) return;
+      const entries = this.readExtraFieldDialog();
+      try {
+        const serialized = serializeExtraFields(entries, this.data.models[index].name);
+        this.extraFieldDrafts[index] = entries;
+        this.data.models[index].extra_body = serialized;
+        this.renderModels();
+        this.onDirty();
+        dialog.close();
+      } catch (error) {
+        const message = document.getElementById("extra-fields-error");
+        message.textContent = error.message;
+        message.hidden = false;
+      }
+    }
   }
 
   async openModelPicker(index) {
@@ -246,6 +348,7 @@ export class ConfigController {
 
   buildUpdate() {
     this.syncRows();
+    this.data.models.forEach((model, index) => { model.extra_body = serializeExtraFields(this.extraFieldDrafts[index], model.name); });
     const app = this.data.app;
     Object.assign(app, {
       chat_model_name: document.getElementById("chat-model").value,

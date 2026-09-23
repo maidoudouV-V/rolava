@@ -1,5 +1,5 @@
 use crate::ai_provider::{
-    context_messages_without_tools, AIProvider, ChatUsage, ContextMessage, MessageRole,
+    context_messages_without_tools, AIProvider, ChatUsage, ContextMessage, ExtraBody, MessageRole,
     ReasoningState, ToolChatMessage, ToolChatResponse,
 };
 use crate::tools::ToolDefinition;
@@ -21,6 +21,7 @@ pub struct GeminiProvider {
     model: String,
     max_tokens: Option<i32>,
     reasoning_effort: String,
+    extra_body: ExtraBody,
 }
 
 impl GeminiProvider {
@@ -44,7 +45,13 @@ impl GeminiProvider {
             model: model.into(),
             max_tokens,
             reasoning_effort: reasoning_effort.into(),
+            extra_body: ExtraBody::default(),
         }
+    }
+
+    pub fn with_extra_body(mut self, extra_body: ExtraBody) -> Self {
+        self.extra_body = extra_body;
+        self
     }
 
     fn generate_content_url(&self) -> String {
@@ -60,7 +67,7 @@ impl GeminiProvider {
             }
             body["generationConfig"]["thinkingConfig"] = thinking;
         }
-        Ok(body)
+        self.extra_body.merge(body)
     }
 }
 

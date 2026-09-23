@@ -6,7 +6,70 @@ use crate::tools::{ToolCall, ToolDefinition, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+/// 每个模型可配置的请求体附加字段，合并到 Provider 生成的 JSON 顶层。
+#[derive(Clone, Default)]
+pub struct ExtraBody(Map<String, Value>);
+
+impl ExtraBody {
+    pub fn parse(text: &str) -> Result<Self> {
+        if text.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        let Value::Object(fields) = serde_json::from_str(text)
+            .map_err(|error| anyhow::anyhow!("请求附加字段不是有效 JSON：{}", error))?
+        else {
+            anyhow::bail!("请求附加字段必须是 JSON 对象");
+        };
+        const PROTECTED: &[&str] = &[
+            "model",
+            "messages",
+            "input",
+            "contents",
+            "systemInstruction",
+            "generationConfig",
+            "tools",
+            "tool_choice",
+            "session_id",
+            "prompt_cache_key",
+            "store",
+            "include",
+            "web_search_options",
+            "stream",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "reasoning",
+            "reasoning_effort",
+            "response_format",
+        ];
+        if let Some(key) = fields.keys().find(|key| PROTECTED.contains(&key.as_str())) {
+            anyhow::bail!("请求附加字段不能覆盖程序管理的字段：{}", key);
+        }
+        if let Some((key, _)) = fields
+            .iter()
+            .find(|(_, value)| !value.is_string() && !value.is_number())
+        {
+            anyhow::bail!("请求附加字段 {} 的值只能是字符串或数字", key);
+        }
+        Ok(Self(fields))
+    }
+
+    pub fn merge(&self, body: impl Serialize) -> Result<Value> {
+        let mut body = serde_json::to_value(body)?;
+        let Some(fields) = body.as_object_mut() else {
+            anyhow::bail!("Provider 请求体必须是 JSON 对象");
+        };
+        for (key, value) in &self.0 {
+            if fields.contains_key(key) {
+                anyhow::bail!("请求附加字段不能覆盖程序生成的字段：{}", key);
+            }
+            fields.insert(key.clone(), value.clone());
+        }
+        Ok(body)
+    }
+}
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub enum MessageRole {

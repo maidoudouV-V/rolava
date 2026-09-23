@@ -1,6 +1,7 @@
 use crate::ai_provider::{
     gemini::GeminiProvider, openai_compatible::OpenAICompatibleProvider,
     openai_responses::OpenAIResponsesProvider, openrouter::OpenRouterProvider, AIProvider,
+    ExtraBody,
 };
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
@@ -285,6 +286,9 @@ pub struct ModelConfig {
     /// 是否启用模型的图像输入能力；未配置时默认禁用。
     #[serde(default)]
     pub vision: ModelFeatureState,
+    /// 请求体的额外字段，仅支持字符串或数字值；空值表示不添加。
+    #[serde(default)]
+    pub extra_body: String,
 }
 
 fn default_reasoning_effort() -> String {
@@ -428,35 +432,49 @@ impl AppConfig {
                             model_config.provider
                         )
                     })?;
+            let extra_body = ExtraBody::parse(&model_config.extra_body)
+                .with_context(|| format!("模型 {} 的请求附加字段无效", model_config.name))?;
             let model: Box<dyn AIProvider + Send + Sync> = match provider_config.r#type.as_str() {
-                "openai_compatible" => Box::new(OpenAICompatibleProvider::new(
-                    provider_config.key.clone(),
-                    provider_config.base_url.clone(),
-                    model_config.model.clone(),
-                    model_config.max_tokens,
-                    model_config.reasoning_effort.clone(),
-                )),
-                "openai_responses" => Box::new(OpenAIResponsesProvider::new(
-                    provider_config.key.clone(),
-                    provider_config.base_url.clone(),
-                    model_config.model.clone(),
-                    model_config.max_tokens,
-                    model_config.reasoning_effort.clone(),
-                )),
-                "openrouter" => Box::new(OpenRouterProvider::new(
-                    provider_config.key.clone(),
-                    provider_config.base_url.clone(),
-                    model_config.model.clone(),
-                    model_config.max_tokens,
-                    model_config.reasoning_effort.clone(),
-                )),
-                "gemini" => Box::new(GeminiProvider::new(
-                    provider_config.key.clone(),
-                    provider_config.base_url.clone(),
-                    model_config.model.clone(),
-                    model_config.max_tokens,
-                    model_config.reasoning_effort.clone(),
-                )),
+                "openai_compatible" => Box::new(
+                    OpenAICompatibleProvider::new(
+                        provider_config.key.clone(),
+                        provider_config.base_url.clone(),
+                        model_config.model.clone(),
+                        model_config.max_tokens,
+                        model_config.reasoning_effort.clone(),
+                    )
+                    .with_extra_body(extra_body),
+                ),
+                "openai_responses" => Box::new(
+                    OpenAIResponsesProvider::new(
+                        provider_config.key.clone(),
+                        provider_config.base_url.clone(),
+                        model_config.model.clone(),
+                        model_config.max_tokens,
+                        model_config.reasoning_effort.clone(),
+                    )
+                    .with_extra_body(extra_body),
+                ),
+                "openrouter" => Box::new(
+                    OpenRouterProvider::new(
+                        provider_config.key.clone(),
+                        provider_config.base_url.clone(),
+                        model_config.model.clone(),
+                        model_config.max_tokens,
+                        model_config.reasoning_effort.clone(),
+                    )
+                    .with_extra_body(extra_body),
+                ),
+                "gemini" => Box::new(
+                    GeminiProvider::new(
+                        provider_config.key.clone(),
+                        provider_config.base_url.clone(),
+                        model_config.model.clone(),
+                        model_config.max_tokens,
+                        model_config.reasoning_effort.clone(),
+                    )
+                    .with_extra_body(extra_body),
+                ),
                 _ => {
                     return Err(anyhow::anyhow!(
                         "不支持的服务商类型：{}",

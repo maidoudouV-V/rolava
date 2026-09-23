@@ -9,7 +9,7 @@ use super::skill_store::{
 use crate::ai_provider::{
     gemini::GeminiProvider, openai_compatible::OpenAICompatibleProvider,
     openai_responses::OpenAIResponsesProvider, openrouter::OpenRouterProvider, AIProvider,
-    ToolChatMessage, ToolChatUserContent,
+    ExtraBody, ToolChatMessage, ToolChatUserContent,
 };
 use crate::chat_history::load_chat_history_context;
 use crate::config::{validate_skill_environment, AppConfig, ModelConfig};
@@ -345,35 +345,49 @@ async fn test_model(
     Json(request): Json<TestModelRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let key = resolve_provider_key(&state, &request.provider);
+    let extra_body = ExtraBody::parse(&request.model.extra_body)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let provider: Box<dyn AIProvider + Send + Sync> = match request.provider.r#type.as_str() {
-        "openai_compatible" => Box::new(OpenAICompatibleProvider::new(
-            key,
-            request.provider.base_url,
-            request.model.model,
-            request.model.max_tokens,
-            request.model.reasoning_effort,
-        )),
-        "openai_responses" => Box::new(OpenAIResponsesProvider::new(
-            key,
-            request.provider.base_url,
-            request.model.model,
-            request.model.max_tokens,
-            request.model.reasoning_effort,
-        )),
-        "openrouter" => Box::new(OpenRouterProvider::new(
-            key,
-            request.provider.base_url,
-            request.model.model,
-            request.model.max_tokens,
-            request.model.reasoning_effort,
-        )),
-        "gemini" => Box::new(GeminiProvider::new(
-            key,
-            request.provider.base_url,
-            request.model.model,
-            request.model.max_tokens,
-            request.model.reasoning_effort,
-        )),
+        "openai_compatible" => Box::new(
+            OpenAICompatibleProvider::new(
+                key,
+                request.provider.base_url,
+                request.model.model,
+                request.model.max_tokens,
+                request.model.reasoning_effort,
+            )
+            .with_extra_body(extra_body),
+        ),
+        "openai_responses" => Box::new(
+            OpenAIResponsesProvider::new(
+                key,
+                request.provider.base_url,
+                request.model.model,
+                request.model.max_tokens,
+                request.model.reasoning_effort,
+            )
+            .with_extra_body(extra_body),
+        ),
+        "openrouter" => Box::new(
+            OpenRouterProvider::new(
+                key,
+                request.provider.base_url,
+                request.model.model,
+                request.model.max_tokens,
+                request.model.reasoning_effort,
+            )
+            .with_extra_body(extra_body),
+        ),
+        "gemini" => Box::new(
+            GeminiProvider::new(
+                key,
+                request.provider.base_url,
+                request.model.model,
+                request.model.max_tokens,
+                request.model.reasoning_effort,
+            )
+            .with_extra_body(extra_body),
+        ),
         _ => return Err(ApiError::bad_request("不支持的 Provider 类型")),
     };
     let response = tokio::time::timeout(

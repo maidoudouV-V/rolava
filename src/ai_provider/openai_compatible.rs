@@ -1,6 +1,6 @@
 use crate::ai_provider::{
-    AIProvider, ChatUsage, ReasoningPayload, ReasoningState, ToolChatContentPart, ToolChatMessage,
-    ToolChatResponse, ToolChatUserContent,
+    AIProvider, ChatUsage, ExtraBody, ReasoningPayload, ReasoningState, ToolChatContentPart,
+    ToolChatMessage, ToolChatResponse, ToolChatUserContent,
 };
 use crate::tools::{ToolCall, ToolDefinition};
 use anyhow::{anyhow, bail};
@@ -23,6 +23,7 @@ pub struct OpenAICompatibleProvider {
     model: String,
     max_tokens: Option<i32>,
     reasoning_effort: String,
+    extra_body: ExtraBody,
 }
 
 impl OpenAICompatibleProvider {
@@ -40,7 +41,13 @@ impl OpenAICompatibleProvider {
             model: model.into(),
             max_tokens,
             reasoning_effort: reasoning_effort.into(),
+            extra_body: ExtraBody::default(),
         }
+    }
+
+    pub fn with_extra_body(mut self, extra_body: ExtraBody) -> Self {
+        self.extra_body = extra_body;
+        self
     }
 }
 
@@ -324,13 +331,13 @@ impl AIProvider for OpenAICompatibleProvider {
         tools: &[ToolDefinition],
     ) -> anyhow::Result<ToolChatResponse> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = build_openai_compatible_request(
+        let body = self.extra_body.merge(build_openai_compatible_request(
             &self.model,
             self.max_tokens,
             &self.reasoning_effort,
             messages,
             tools,
-        );
+        ))?;
         trace!(
             provider = "openai_compatible",
             model = %self.model,
@@ -364,7 +371,7 @@ impl AIProvider for OpenAICompatibleProvider {
 
     async fn describe_image(&self, image_data_url: &str, prompt: &str) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = OpenAICompatibleVisionRequest {
+        let body = self.extra_body.merge(OpenAICompatibleVisionRequest {
             model: &self.model,
             messages: vec![OpenAICompatibleVisionMessage {
                 role: "user",
@@ -380,7 +387,7 @@ impl AIProvider for OpenAICompatibleProvider {
             }],
             max_tokens: self.max_tokens,
             reasoning_effort: VISION_REASONING_EFFORT,
-        };
+        })?;
         debug!(
             provider = "openai_compatible",
             model = %self.model,
@@ -421,7 +428,7 @@ impl AIProvider for OpenAICompatibleProvider {
 
     async fn web_search(&self, question: &str) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = OpenAICompatibleWebSearchRequest {
+        let body = self.extra_body.merge(OpenAICompatibleWebSearchRequest {
             model: &self.model,
             messages: vec![OpenAICompatibleToolMessage::User {
                 content: OpenAICompatibleUserContent::Text(question),
@@ -429,7 +436,7 @@ impl AIProvider for OpenAICompatibleProvider {
             web_search_options: OpenAICompatibleWebSearchOptions {
                 search_context_size: WEB_SEARCH_CONTEXT_SIZE,
             },
-        };
+        })?;
         trace!(
             provider = "openai_compatible",
             model = %self.model,

@@ -1,6 +1,6 @@
 use crate::ai_provider::{
-    AIProvider, ChatUsage, ReasoningPayload, ReasoningState, ToolChatContentPart, ToolChatMessage,
-    ToolChatResponse, ToolChatUserContent,
+    AIProvider, ChatUsage, ExtraBody, ReasoningPayload, ReasoningState, ToolChatContentPart,
+    ToolChatMessage, ToolChatResponse, ToolChatUserContent,
 };
 use crate::tools::{ToolCall, ToolDefinition};
 use anyhow::{anyhow, bail, Context};
@@ -21,6 +21,7 @@ pub struct OpenAIResponsesProvider {
     model: String,
     max_tokens: Option<i32>,
     reasoning_effort: String,
+    extra_body: ExtraBody,
 }
 
 impl OpenAIResponsesProvider {
@@ -44,7 +45,13 @@ impl OpenAIResponsesProvider {
             model: model.into(),
             max_tokens,
             reasoning_effort: reasoning_effort.into(),
+            extra_body: ExtraBody::default(),
         }
+    }
+
+    pub fn with_extra_body(mut self, extra_body: ExtraBody) -> Self {
+        self.extra_body = extra_body;
+        self
     }
 
     async fn send_request(
@@ -52,10 +59,11 @@ impl OpenAIResponsesProvider {
         body: &OpenAIResponsesRequest<'_>,
         operation: &'static str,
     ) -> anyhow::Result<ToolChatResponse> {
+        let body = self.extra_body.merge(body)?;
         trace!(
             provider = "openai_responses",
             model = %self.model,
-            request = %serde_json::to_string_pretty(body)
+            request = %serde_json::to_string_pretty(&body)
                 .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
             "{}完整请求",
             operation
@@ -64,7 +72,7 @@ impl OpenAIResponsesProvider {
             .http_client
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(&self.api_key)
-            .json(body)
+            .json(&body)
             .send()
             .await?;
         let status = response.status();
