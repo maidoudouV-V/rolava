@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"设置群聊后续关注状态，两种状态都会结束本轮处理，可以同时输出聊天正文。
+const DESCRIPTION: &str = r#"结束此次响应，并设置群聊后续关注状态，可以同时输出聊天正文。
 state 为 continue 时，后续群消息继续直接交给你处理；为 end 时，后续群消息先经过筛选，只有需要你处理时才交给你。
 应在必要操作完成后调用，不与其他工具一起调用。"#;
 
