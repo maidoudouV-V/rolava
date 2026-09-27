@@ -218,8 +218,8 @@ export function normalizeSubtitleUrl(value) {
     )).join('');
     if (!plain.startsWith(prefix)) continue;
     const path = plain.slice(prefix.length);
-    if (!path.startsWith('/bfs/subtitle/')
-      || path.length === '/bfs/subtitle/'.length
+    if (!path.startsWith('/bfs/')
+      || path.length === '/bfs/'.length
       || /[\u0000-\u001f\u007f]/.test(path)
       || /[?#\\]/.test(path)
       || path.split('/').some(segment => segment === '.' || segment === '..')) {
