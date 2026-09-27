@@ -55,8 +55,8 @@ pub struct RunScriptArgs {
 struct RunScriptResult {
     success: bool,
     exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
+    stdout: Value,
+    stderr: Value,
 }
 
 pub struct RunScriptTool;
@@ -133,10 +133,18 @@ impl Tool for RunScriptTool {
         let result = RunScriptResult {
             success: output.status.success(),
             exit_code: output.status.code(),
-            stdout: crate::text_utils::truncate_long_text(&String::from_utf8_lossy(&output.stdout)),
-            stderr: crate::text_utils::truncate_long_text(&String::from_utf8_lossy(&output.stderr)),
+            stdout: process_output(&output.stdout),
+            stderr: process_output(&output.stderr),
         };
         Ok(ToolOutput::text(serde_json::to_string(&result)?))
+    }
+}
+
+fn process_output(bytes: &[u8]) -> Value {
+    let text = crate::text_utils::truncate_long_text(&String::from_utf8_lossy(bytes));
+    match serde_json::from_str::<Value>(text.trim()) {
+        Ok(value @ (Value::Object(_) | Value::Array(_))) => value,
+        _ => Value::String(text),
     }
 }
 

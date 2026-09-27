@@ -9,6 +9,10 @@ import {
 } from './core.mjs';
 
 const BV_PATTERN = /^BV[0-9A-Za-z]{10}$/i;
+const MODIFIED_Z_THRESHOLD = 3.5;
+const SECONDARY_MODIFIED_Z_THRESHOLD = 2.8;
+const GAP_RATIO_THRESHOLD = 3;
+const MAD_EPSILON = 1e-9;
 const SUBTITLE_URL_ENCODINGS = [
   {
     prefix: 'nP](wOFRvU.+<fjS{jn-!$D|Dz&",zT`',
@@ -230,11 +234,149 @@ export function normalizeSubtitleUrl(value) {
   throw new Error('暂不支持此B站字幕地址编码，请更新程序后重试');
 }
 
-export function toPlainText(body) {
+function subtitleTime(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
+}
+
+function subtitleCues(body) {
   return (Array.isArray(body) ? body : [])
-    .map(item => String(item?.content ?? '').trim())
-    .filter(Boolean)
-    .join('\n');
+    .map(item => {
+      const content = String(item?.content ?? '').replace(/\s+/g, ' ').trim();
+      const from = subtitleTime(item?.from);
+      const rawTo = subtitleTime(item?.to);
+      const to = from === null || rawTo === null ? (rawTo ?? from) : Math.max(from, rawTo);
+      return { content, from, to };
+    })
+    .filter(cue => cue.content);
+}
+
+function median(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle];
+}
+
+function naturalGapAnchors(cues) {
+  const gaps = [];
+  const durations = [];
+  let previousEnd = null;
+
+  for (let index = 0; index < cues.length; index += 1) {
+    const cue = cues[index];
+    if (cue.from === null) continue;
+    if (cue.to !== null && cue.to > cue.from) durations.push(cue.to - cue.from);
+    if (previousEnd !== null) {
+      gaps.push({ index, seconds: Math.max(0, cue.from - previousEnd) });
+    }
+    previousEnd = Math.max(previousEnd ?? cue.from, cue.to ?? cue.from);
+  }
+
+  if (gaps.length === 0) return new Set();
+  const values = gaps.map(gap => gap.seconds);
+  const positiveValues = values.filter(value => value > MAD_EPSILON);
+  const typicalGap = median(positiveValues) ?? 0;
+  const typicalDuration = median(durations) ?? 0;
+  const logValues = positiveValues.map(value => Math.log1p(value));
+  const logCenter = median(logValues) ?? 0;
+  const logMad = median(logValues.map(value => Math.abs(value - logCenter))) ?? 0;
+  const meaningfulGap = Math.max(
+    typicalGap * GAP_RATIO_THRESHOLD,
+    typicalDuration / 2,
+  );
+  const scoredGaps = logMad > MAD_EPSILON
+    ? gaps.map(gap => ({
+        ...gap,
+        score: 0.6744897501960817 * (Math.log1p(gap.seconds) - logCenter) / logMad,
+      }))
+    : [];
+  let threshold = null;
+
+  for (const gap of scoredGaps) {
+    if (gap.seconds >= meaningfulGap && gap.score >= MODIFIED_Z_THRESHOLD) {
+      threshold = Math.min(threshold ?? gap.seconds, gap.seconds);
+    }
+  }
+
+  if (threshold === null) {
+    const sorted = [...new Set(values)].sort((left, right) => left - right);
+    for (let index = 1; index < sorted.length; index += 1) {
+      const lower = sorted[index - 1];
+      const upper = sorted[index];
+      const separated = lower <= MAD_EPSILON
+        ? upper > MAD_EPSILON
+        : upper / lower >= GAP_RATIO_THRESHOLD;
+      if (separated && upper >= typicalDuration / 2) {
+        threshold = upper;
+        break;
+      }
+    }
+  }
+
+  if (threshold !== null) {
+    for (const gap of scoredGaps) {
+      if (gap.seconds >= meaningfulGap && gap.score >= SECONDARY_MODIFIED_Z_THRESHOLD) {
+        threshold = Math.min(threshold, gap.seconds);
+      }
+    }
+  }
+
+  return new Set(
+    threshold === null
+      ? []
+      : gaps.filter(gap => gap.seconds >= threshold).map(gap => gap.index),
+  );
+}
+
+function minuteAnchors(cues) {
+  const timedCues = cues
+    .map((cue, index) => ({ index, seconds: cue.from }))
+    .filter(cue => cue.seconds !== null);
+  if (timedCues.length === 0) return new Set();
+
+  const anchors = new Set([timedCues[0].index, timedCues.at(-1).index]);
+  const finalTime = timedCues.at(-1).seconds;
+  let cueIndex = 0;
+  for (let minute = 60; minute < finalTime; minute += 60) {
+    while (cueIndex < timedCues.length && timedCues[cueIndex].seconds < minute) {
+      cueIndex += 1;
+    }
+    if (cueIndex < timedCues.length) anchors.add(timedCues[cueIndex].index);
+  }
+  return anchors;
+}
+
+function formatTimestamp(seconds) {
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor(totalSeconds % 3600 / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`
+    : `${minutes}:${String(remainingSeconds).padStart(2, '0')}`;
+}
+
+export function toTimedText(body) {
+  const cues = subtitleCues(body);
+  if (cues.length === 0) return '';
+  let anchors = naturalGapAnchors(cues);
+  if (anchors.size > 0) {
+    if (cues[0].from !== null) anchors.add(0);
+    if (cues.at(-1).from !== null) anchors.add(cues.length - 1);
+  } else {
+    anchors = minuteAnchors(cues);
+  }
+  return cues
+    .map((cue, index) => (
+      anchors.has(index) && cue.from !== null
+        ? `[${formatTimestamp(cue.from)}] ${cue.content}`
+        : cue.content
+    ))
+    .join(' ');
 }
 
 export function isExpiredSubtitleUrl(error) {

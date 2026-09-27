@@ -6,7 +6,7 @@ import {
   getSubtitleTracks,
   downloadSubtitleJson,
   chooseTrack,
-  toPlainText,
+  toTimedText,
   isExpiredSubtitleUrl,
 } from './lib/bilibili.mjs';
 import { jsonOut, fail } from './lib/core.mjs';
@@ -39,7 +39,7 @@ function truncateSubtitle(text) {
     return { subtitle: text, total_chars: characters.length, truncated: false };
   }
   return {
-    subtitle: `${characters.slice(0, EDGE_CHARS).join('')}\n\n[字幕中间部分已截断]\n\n${characters.slice(-EDGE_CHARS).join('')}`,
+    subtitle: `${characters.slice(0, EDGE_CHARS).join('')} [字幕中间部分已截断] ${characters.slice(-EDGE_CHARS).join('')}`,
     total_chars: characters.length,
     truncated: true,
   };
@@ -67,7 +67,7 @@ try {
     subtitle = await downloadSubtitleJson(track.url);
   }
 
-  const text = toPlainText(subtitle?.body);
+  const text = toTimedText(subtitle?.body);
   if (!text) throw new Error('B站字幕文件没有可用正文');
   jsonOut({
     title: info.title,
