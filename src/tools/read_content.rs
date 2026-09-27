@@ -67,6 +67,12 @@ impl Tool for ReadContentTool {
         if !allowed.iter().any(|root| target_path.starts_with(root)) {
             anyhow::bail!("没有权限读取该路径：{}", arguments.path.trim());
         }
+        if target_path
+            .strip_prefix(&project_root)
+            .is_ok_and(is_skill_runtime_data_path)
+        {
+            anyhow::bail!("没有权限读取 Skill 运行数据");
+        }
 
         let metadata = tokio::fs::metadata(&target_path)
             .await
@@ -157,7 +163,19 @@ fn validate_relative_path(raw_path: &str) -> Result<PathBuf> {
     {
         anyhow::bail!("没有权限读取该路径");
     }
+    if is_skill_runtime_data_path(path) {
+        anyhow::bail!("没有权限读取 Skill 运行数据");
+    }
     Ok(path.to_path_buf())
+}
+
+fn is_skill_runtime_data_path(path: &Path) -> bool {
+    path.components().nth(2).is_some_and(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("data"))
+    })
 }
 
 async fn allowed_roots(project_root: &Path) -> Result<Vec<PathBuf>> {

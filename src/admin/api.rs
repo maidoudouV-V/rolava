@@ -12,7 +12,9 @@ use crate::ai_provider::{
     ExtraBody, ToolChatMessage, ToolChatUserContent,
 };
 use crate::chat_history::load_chat_history_context;
-use crate::config::{validate_skill_environment, AppConfig, ModelConfig};
+use crate::config::{
+    validate_skill_environment_groups, AppConfig, ModelConfig, SkillEnvironmentGroups,
+};
 use crate::history_compression::render_summary_date_heading;
 use crate::memory::{GroupMemorySession, UserMemoryService, MAX_RETENTION_DAYS, SECONDS_PER_DAY};
 use crate::repository::db_manager::{ConversationRecord, QQChatContextManager};
@@ -33,7 +35,7 @@ use chrono::{Local, Timelike, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,6 +117,10 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/prompts/{prompt_id}", get(get_prompt).put(put_prompt))
         .route("/skills", get(admin_skills))
         .route("/skills/settings", put(put_skill_settings))
+        .route(
+            "/skills/bilibili-subtitle/credentials",
+            get(poll_bilibili_credentials).post(start_bilibili_credentials),
+        )
         .route("/skills/{skill_name}/files", get(skill_files))
         .route(
             "/skills/{skill_name}/file",
@@ -657,9 +663,13 @@ async fn admin_skills(State(state): State<Arc<AdminState>>) -> Result<Json<Value
     }
     let items = tokio::task::spawn_blocking(move || list_skills(&root, &normalized)).await??;
     let environment = app_config
-        .skill_environment
-        .keys()
-        .map(|name| json!({ "name": name, "configured": true }))
+        .skill_environment_groups
+        .iter()
+        .flat_map(|(skill, variables)| {
+            variables.iter().map(move |(name, value)| {
+                json!({ "skill": skill, "name": name, "configured": !value.is_empty() })
+            })
+        })
         .collect::<Vec<_>>();
     Ok(Json(json!({ "items": items, "environment": environment })))
 }
@@ -672,6 +682,7 @@ struct SkillSettingsUpdate {
 
 #[derive(Deserialize)]
 struct SkillEnvironmentUpdate {
+    skill: String,
     name: String,
     #[serde(default)]
     value: Option<String>,
@@ -682,10 +693,12 @@ async fn put_skill_settings(
     Json(update): Json<SkillSettingsUpdate>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let app_config = state.app_config();
-    let mut environment = BTreeMap::new();
+    let mut environment = SkillEnvironmentGroups::new();
+    let mut names = HashSet::new();
     for variable in update.environment {
+        let skill = variable.skill.trim().to_string();
         let name = variable.name.trim().to_string();
-        if environment.contains_key(&name) {
+        if !names.insert(name.clone()) {
             return Err(ApiError::bad_request(format!(
                 "Skill 环境变量名称重复：{}",
                 name
@@ -695,11 +708,17 @@ async fn put_skill_settings(
         let value = variable
             .value
             .filter(|value| !value.is_empty())
-            .or_else(|| app_config.skill_environment.get(&name).cloned())
+            .or_else(|| {
+                app_config
+                    .skill_environment_groups
+                    .get(&skill)
+                    .and_then(|variables| variables.get(&name))
+                    .cloned()
+            })
             .ok_or_else(|| ApiError::bad_request(format!("请填写环境变量 {} 的值", name)))?;
-        environment.insert(name, value);
+        environment.entry(skill).or_default().insert(name, value);
     }
-    validate_skill_environment(&environment)
+    validate_skill_environment_groups(&environment)
         .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
 
     let root = PathBuf::from(crate::skills::DIRECTORY_NAME);
@@ -718,6 +737,14 @@ async fn put_skill_settings(
         StatusCode::ACCEPTED,
         Json(json!({ "enabled": enabled, "restarting": true })),
     ))
+}
+
+async fn start_bilibili_credentials() -> Result<Json<Value>, ApiError> {
+    Ok(Json(super::bilibili_auth::run_login_action("start").await?))
+}
+
+async fn poll_bilibili_credentials() -> Result<Json<Value>, ApiError> {
+    Ok(Json(super::bilibili_auth::run_login_action("poll").await?))
 }
 
 async fn skill_files(Path(skill_name): Path<String>) -> Result<Json<Value>, ApiError> {

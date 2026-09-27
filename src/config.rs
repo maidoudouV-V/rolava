@@ -31,9 +31,9 @@ struct TomlConfig {
     /// 管理后台认证配置。
     #[serde(default)]
     admin: AdminSection,
-    /// 传递给 Skill 子进程的环境变量；值不会通过管理 API 回显。
+    /// 按 Skill 分组、传递给 Skill 子进程的环境变量；值不会通过管理 API 回显。
     #[serde(default)]
-    skill_environment: BTreeMap<String, String>,
+    skill_environment: SkillEnvironmentGroups,
 }
 
 fn parse_toml_config(text: &str) -> Result<TomlConfig> {
@@ -344,6 +344,7 @@ pub struct AppConfig {
     pub admin: AdminSection,
     /// worker 启动时注入、由 Skill 子进程继承的环境变量。
     pub skill_environment: BTreeMap<String, String>,
+    pub skill_environment_groups: SkillEnvironmentGroups,
     /// QQ 经典表情 ID 到名称的映射。
     pub face_id_map: HashMap<String, String>,
 }
@@ -364,7 +365,7 @@ impl AppConfig {
             models,
             logging,
             admin,
-            skill_environment,
+            skill_environment: skill_environment_groups,
         } = parse_toml_config(&toml_str).with_context(|| {
             format!(
                 "解析主配置文件失败：{}",
@@ -378,7 +379,12 @@ impl AppConfig {
         if app.startup_history_fetch_count > 999 {
             anyhow::bail!("每群启动历史消息数不能超过 999");
         }
-        validate_skill_environment(&skill_environment)?;
+        validate_skill_environment_groups(&skill_environment_groups)?;
+        let skill_environment = skill_environment_groups
+            .values()
+            .flat_map(|variables| variables.iter())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
 
         // 定时任务现为固定能力，忽略旧配置中的开关项。
         app.enabled_actions
@@ -559,6 +565,7 @@ impl AppConfig {
             logging,
             admin,
             skill_environment,
+            skill_environment_groups,
             face_id_map,
         })
     }
@@ -618,6 +625,31 @@ pub(crate) fn validate_skill_environment(environment: &BTreeMap<String, String>)
         }
     }
     Ok(())
+}
+
+pub type SkillEnvironmentGroups = BTreeMap<String, BTreeMap<String, String>>;
+
+pub(crate) fn validate_skill_environment_groups(groups: &SkillEnvironmentGroups) -> Result<()> {
+    let mut flattened = BTreeMap::new();
+    for (skill, variables) in groups {
+        if skill.is_empty()
+            || skill.len() > 64
+            || !skill.bytes().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || character == b'-'
+                    || character == b'_'
+            })
+        {
+            anyhow::bail!("Skill 环境变量分组名称无效：{}", skill);
+        }
+        for (name, value) in variables {
+            if flattened.insert(name.clone(), value.clone()).is_some() {
+                anyhow::bail!("Skill 环境变量名称不能跨分组重复：{}", name);
+            }
+        }
+    }
+    validate_skill_environment(&flattened)
 }
 
 pub struct PromptConfig {

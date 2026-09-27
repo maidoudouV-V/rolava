@@ -1,0 +1,3 @@
+data/
+skills/*/data/
+**/node_modules/

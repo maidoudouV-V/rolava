@@ -1,10 +1,9 @@
-use crate::config::{AppConfig, ModelConfig};
+use crate::config::{AppConfig, ModelConfig, SkillEnvironmentGroups};
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -182,7 +181,7 @@ pub fn write_enabled_skills(config_path: &Path, enabled_skills: &[String]) -> Re
 pub fn write_skill_settings(
     config_path: &Path,
     enabled_skills: &[String],
-    environment: &BTreeMap<String, String>,
+    environment: &SkillEnvironmentGroups,
 ) -> Result<AppConfig> {
     let source = fs::read_to_string(config_path)
         .with_context(|| format!("读取配置失败：{}", config_path.display()))?;
@@ -192,8 +191,12 @@ pub fn write_skill_settings(
     document["app"]["enabled_skills"] = Item::Value(strings_array(enabled_skills).into());
 
     let mut environment_table = Table::new();
-    for (name, environment_value) in environment {
-        environment_table[name] = value(environment_value);
+    for (skill, variables) in environment {
+        let mut skill_table = Table::new();
+        for (name, environment_value) in variables {
+            skill_table[name] = value(environment_value);
+        }
+        environment_table[skill] = Item::Table(skill_table);
     }
     document["skill_environment"] = Item::Table(environment_table);
 

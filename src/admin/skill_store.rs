@@ -19,6 +19,8 @@ pub struct AdminSkillSummary {
     pub description: String,
     pub entry_path: String,
     pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,6 +42,7 @@ pub fn list_skills(root: &Path, enabled_names: &[String]) -> Result<Vec<AdminSki
             description: entry.metadata.description.clone(),
             entry_path: entry.virtual_path.clone(),
             enabled: enabled_names.contains(entry.metadata.name.as_str()),
+            credential: (entry.metadata.name == "bilibili-subtitle").then_some("bilibili_qrcode"),
         })
         .collect())
 }
@@ -138,6 +141,12 @@ fn resolve_existing_file(entry: &SkillEntry, relative_path: &str) -> Result<Path
     if !path.starts_with(&root) {
         anyhow::bail!("文件路径超出当前 Skill 目录");
     }
+    if path
+        .strip_prefix(&root)
+        .is_ok_and(is_skill_runtime_data_path)
+    {
+        anyhow::bail!("不允许访问 Skill 运行数据");
+    }
     if !fs::metadata(&path)?.is_file() {
         anyhow::bail!("目标路径不是文件");
     }
@@ -156,7 +165,19 @@ fn validate_relative_file_path(raw_path: &str) -> Result<PathBuf> {
     {
         anyhow::bail!("文件路径不能包含根目录、盘符或路径跳转");
     }
+    if is_skill_runtime_data_path(path) {
+        anyhow::bail!("不允许访问 Skill 运行数据");
+    }
     Ok(path.to_path_buf())
+}
+
+fn is_skill_runtime_data_path(path: &Path) -> bool {
+    path.components().next().is_some_and(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("data"))
+    })
 }
 
 fn scan_files(
@@ -178,7 +199,12 @@ fn scan_files(
         let path = entry.path();
         if file_type.is_dir() {
             let name = entry.file_name();
-            if name == "node_modules" || name == ".git" {
+            let ignored = name.to_str().is_some_and(|name| {
+                name.eq_ignore_ascii_case("node_modules")
+                    || name.eq_ignore_ascii_case(".git")
+                    || name.eq_ignore_ascii_case("data")
+            });
+            if ignored {
                 continue;
             }
             scan_files(root, &path, depth + 1, output)?;

@@ -1,0 +1,13 @@
+{
+  "name": "rolava-skill-bilibili-subtitle",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "protobufjs": "8.8.0",
+    "qrcode": "1.5.4"
+  }
+}

@@ -26,9 +26,7 @@ SUBTITLE_EXTENSIONS = {"srt", "vtt", "json", "ass", "txt"}
 
 
 class SkillError(Exception):
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
+    pass
 
 
 def parse_args(arguments: Sequence[str]) -> dict[str, str]:
@@ -36,13 +34,13 @@ def parse_args(arguments: Sequence[str]) -> dict[str, str]:
     values: dict[str, str] = {}
     for argument in arguments:
         if not argument.startswith("--") or "=" not in argument:
-            raise SkillError("INVALID_INPUT", "参数必须使用 --name=value 格式")
+            raise SkillError("参数必须使用 --name=value 格式")
         name, value = argument[2:].split("=", 1)
         if name not in allowed or not value:
-            raise SkillError("INVALID_INPUT", f"不支持或缺少参数值：--{name}")
+            raise SkillError(f"不支持或缺少参数值：--{name}")
         values[name] = value
     if "url" not in values:
-        raise SkillError("INVALID_INPUT", "缺少 --url")
+        raise SkillError("缺少 --url")
     return values
 
 
@@ -51,14 +49,14 @@ def parse_part(value: object | None) -> int | None:
         return None
     text = str(value)
     if not re.fullmatch(r"[1-9]\d{0,3}", text):
-        raise SkillError("INVALID_INPUT", "part 必须是 1-9999 的整数")
+        raise SkillError("part 必须是 1-9999 的整数")
     return int(text)
 
 
 def normalize_video_input(raw_value: object, explicit_part: object | None = None) -> dict[str, object]:
     raw = str(raw_value or "").strip()
     if not raw or len(raw) > 2048:
-        raise SkillError("INVALID_INPUT", "B站视频链接或 BV 号无效")
+        raise SkillError("B站视频链接或 BV 号无效")
 
     part = parse_part(explicit_part)
     if BVID_PATTERN.fullmatch(raw):
@@ -72,7 +70,7 @@ def normalize_video_input(raw_value: object, explicit_part: object | None = None
         parsed = urlsplit(raw)
         port = parsed.port
     except ValueError as error:
-        raise SkillError("INVALID_INPUT", "B站视频链接或 BV 号无效") from error
+        raise SkillError("B站视频链接或 BV 号无效") from error
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.hostname
@@ -80,19 +78,19 @@ def normalize_video_input(raw_value: object, explicit_part: object | None = None
         or parsed.password
         or port is not None
     ):
-        raise SkillError("INVALID_INPUT", "仅支持标准的B站视频链接")
+        raise SkillError("仅支持标准的B站视频链接")
 
     hostname = parsed.hostname.lower()
     is_bilibili = hostname == "bilibili.com" or hostname.endswith(".bilibili.com")
     is_short_link = hostname == "b23.tv" or hostname.endswith(".b23.tv")
     if not is_bilibili and not is_short_link:
-        raise SkillError("INVALID_INPUT", "仅支持 bilibili.com、b23.tv 或 BV 号")
+        raise SkillError("仅支持 bilibili.com、b23.tv 或 BV 号")
 
     bvid: str | None = None
     if is_bilibili:
         match = re.search(r"/video/(BV[0-9A-Za-z]{10})(?:/|$)", parsed.path)
         if not match:
-            raise SkillError("INVALID_INPUT", "仅支持B站普通视频链接")
+            raise SkillError("仅支持B站普通视频链接")
         bvid = match.group(1)
         if part is None:
             query_part = parse_qs(parsed.query).get("p")
@@ -101,7 +99,7 @@ def normalize_video_input(raw_value: object, explicit_part: object | None = None
         normalized_url = f"https://www.bilibili.com/video/{bvid}"
     else:
         if not parsed.path or parsed.path == "/":
-            raise SkillError("INVALID_INPUT", "b23.tv 短链接无效")
+            raise SkillError("b23.tv 短链接无效")
         normalized_url = urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, ""))
 
     return {"url": normalized_url, "bvid": bvid, "part": part or 1}
@@ -117,19 +115,19 @@ def resolve_short_link(video: Mapping[str, object], explicit_part: object | None
         final_url = error.geturl()
         error.close()
     except (URLError, OSError) as error:
-        raise SkillError("UPSTREAM_ERROR", "无法解析 b23.tv 短链接") from error
+        raise SkillError(str(error)) from error
     resolved = normalize_video_input(final_url, explicit_part)
     if not resolved["bvid"]:
-        raise SkillError("INVALID_INPUT", "b23.tv 短链接未指向普通视频")
+        raise SkillError("b23.tv 短链接未指向普通视频")
     return resolved
 
 
 def cookie_header_to_netscape(raw_value: object | None) -> str:
     raw = raw_value.strip() if isinstance(raw_value, str) else ""
     if not raw:
-        raise SkillError("MISSING_COOKIE", "缺少 BILIBILI_COOKIE 环境变量")
+        raise SkillError("缺少 BILIBILI_COOKIE 环境变量")
     if re.search(r"[\r\n\t]", raw):
-        raise SkillError("LOGIN_REQUIRED", "BILIBILI_COOKIE 格式无效，请更新登录 Cookie")
+        raise SkillError("BILIBILI_COOKIE 格式无效，请更新登录 Cookie")
 
     cookies: dict[str, str] = {}
     for item in raw.split(";"):
@@ -137,16 +135,16 @@ def cookie_header_to_netscape(raw_value: object | None) -> str:
         if not pair:
             continue
         if "=" not in pair:
-            raise SkillError("LOGIN_REQUIRED", "BILIBILI_COOKIE 格式无效，请更新登录 Cookie")
+            raise SkillError("BILIBILI_COOKIE 格式无效，请更新登录 Cookie")
         name, value = pair.split("=", 1)
         name = name.strip()
         value = value.strip()
         if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
-            raise SkillError("LOGIN_REQUIRED", "BILIBILI_COOKIE 格式无效，请更新登录 Cookie")
+            raise SkillError("BILIBILI_COOKIE 格式无效，请更新登录 Cookie")
         cookies[name] = value
 
     if not cookies.get("SESSDATA"):
-        raise SkillError("LOGIN_REQUIRED", "BILIBILI_COOKIE 不包含有效的B站登录状态")
+        raise SkillError("BILIBILI_COOKIE 不包含 SESSDATA")
 
     lines = ["# Netscape HTTP Cookie File"]
     lines.extend(
@@ -213,7 +211,7 @@ def run_ytdlp(
             "timed_out": True,
         }
     except OSError as error:
-        raise SkillError("UPSTREAM_ERROR", "无法启动 yt-dlp") from error
+        raise SkillError(str(error)) from error
     return {
         "returncode": result.returncode,
         "stdout": result.stdout[:MAX_PROCESS_OUTPUT_CHARS],
@@ -222,28 +220,10 @@ def run_ytdlp(
     }
 
 
-def looks_like_login_error(output: object) -> bool:
-    return bool(
-        re.search(
-            r"login (?:is )?required|please (?:log|sign) in|sign in to confirm|"
-            r"only available (?:for|to) (?:registered|logged-in) users|"
-            r"cookies? (?:are|is) (?:no longer valid|invalid|expired)|"
-            r"需要登录|请先登录|登录后(?:才能|可)",
-            str(output or ""),
-            re.I,
-        )
-    )
-
-
-def extract_ytdlp_error(output: object) -> str:
+def compact_error_text(output: object, fallback: str) -> str:
     text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(output or ""))
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
-    error_lines = []
-    for line in lines:
-        match = re.search(r"(?:^|\s)ERROR:\s*(.+)", line, re.I)
-        if match:
-            error_lines.append(match.group(1).strip())
-    reason = error_lines[-1] if error_lines else (lines[-1] if lines else "读取B站字幕失败")
+    reason = " ".join(lines) if lines else fallback
     reason = re.sub(
         r"(?:[A-Za-z]:)?[^\s\"']*bilibili-subtitle-[^\s\"']*",
         "[临时文件]",
@@ -251,20 +231,14 @@ def extract_ytdlp_error(output: object) -> str:
         flags=re.I,
     )
     if len(reason) > MAX_YTDLP_ERROR_CHARS:
-        reason = reason[: MAX_YTDLP_ERROR_CHARS - 3] + "..."
+        reason = "..." + reason[-(MAX_YTDLP_ERROR_CHARS - 3) :]
     return reason
 
 
 def map_ytdlp_failure(result: Mapping[str, object]) -> None:
-    if result.get("timed_out"):
-        raise SkillError("TIMEOUT", "读取B站字幕超时")
     output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
-    reason = extract_ytdlp_error(output)
-    if re.search(r"unsupported url|invalid url", output, re.I):
-        raise SkillError("INVALID_INPUT", reason)
-    if looks_like_login_error(output):
-        raise SkillError("LOGIN_REQUIRED", reason)
-    raise SkillError("UPSTREAM_ERROR", reason)
+    fallback = "yt-dlp 执行超时" if result.get("timed_out") else "yt-dlp 未返回错误信息"
+    raise SkillError(compact_error_text(output, fallback))
 
 
 def clean_cue_text(value: object) -> str:
@@ -317,7 +291,7 @@ def json_subtitle_to_text(raw_value: object) -> str:
     try:
         data = json.loads(str(raw_value))
     except (TypeError, json.JSONDecodeError) as error:
-        raise SkillError("UPSTREAM_ERROR", "字幕文件格式无效") from error
+        raise SkillError(str(error)) from error
     body = data.get("body", []) if isinstance(data, dict) else []
     if not isinstance(body, list):
         body = []
@@ -422,16 +396,14 @@ def read_subtitle(
         )
         if not subtitle_files:
             output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
-            if looks_like_login_error(output):
-                raise SkillError("LOGIN_REQUIRED", extract_ytdlp_error(output))
-            raise SkillError("NO_SUBTITLE", "该视频没有可读取的字幕")
+            raise SkillError(compact_error_text(output, "yt-dlp 未生成字幕文件"))
 
         selected = subtitle_files[0]
         extension = selected.suffix.lower().lstrip(".")
         raw_subtitle = selected.read_text(encoding="utf-8-sig", errors="replace")
         text = subtitle_to_text(extension, raw_subtitle)
         if not text:
-            raise SkillError("NO_SUBTITLE", "该视频字幕内容为空")
+            raise SkillError("yt-dlp 返回了空字幕文件")
 
         info: dict[str, object] = {}
         info_file = next((file for file in files if file.name.endswith(".info.json")), None)
@@ -439,7 +411,7 @@ def read_subtitle(
             try:
                 loaded = json.loads(info_file.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as error:
-                raise SkillError("UPSTREAM_ERROR", "视频信息格式无效") from error
+                raise SkillError(str(error)) from error
             if isinstance(loaded, dict):
                 info = loaded
 
@@ -462,13 +434,21 @@ def main() -> int:
         return 0
     except SkillError as error:
         print(
-            json.dumps({"error": str(error), "code": error.code}, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(
+                {"error": compact_error_text(str(error), error.__class__.__name__)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
             file=sys.stderr,
         )
         return 1
-    except Exception:
+    except Exception as error:
         print(
-            json.dumps({"error": "读取B站字幕失败", "code": "UPSTREAM_ERROR"}, ensure_ascii=False),
+            json.dumps(
+                {"error": compact_error_text(str(error), error.__class__.__name__)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
             file=sys.stderr,
         )
         return 1

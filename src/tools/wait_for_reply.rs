@@ -14,9 +14,9 @@ use crate::conversation_trigger::ConversationTrigger;
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
-const DESCRIPTION: &str = r#"当需要等待对方回答或确认，并在对方迟迟未回复时继续处理，使用此工具。
-工具会创建后台等待任务并立即返回，你可以继续完成本轮处理，无需再次调用来检查等待结果。
-指定时间到期时，如果对方在当前会话中没有发送任何新消息，系统会再次唤起你，按 reason 中的说明继续处理；对方已发送消息则不触发本次超时处理。
+const DESCRIPTION: &str = r#"当需要等待对方发言时使用此工具。
+工具会创建后台等待任务并立即返回。
+指定时间到期时，如果对方在当前会话中没有发送任何新消息，系统会再次唤起你查看消息，按 reason 中的说明继续处理；对方发送消息后自动取消等待。
 同一会话中，对同一人的新等待任务会替换旧任务。"#;
 
 #[derive(Debug, Deserialize)]

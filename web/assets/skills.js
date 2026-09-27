@@ -13,6 +13,8 @@ export class SkillsController {
     this.enabledDirty = false;
     this.environmentDirty = false;
     this.fileDirty = false;
+    this.loginPollTimer = null;
+    this.loginGeneration = 0;
 
     document.getElementById("refresh-skills").addEventListener("click", () => this.refresh(true));
     document.getElementById("save-enabled-skills").addEventListener("click", () => this.saveEnabled());
@@ -25,6 +27,10 @@ export class SkillsController {
       const toggle = event.target.closest("[data-skill-toggle]");
       if (toggle) this.toggleSkill(toggle.dataset.skillToggle, toggle.checked);
     });
+    document.querySelectorAll("[data-bilibili-login-close]").forEach(button => {
+      button.addEventListener("click", () => document.getElementById("bilibili-login-dialog").close());
+    });
+    document.getElementById("bilibili-login-dialog").addEventListener("close", () => this.stopLoginPolling());
   }
 
   async load() {
@@ -39,7 +45,13 @@ export class SkillsController {
     try {
       const response = await api.get("/skills");
       this.items = response.items || [];
-      this.environmentItems = (response.environment || []).map(item => ({ name: item.name, value: "", existing: true }));
+      this.environmentItems = (response.environment || []).map(item => ({
+        skill: item.skill,
+        name: item.name,
+        value: "",
+        existing: true,
+        configured: Boolean(item.configured),
+      }));
       this.currentSkill = null;
       this.currentFile = null;
       this.originalContent = "";
@@ -97,6 +109,7 @@ export class SkillsController {
 
   async saveEnabled() {
     const environment = this.environmentItems.map(item => ({
+      skill: item.skill,
       name: item.name.trim(),
       value: item.value || null,
     }));
@@ -125,7 +138,8 @@ export class SkillsController {
   }
 
   addEnvironment() {
-    this.environmentItems.push({ name: "", value: "", existing: false });
+    if (!this.currentSkill) return;
+    this.environmentItems.push({ skill: this.currentSkill, name: "", value: "", existing: false, configured: false });
     this.environmentDirty = true;
     this.onDirty("Skill 设置尚未应用");
     this.updateSettingsButton();
@@ -134,16 +148,30 @@ export class SkillsController {
   }
 
   renderEnvironment() {
+    const section = document.getElementById("skill-environment");
     const container = document.getElementById("skill-environment-list");
-    if (!this.environmentItems.length) {
-      container.innerHTML = '<div class="empty"><i data-lucide="key-round"></i><strong>没有环境变量</strong></div>';
+    const addButton = document.getElementById("add-skill-environment");
+    if (!this.currentSkill) {
+      section.hidden = true;
+      addButton.disabled = true;
+      container.innerHTML = "";
+      return;
+    }
+    section.hidden = false;
+    addButton.disabled = false;
+    document.getElementById("skill-environment-skill").textContent = this.currentSkill;
+    const visibleItems = this.environmentItems
+      .map((item, index) => ({ item, index }))
+      .filter(({ item }) => item.skill === this.currentSkill);
+    if (!visibleItems.length) {
+      container.innerHTML = '<div class="empty"><i data-lucide="key-round"></i><strong>该 Skill 没有环境变量</strong></div>';
       refreshIcons();
       return;
     }
-    container.innerHTML = this.environmentItems.map((item, index) => `
+    container.innerHTML = visibleItems.map(({ item, index }) => `
       <div class="skill-environment-row">
         <label><span>变量名</span><input type="text" data-env-name="${index}" value="${escapeHtml(item.name)}" ${item.existing ? "readonly" : ""} autocomplete="off" placeholder="API_KEY"></label>
-        <label><span>变量值</span><input type="password" data-env-value="${index}" value="${escapeHtml(item.value)}" autocomplete="new-password" placeholder="${item.existing ? "已配置，留空保持不变" : "输入变量值"}"></label>
+        <label><span>变量值</span><input type="password" data-env-value="${index}" value="${escapeHtml(item.value)}" autocomplete="new-password" placeholder="${item.configured ? "已配置，留空保持不变" : "输入变量值"}"></label>
         <button class="icon-button danger" data-env-delete="${index}" title="删除变量" aria-label="删除变量"><i data-lucide="trash-2"></i></button>
       </div>`).join("");
     container.querySelectorAll("[data-env-name]").forEach(input => input.addEventListener("input", () => {
@@ -181,9 +209,10 @@ export class SkillsController {
     this.currentFile = null;
     this.fileDirty = false;
     this.renderList();
+    this.renderEnvironment();
     const detail = document.getElementById("skill-detail");
     detail.innerHTML = `
-      <header><div><h2>${escapeHtml(item.name)}</h2><p>${escapeHtml(item.description)}</p></div><span class="skill-state${item.enabled ? " enabled" : ""}">${item.enabled ? "已启用" : "未启用"}</span></header>
+      <header><div><h2>${escapeHtml(item.name)}</h2><p>${escapeHtml(item.description)}</p></div><div class="skill-detail-actions">${item.credential === "bilibili_qrcode" ? '<button class="button small" id="get-bilibili-credentials"><i data-lucide="scan-line"></i>获取登录凭据</button>' : ""}<span class="skill-state${item.enabled ? " enabled" : ""}">${item.enabled ? "已启用" : "未启用"}</span></div></header>
       <div class="skill-editor-layout">
         <aside class="skill-files"><strong>目录文件</strong><div id="skill-file-list"><div class="empty">正在读取</div></div></aside>
         <section class="skill-file-editor">
@@ -192,6 +221,7 @@ export class SkillsController {
         </section>
       </div>`;
     refreshIcons();
+    document.getElementById("get-bilibili-credentials")?.addEventListener("click", () => this.openBilibiliLogin());
     document.getElementById("save-skill-file").addEventListener("click", () => this.saveFile());
     document.getElementById("skill-file-content").addEventListener("input", event => {
       this.fileDirty = event.target.value !== this.originalContent;
@@ -252,6 +282,59 @@ export class SkillsController {
       button.disabled = false;
       toast(error.message, true);
     }
+  }
+
+  async openBilibiliLogin() {
+    const dialog = document.getElementById("bilibili-login-dialog");
+    const image = document.getElementById("bilibili-login-qr");
+    const status = document.getElementById("bilibili-login-status");
+    const generation = ++this.loginGeneration;
+    clearTimeout(this.loginPollTimer);
+    image.removeAttribute("src");
+    image.hidden = true;
+    status.textContent = "正在获取二维码";
+    dialog.showModal();
+    try {
+      const response = await api.post("/skills/bilibili-subtitle/credentials");
+      if (generation !== this.loginGeneration || !dialog.open) return;
+      image.src = response.qr_image;
+      image.hidden = false;
+      status.textContent = "请使用哔哩哔哩客户端扫码";
+      this.loginPollTimer = setTimeout(() => this.pollBilibiliLogin(generation), 1800);
+    } catch (error) {
+      if (generation === this.loginGeneration) status.textContent = error.message;
+    }
+  }
+
+  async pollBilibiliLogin(generation) {
+    const dialog = document.getElementById("bilibili-login-dialog");
+    if (generation !== this.loginGeneration || !dialog.open) return;
+    const status = document.getElementById("bilibili-login-status");
+    try {
+      const response = await api.get("/skills/bilibili-subtitle/credentials");
+      if (generation !== this.loginGeneration || !dialog.open) return;
+      if (response.status === "success") {
+        status.textContent = "登录凭据已保存";
+        toast("B站登录凭据已保存");
+        return;
+      }
+      if (response.status === "expired") {
+        status.textContent = response.message || "二维码已失效，请重新获取";
+        return;
+      }
+      status.textContent = response.status === "scanned"
+        ? "已扫码，请在客户端确认"
+        : "请使用哔哩哔哩客户端扫码";
+      this.loginPollTimer = setTimeout(() => this.pollBilibiliLogin(generation), 1800);
+    } catch (error) {
+      status.textContent = error.message;
+    }
+  }
+
+  stopLoginPolling() {
+    this.loginGeneration += 1;
+    clearTimeout(this.loginPollTimer);
+    this.loginPollTimer = null;
   }
 }
 

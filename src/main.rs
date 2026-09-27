@@ -252,6 +252,7 @@ async fn run_worker() -> Result<WorkerExit> {
     let mut scheduler_task = tokio::spawn(scheduler.run());
     let mut cleanup_task = tokio::spawn(resource_cleanup.run());
     let mut history_compression_task = tokio::spawn(history_compression.run());
+    let bilibili_auth_task = tokio::spawn(admin::maintain_bilibili_credentials(restart.clone()));
     info!(admin_url = "/admin", "服务启动完成");
 
     let outcome = tokio::select! {
@@ -285,6 +286,7 @@ async fn run_worker() -> Result<WorkerExit> {
     scheduler_task.abort();
     cleanup_task.abort();
     history_compression_task.abort();
+    bilibili_auth_task.abort();
     Ok(outcome)
 }
 
