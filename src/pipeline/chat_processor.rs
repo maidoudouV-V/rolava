@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::OnceCell;
-use tracing::{debug, error, info, info_span, trace, warn, Instrument};
+use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
 
 use crate::chat_history::{load_chat_history_context, render_history_message_line};
 use crate::conversation_context::{ActiveToolHistory, RuntimeContextState, ToolRoundHistory};
@@ -21,7 +21,7 @@ use crate::tools::{
     ToolResult, ToolServices,
 };
 use crate::transport::message::{
-    preferred_sender_name, ConversationKind, IncomingMessage, MessageTarget,
+    preferred_sender_name, readable_message_text, ConversationKind, IncomingMessage, MessageTarget,
 };
 use crate::transport::{GroupInfo, SendOptions};
 use sha2::{Digest, Sha256};
@@ -117,7 +117,28 @@ impl ChatProcessor {
             .into_iter()
             .map(|message| message.message)
             .collect::<Vec<_>>();
-        info!(message_count = incoming_messages.len(), "开始处理平台消息");
+        let messages = incoming_messages
+            .iter()
+            .map(|message| {
+                format!(
+                    "{}: {}",
+                    preferred_sender_name(
+                        &message.sender.display_name,
+                        message.sender.nickname.as_deref(),
+                    ),
+                    readable_message_text(
+                        &message.content.text,
+                        message
+                            .content
+                            .parts
+                            .iter()
+                            .map(|part| (part.kind.as_str(), &part.data)),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        info!(scene = %self.scene, messages = %messages, "开始处理平台消息");
         for incoming_message in &incoming_messages {
             debug!(
                 scene = %self.scene,
@@ -256,7 +277,7 @@ impl ChatProcessor {
         let mut conversation_effect = ConversationEffect::None;
 
         for tool_round in 0.. {
-            let ai_span = info_span!(
+            let ai_span = debug_span!(
                 "ai_request",
                 round = tool_round + 1,
                 message_count = request_messages.len(),
@@ -316,7 +337,7 @@ impl ChatProcessor {
             let mut tool_results = Vec::new();
             for tool_call in tool_calls {
                 let tool_arguments = tool_call.arguments.clone();
-                info!(
+                debug!(
                     tool_name = %tool_call.name,
                     tool_call_id = %tool_call.id,
                     "开始调用工具"
@@ -327,11 +348,7 @@ impl ChatProcessor {
                     arguments = %tool_arguments,
                     "工具调用参数"
                 );
-                let tool_span = info_span!(
-                    "tool_call",
-                    tool_name = %tool_call.name,
-                    tool_call_id = %tool_call.id
-                );
+                let tool_span = debug_span!("tool_call", tool_name = %tool_call.name);
                 let started_at = Instant::now();
                 let result = tools
                     .execute(&tool_context, tool_call)
@@ -351,8 +368,6 @@ impl ChatProcessor {
                 } else {
                     info!(
                         tool_name = %result.tool_name,
-                        tool_call_id = %result.tool_call_id,
-                        requires_ai_response = result.requires_ai_response,
                         elapsed_ms,
                         "工具调用完成"
                     );
@@ -506,7 +521,7 @@ impl ChatProcessor {
             let elapsed_ms = started_at.elapsed().as_millis() as u64;
             match chat_result {
                 Ok(resp) => {
-                    info!(
+                    debug!(
                         attempt,
                         elapsed_ms,
                         model = ?resp.model,

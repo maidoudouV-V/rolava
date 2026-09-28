@@ -84,6 +84,37 @@ pub fn preferred_sender_name<'a>(display_name: &'a str, nickname: Option<&'a str
         .unwrap_or_else(|| display_name.trim())
 }
 
+/// 日志中的富消息只展示图片描述和回复摘要，不展示本地图片路径或回复消息 ID。
+pub fn readable_message_text<'a>(
+    text: &str,
+    parts: impl IntoIterator<Item = (&'a str, &'a Value)>,
+) -> String {
+    let mut text = text.to_string();
+    for (kind, data) in parts {
+        let Some(context_text) = data.get("context_text").and_then(Value::as_str) else {
+            continue;
+        };
+        if kind == "image" {
+            let description = data
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let replacement = if description.is_empty() {
+                "[图片]".to_string()
+            } else {
+                format!("[图片：{description}]")
+            };
+            text = text.replace(context_text, &replacement);
+        } else if kind == "reply"
+            && (context_text.starts_with("[reply ID：") || context_text.contains("：ID "))
+        {
+            text = text.replace(context_text, "[回复消息]");
+        }
+    }
+    text
+}
+
 /// 标准化后的消息内容。
 #[derive(Debug, Clone)]
 pub struct MessageContent {

@@ -6,7 +6,9 @@ use crate::config::AppConfig;
 use crate::conversation_control::ConversationControl;
 use crate::message_ingestion::MessageIngestionService;
 use crate::repository::db_manager::{ChatMessage, QQChatContextManager};
-use crate::transport::message::{preferred_sender_name, ConversationKind, IncomingMessage};
+use crate::transport::message::{
+    preferred_sender_name, readable_message_text, ConversationKind, IncomingMessage,
+};
 
 const INITIAL_FILTER_CONTEXT_MESSAGES: u32 = 50;
 const MAX_FILTER_CONTEXT_MESSAGES: usize = 100;
@@ -119,12 +121,20 @@ impl ConversationFilter {
                     .and_then(Self::parse_filter_action)
                 {
                     Some(FilterAction::Reply) => {
-                        info!(filter_action = "reply", "AI 前置过滤完成");
+                        info!(
+                            result = "回复",
+                            messages = %Self::render_current_messages_log(&accepted_messages),
+                            "AI 前置过滤完成"
+                        );
                         self.conversation_control.set_ai_filter_bypassed(true);
                         accepted_messages
                     }
                     Some(FilterAction::Ignore) => {
-                        info!(filter_action = "ignore", "AI 前置过滤完成");
+                        info!(
+                            result = "忽略",
+                            messages = %Self::render_current_messages_log(&accepted_messages),
+                            "AI 前置过滤完成"
+                        );
                         Vec::new()
                     }
                     None => {
@@ -280,7 +290,15 @@ impl ConversationFilter {
                         &message.message.sender.display_name,
                         message.message.sender.nickname.as_deref(),
                     ),
-                    message.message.content.text
+                    readable_message_text(
+                        &message.message.content.text,
+                        message
+                            .message
+                            .content
+                            .parts
+                            .iter()
+                            .map(|part| (part.kind.as_str(), &part.data)),
+                    )
                 )
             })
             .collect::<Vec<_>>()

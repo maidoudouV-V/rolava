@@ -4,8 +4,8 @@ use crate::conversation_trigger::{ConversationTrigger, RoutedConversationTrigger
 use crate::repository::db_manager::{NewChatMessage, QQChatContextManager};
 use crate::runtime_state::{RuntimeGroupInfo, RuntimeState};
 use crate::transport::message::{
-    preferred_sender_name, Conversation, ConversationKind, IncomingMessage, MessageContent,
-    MessagePart, MessageTarget, Participant,
+    preferred_sender_name, readable_message_text, Conversation, ConversationKind, IncomingMessage,
+    MessageContent, MessagePart, MessageTarget, Participant,
 };
 use crate::transport::{GroupInfo, MessageSender, QqExpression, QqImage, SendOptions, SentMessage};
 use anyhow::{bail, Context, Result};
@@ -1206,11 +1206,20 @@ impl OneBotMessageSender {
             .db_manager
             .write_message(&outgoing_message)
             .context("消息已发送，但写入聊天记录失败")?;
-        info!(
+        let content = readable_message_text(
+            text,
+            content_parts
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|part| Some((part.get("kind")?.as_str()?, part.get("data")?))),
+        );
+        info!(content = %content, "OneBot 消息发送并入库成功");
+        debug!(
             conversation_kind,
             conversation_id = %target.conversation.id,
             message_id = stored_message.id,
-            "OneBot 消息发送并入库成功"
+            "OneBot 消息入库详情"
         );
 
         Ok(SentMessage {
@@ -1310,7 +1319,7 @@ impl OneBotMessageSender {
 
         if !persist {
             info!(
-                conversation_id = %target.conversation.id,
+                content = %text,
                 "OneBot 临时消息发送成功"
             );
             return Ok(None);
@@ -1995,9 +2004,14 @@ impl OneBotHttpServer {
         }) {
             error!(conversation_id, user_id, error = %error, "戳一戳触发会话失败");
         } else {
+            let sender = if display_name == format!("QQ {user_id}") {
+                "未知用户"
+            } else {
+                &display_name
+            };
             info!(
-                conversation_id,
-                user_id, "收到目标为机器人的戳一戳，已触发会话"
+                sender,
+                "收到目标为机器人的戳一戳，已触发会话"
             );
         }
     }

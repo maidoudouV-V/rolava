@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, info_span, Instrument};
+use tracing::{debug, error, info_span, Instrument};
 
 use crate::commands::CommandSystem;
 use crate::config::AppConfig;
@@ -153,11 +153,14 @@ impl ConversationDispatcher {
             &self.tool_services.app_config.app.enabled_actions,
             &target.conversation.kind,
         );
-        let actor_span = info_span!("conversation", conversation_key);
+        let actor_span = info_span!(
+            "conversation",
+            scene = Self::scene_name(&target.conversation.kind)
+        );
         tokio::spawn(actor.run().instrument(actor_span));
         self.actors
             .insert(conversation_key.to_string(), actor_tx.clone());
-        info!(conversation_key, "已创建会话 Actor");
+        debug!(conversation_key, "已创建会话 Actor");
         debug!(conversation_key, "会话 Actor 已加入分发表");
         actor_tx
     }

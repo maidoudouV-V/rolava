@@ -366,7 +366,8 @@ impl MessageEnricher {
             &placeholder_text,
             &described_text,
         )?;
-        info!(image_id, updated_messages, description = %description, "后台图片描述已写回数据库");
+        info!(description = %description, "后台图片描述已写回数据库");
+        debug!(image_id, updated_messages, "后台图片描述写回详情");
         Ok(())
     }
 
@@ -377,7 +378,7 @@ impl MessageEnricher {
             trace!(image_data = %image_data, "无法下载的图片消息原始数据");
             return Ok(None);
         };
-        info!("检测到图片消息，开始下载");
+        debug!("检测到图片消息，开始下载");
         trace!(image_url = %image_url, "图片完整下载地址");
 
         let downloaded_image = self.download_image(&image_url).await?;
@@ -565,7 +566,7 @@ impl MessageEnricher {
         mime_type: Option<&str>,
     ) -> Result<String> {
         let vision_image = Self::prepare_image_for_vision(bytes, mime_type)?;
-        info!(
+        debug!(
             model = %app_config.app.visual_model_name,
             image_size_kb = vision_image.bytes.len() / 1024,
             mime_type = %vision_image.mime_type,

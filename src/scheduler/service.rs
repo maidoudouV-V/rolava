@@ -192,7 +192,7 @@ impl SchedulerService {
             if let Err(error) = self.trigger_tx.send(route) {
                 error!(task_id = %task.id, error = %error, "定时任务投递到会话分发器失败");
             } else {
-                info!(task_id = %task.id, title = %task.title, "定时任务已触发");
+                info!(title = %task.title, "定时任务已触发");
             }
         }
         Ok(())

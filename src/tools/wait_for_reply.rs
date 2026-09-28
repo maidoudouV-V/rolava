@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, info_span, trace, Instrument};
+use tracing::{debug, error, info, info_span, trace, Instrument};
 
 use crate::config::render_prompt_template;
 use crate::conversation_trigger::ConversationTrigger;
@@ -144,10 +144,11 @@ impl Tool for WaitForReplyTool {
             .wait_for_reply_timeout_prompt
             .clone();
 
-        info!(target = %target, timeout_seconds, "已创建等待回复任务");
+        info!(timeout_seconds, "已创建等待回复任务");
+        debug!(target = %target, "等待回复目标");
         trace!(target = %target, reason = %reason, "等待回复完整原因");
 
-        let task_span = info_span!("wait_for_reply", target = %target, timeout_seconds);
+        let task_span = info_span!("wait_for_reply", timeout_seconds);
         tokio::spawn(
             async move {
                 sleep(Duration::from_secs(timeout_seconds)).await;
