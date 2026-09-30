@@ -457,6 +457,9 @@ impl AIProvider for OpenRouterProvider {
 
         let response_text = resp.text().await?;
         trace!(provider = "openrouter", response = %response_text, "视觉 Provider 原始响应");
+        let raw_response: Value = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow!("解析 OpenRouter 视觉响应失败：{}", e))?;
+        check_openrouter_response_error(&raw_response)?;
         let parsed: OpenRouterChatResponse = serde_json::from_str(&response_text)
             .map_err(|e| anyhow!("解析 OpenRouter 视觉响应失败：{}", e))?;
         parsed
@@ -467,9 +470,36 @@ impl AIProvider for OpenRouterProvider {
     }
 }
 
+fn check_openrouter_response_error(raw_response: &Value) -> anyhow::Result<()> {
+    let response_error = raw_response
+        .get("error")
+        .filter(|error| !error.is_null())
+        .or_else(|| {
+            raw_response
+                .get("choices")?
+                .as_array()?
+                .first()?
+                .get("error")
+                .filter(|error| !error.is_null())
+        });
+    if let Some(error) = response_error {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| error.to_string());
+        if let Some(code) = error.get("code") {
+            bail!("OpenRouter API 返回错误（错误码 {}）：{}", code, message);
+        }
+        bail!("OpenRouter API 返回错误：{}", message);
+    }
+    Ok(())
+}
+
 fn parse_openrouter_chat_response(response_text: &str) -> anyhow::Result<ToolChatResponse> {
     let raw_response: Value = serde_json::from_str(response_text)
         .map_err(|error| anyhow!("解析 OpenRouter 原始 JSON 失败：{}", error))?;
+    check_openrouter_response_error(&raw_response)?;
     let parsed: OpenRouterChatResponse = serde_json::from_str(response_text)
         .map_err(|error| anyhow!("解析 OpenRouter 响应失败：{}", error))?;
     let first_choice = parsed
