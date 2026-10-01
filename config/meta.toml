@@ -39,9 +39,6 @@ token = ""
 [skill_environment.amap-lbs-chat-skill]
 AMAP_WEBSERVICE_KEY = ""
 
-[skill_environment.bilibili-video-reader]
-BILIBILI_COOKIE = ""
-
 [skill_environment.image-generator]
 IMAGE_GENERATION_BASE_URL = ""
 IMAGE_GENERATION_MODEL_NAME = ""

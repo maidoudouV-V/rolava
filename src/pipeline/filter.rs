@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use crate::ai_provider::{ContextMessage, MessageRole, ToolChatMessage, ToolChatResponse};
+use crate::ai_provider::{
+    ContextMessage, MessageRole, ToolChatMessage, ToolChatResponse, ToolChatUserContent,
+};
 use crate::config::AppConfig;
 use crate::conversation_control::ConversationControl;
 use crate::message_ingestion::MessageIngestionService;
@@ -192,22 +194,68 @@ impl ConversationFilter {
         }
     }
 
-    /// 固定规则、当次读取的参考记忆和聊天缓存分开构造。
+    /// 在模板中填入参考记忆和聊天记录，判断指令位于资料之后。
     fn build_filter_messages(
         &self,
         latest_message: &IncomingMessage,
     ) -> anyhow::Result<Vec<ToolChatMessage>> {
-        let mut messages = Vec::with_capacity(self.filter_context.len() + 2);
-        messages.push(ToolChatMessage::System {
-            content: self.app_config.prompt_config.filter_prompt.clone(),
-        });
-        if crate::tools::ToolRegistry::is_enabled(&self.app_config.app.enabled_actions, "memory") {
-            messages.push(ToolChatMessage::System {
-                content: self.build_filter_memory(latest_message)?,
-            });
+        let reference_memory = if crate::tools::ToolRegistry::is_enabled(
+            &self.app_config.app.enabled_actions,
+            "memory",
+        ) {
+            self.build_filter_memory(latest_message)?
+        } else {
+            String::from("未启用记忆功能")
+        };
+        let reference_memory = Self::escape_filter_reference(&reference_memory);
+        let chat_history = self
+            .filter_context
+            .iter()
+            .map(|message| {
+                let speaker = match message.role {
+                    MessageRole::Assistant => "机器人",
+                    _ => "群成员",
+                };
+                format!(
+                    "<message speaker=\"{}\">{}</message>",
+                    speaker,
+                    Self::escape_filter_reference(&message.content)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 只解析模板中的占位符，参考资料中的同名文本保持原样。
+        let mut sections = self.app_config.prompt_config.filter_prompt.split("{{");
+        let mut prompt = sections.next().unwrap_or_default().to_string();
+        for section in sections {
+            if let Some(suffix) = section.strip_prefix("reference_memory}}") {
+                prompt.push_str(&reference_memory);
+                prompt.push_str(suffix);
+            } else if let Some(suffix) = section.strip_prefix("chat_history}}") {
+                prompt.push_str(&chat_history);
+                prompt.push_str(suffix);
+            } else {
+                prompt.push_str("{{");
+                prompt.push_str(section);
+            }
         }
-        messages.extend(self.filter_context.iter().map(ToolChatMessage::from));
-        Ok(messages)
+
+        Ok(vec![
+            ToolChatMessage::System { content: prompt },
+            ToolChatMessage::User {
+                content: ToolChatUserContent::text(
+                    "请判断上述聊天记录中的最新消息是否需要交给角色查看，只输出 reply 或 ignore。",
+                ),
+            },
+        ])
+    }
+
+    fn escape_filter_reference(content: &str) -> String {
+        content
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 
     /// 仅查询记忆，不参与主模型的到期清理和已展示标记。
