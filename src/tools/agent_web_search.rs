@@ -10,7 +10,7 @@ use crate::config::render_prompt_template;
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
 const DESCRIPTION: &str = r#"启动一个新的互联网 Agent 查询公开网络信息。
-输入你的问题，此工具会启用智能子 Agent 通过搜索引擎查询并回答你的问题。
+输入你的问题，此工具会启用智能子 Agent 通过搜索引擎查询并回答你的问题。此agent不会保存多轮上下文，每次调用提供完整问题信息。
 仅在用户明确要求联网，或问题本身依赖实时、外部网络信息时调用。
 "#;
 
