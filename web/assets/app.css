@@ -134,6 +134,16 @@ label { display: grid; gap: 6px; color: #44524e; font-size: 12px; font-weight: 6
 .toast-region { position: fixed; right: 18px; bottom: 18px; z-index: 120; display: grid; gap: 8px; }.toast { max-width: 360px; padding: 11px 14px; border: 1px solid var(--line); border-radius: 6px; background: #fff; box-shadow: var(--shadow); }.toast.error { border-color: #e5bbc0; color: var(--red); }
 .restart-screen { position: fixed; inset: 0; z-index: 150; display: grid; place-items: center; align-content: center; gap: 10px; background: rgba(244,248,247,.96); }.restart-screen h2, .restart-screen p { margin: 0; }.restart-screen p { color: var(--muted); }.spinner { width: 34px; height: 34px; border: 3px solid #cfe5dd; border-top-color: var(--green); border-radius: 50%; animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 
+.model-picker[open] { display: flex; flex-direction: column; }
+.model-picker > header, .model-picker-search, .model-picker-status, .model-picker-price-unit { flex-shrink: 0; }
+.model-picker-results { min-height: 0; max-height: 560px; flex: 1 1 auto; }
+.model-catalog-item { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 7px 14px; }
+.model-picker-price-unit { margin: 0; padding: 0 18px 10px; color: var(--faint); font-size: 11px; }
+.model-catalog-prices { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 8px; color: var(--muted); font-size: 11px; }
+.model-catalog-prices > span { display: flex; flex-wrap: wrap; gap: 3px 6px; align-items: baseline; }
+.model-catalog-prices b { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+@media (max-width: 480px) { .model-catalog-prices { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+
 .heading-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .skill-workspace { display: grid; min-height: 680px; grid-template-columns: 330px minmax(0,1fr); overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }
 .skill-panel { border-right: 1px solid var(--line); background: #fafcfb; }.skill-panel > header { display: flex; min-height: 58px; align-items: center; justify-content: space-between; padding: 12px 15px; border-bottom: 1px solid var(--line); }.skill-panel > header small { color: var(--faint); }.skill-list { max-height: 620px; overflow-y: auto; }

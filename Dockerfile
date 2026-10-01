@@ -30,6 +30,7 @@ COPY --from=builder /build/target/release/rolava /usr/local/bin/rolava
 COPY --from=builder /build/web /app/web
 COPY --from=builder /build/prompt /app/prompt
 COPY --from=builder /build/skills /app/skills
+COPY --from=builder /build/config/models.dev.json /app/config/models.dev.json
 
 RUN chmod +x /usr/local/bin/rolava
 

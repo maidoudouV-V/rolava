@@ -2,6 +2,13 @@ import { api } from "./api.js";
 import { escapeHtml, lines, refreshIcons, toast } from "./ui.js";
 
 const JSON_NUMBER = /^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+const MODEL_PRICE_FORMAT = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 8 });
+
+function formatModelPrice(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? `$${MODEL_PRICE_FORMAT.format(value)}`
+    : "未知";
+}
 
 export function parseExtraFields(text) {
   if (!text?.trim()) return [];
@@ -289,8 +296,9 @@ export class ConfigController {
     const status = document.getElementById("model-picker-status");
     status.textContent = filtered.length > 100 ? `找到 ${filtered.length} 个模型，仅渲染前 100 个，请继续输入筛选` : `找到 ${filtered.length} 个模型`;
     document.getElementById("model-picker-results").innerHTML = this.visibleCatalog.length ? this.visibleCatalog.map((item, index) => `<button class="model-catalog-item" data-catalog-index="${index}">
-      <span><strong>${escapeHtml(item.name)}</strong><code>${escapeHtml(item.id)}</code></span>
-      <small class="${item.vision === true ? "vision" : item.vision === false ? "text-only" : "unknown"}">${item.vision === true ? "支持图像" : item.vision === false ? "仅文本" : "能力未知"}</small>
+      <span class="model-catalog-summary"><strong>${escapeHtml(item.name)}</strong><code>${escapeHtml(item.id)}</code></span>
+      <small class="${item.vision === true ? "vision" : item.vision === false ? "text-only" : "unknown"}">${item.vision === true ? "支持图像" : item.vision === false ? "不支持图像" : "能力未知"}</small>
+      <span class="model-catalog-prices">${[["input", "输入"], ["output", "输出"], ["cache_read", "缓存读取"], ["cache_write", "缓存写入"]].map(([key, label]) => `<span><span>${label}</span><b>${formatModelPrice(item.pricing?.[key])}</b></span>`).join("")}</span>
     </button>`).join("") : '<div class="empty"><i data-lucide="search-x"></i><strong>没有匹配模型</strong><span>可以缩短关键词后重试</span></div>';
     refreshIcons();
   }

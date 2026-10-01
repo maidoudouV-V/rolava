@@ -34,7 +34,7 @@ onebot_token = ""
 level = "info"
 
 [admin]
-token = ""
+token = "kL5_HwCIEIydxiVRN0mN02ADTbmy9fIGzLvY_H6iA-w"
 
 [skill_environment.amap-lbs-chat-skill]
 AMAP_WEBSERVICE_KEY = ""

@@ -10,6 +10,7 @@ mod history_compression;
 mod memory;
 mod message_enricher;
 mod message_ingestion;
+mod model_metadata;
 mod pipeline;
 mod repository;
 mod resource_cleanup;
@@ -153,6 +154,22 @@ async fn run_worker() -> Result<WorkerExit> {
     init_tracing(app_config.logging.level.as_str(), admin_logs.clone());
 
     let restart = CancellationToken::new();
+    let metadata_path = config_path.with_file_name("models.dev.json");
+    let model_metadata = Arc::new(model_metadata::ModelMetadataStore::load_local(
+        &metadata_path,
+    ));
+    let metadata_store = model_metadata.clone();
+    let metadata_shutdown = restart.clone();
+    let model_metadata_task = tokio::spawn(async move {
+        tokio::select! {
+            _ = metadata_shutdown.cancelled() => {},
+            result = metadata_store.refresh(&metadata_path) => {
+                if let Err(error) = result {
+                    warn!(error = %format!("{error:#}"), "模型资料库在线更新失败");
+                }
+            }
+        }
+    });
     let runtime = Arc::new(RuntimeState::default());
     let (platform_tx, platform_rx) = mpsc::channel::<IncomingMessage>(MESSAGE_CHANNEL_CAPACITY);
     let (internal_trigger_tx, internal_trigger_rx) = mpsc::unbounded_channel();
@@ -193,6 +210,7 @@ async fn run_worker() -> Result<WorkerExit> {
         runtime.clone(),
         admin_logs,
         restart.clone(),
+        model_metadata,
     ));
     let admin_router = admin::router(admin_state);
 
@@ -287,6 +305,7 @@ async fn run_worker() -> Result<WorkerExit> {
     cleanup_task.abort();
     history_compression_task.abort();
     bilibili_auth_task.abort();
+    model_metadata_task.abort();
     Ok(outcome)
 }
 

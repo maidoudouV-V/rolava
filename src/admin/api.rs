@@ -17,6 +17,7 @@ use crate::config::{
 };
 use crate::history_compression::render_summary_date_heading;
 use crate::memory::{GroupMemorySession, UserMemoryService, MAX_RETENTION_DAYS, SECONDS_PER_DAY};
+use crate::model_metadata::{ModelMetadataStore, ModelPricing};
 use crate::repository::db_manager::{ConversationRecord, QQChatContextManager};
 use crate::runtime_state::{RuntimeGroupMember, RuntimeState};
 use crate::scheduler::SchedulerService;
@@ -63,6 +64,7 @@ pub struct AdminState {
     pub restart: CancellationToken,
     pub started_at: i64,
     user_memory: Arc<UserMemoryService>,
+    model_metadata: Arc<ModelMetadataStore>,
 }
 
 impl AdminState {
@@ -75,6 +77,7 @@ impl AdminState {
         runtime: Arc<RuntimeState>,
         logs: Arc<AdminLogBuffer>,
         restart: CancellationToken,
+        model_metadata: Arc<ModelMetadataStore>,
     ) -> Self {
         Self {
             group_context_history_limit: app_config.app.group_max_history_messages,
@@ -90,6 +93,7 @@ impl AdminState {
             runtime,
             logs,
             restart,
+            model_metadata,
             started_at: Utc::now().timestamp(),
         }
     }
@@ -421,8 +425,9 @@ struct ProviderModelsRequest {
 struct ProviderModelItem {
     id: String,
     name: String,
-    /// None 表示供应商目录没有提供可靠的图像输入能力信息。
+    /// None 表示没有匹配到可靠的图像输入能力信息。
     vision: Option<bool>,
+    pricing: ModelPricing,
 }
 
 async fn provider_models(
@@ -430,13 +435,25 @@ async fn provider_models(
     Json(request): Json<ProviderModelsRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let key = resolve_provider_key(&state, &request.provider);
-    let items = match request.provider.r#type.as_str() {
+    let mut items = match request.provider.r#type.as_str() {
         "openai_compatible" | "openai_responses" | "openrouter" => {
             fetch_openai_style_models(&request.provider, &key).await?
         }
         "gemini" => fetch_gemini_models(&request.provider, &key).await?,
         _ => return Err(ApiError::bad_request("不支持的 Provider 类型")),
     };
+    if request.provider.r#type != "openrouter" {
+        for item in &mut items {
+            if let Some(metadata) = state.model_metadata.lookup(
+                &request.provider.r#type,
+                &request.provider.base_url,
+                &item.id,
+            ) {
+                item.vision = item.vision.or(metadata.vision);
+                item.pricing.merge_missing(&metadata.pricing);
+            }
+        }
+    }
     Ok(Json(json!({ "items": items })))
 }
 
@@ -499,7 +516,10 @@ async fn fetch_openai_style_models(
         .or_else(|| value.get("models"))
         .and_then(Value::as_array)
         .ok_or_else(|| ApiError::new(StatusCode::BAD_GATEWAY, "模型列表响应缺少 data 数组"))?;
-    Ok(normalize_model_items(models))
+    Ok(normalize_model_items(
+        models,
+        provider.r#type == "openrouter",
+    ))
 }
 
 async fn fetch_gemini_models(
@@ -550,7 +570,7 @@ async fn fetch_gemini_models(
                     "Google 模型列表响应缺少 models 数组",
                 )
             })?;
-        items.extend(normalize_model_items(models));
+        items.extend(normalize_model_items(models, false));
         page_token = value
             .get("nextPageToken")
             .and_then(Value::as_str)
@@ -562,7 +582,7 @@ async fn fetch_gemini_models(
     Ok(items)
 }
 
-fn normalize_model_items(models: &[Value]) -> Vec<ProviderModelItem> {
+fn normalize_model_items(models: &[Value], openrouter: bool) -> Vec<ProviderModelItem> {
     models
         .iter()
         .filter_map(|model| {
@@ -583,9 +603,31 @@ fn normalize_model_items(models: &[Value]) -> Vec<ProviderModelItem> {
                 id,
                 name,
                 vision: infer_model_vision(model),
+                pricing: if openrouter {
+                    openrouter_model_pricing(model)
+                } else {
+                    ModelPricing::default()
+                },
             })
         })
         .collect()
+}
+
+fn openrouter_model_pricing(model: &Value) -> ModelPricing {
+    let price = |key: &str| {
+        let value = model.get("pricing")?.get(key)?;
+        let value = value
+            .as_f64()
+            .or_else(|| value.as_str()?.parse::<f64>().ok())?;
+        let value = value * 1_000_000.0;
+        (value.is_finite() && value >= 0.0).then_some(value)
+    };
+    ModelPricing {
+        input: price("prompt"),
+        output: price("completion"),
+        cache_read: price("input_cache_read"),
+        cache_write: price("input_cache_write"),
+    }
 }
 
 fn infer_model_vision(model: &Value) -> Option<bool> {
@@ -596,6 +638,7 @@ fn infer_model_vision(model: &Value) -> Option<bool> {
     }
     for path in [
         "/architecture/input_modalities",
+        "/modalities/input",
         "/input_modalities",
         "/modalities",
         "/capabilities/input_modalities",
