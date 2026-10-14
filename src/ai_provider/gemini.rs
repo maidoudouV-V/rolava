@@ -75,8 +75,7 @@ fn thinking_config(effort: &str) -> anyhow::Result<Option<Value>> {
     use serde_json::json;
     let level = match effort.trim() {
         "auto" => return Ok(None),
-        "none" | "minimal" => "minimal",
-        "low" => "low",
+        "none" | "minimal" | "low" => "low",
         "medium" => "medium",
         "high" | "xhigh" => "high",
         other => return Err(anyhow!("未知的思考强度：{}", other)),

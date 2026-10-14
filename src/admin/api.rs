@@ -570,7 +570,12 @@ async fn fetch_gemini_models(
                     "Google 模型列表响应缺少 models 数组",
                 )
             })?;
-        items.extend(normalize_model_items(models, false));
+        items.extend(
+            models
+                .iter()
+                .filter(|model| is_gemini_text_generation_model(model))
+                .flat_map(|model| normalize_model_items(std::slice::from_ref(model), false)),
+        );
         page_token = value
             .get("nextPageToken")
             .and_then(Value::as_str)
@@ -580,6 +585,48 @@ async fn fetch_gemini_models(
         }
     }
     Ok(items)
+}
+
+fn is_gemini_text_generation_model(model: &Value) -> bool {
+    let supports_generation = model
+        .get("supportedGenerationMethods")
+        .and_then(Value::as_array)
+        .is_some_and(|methods| {
+            methods
+                .iter()
+                .any(|method| method.as_str() == Some("generateContent"))
+        });
+    if !supports_generation {
+        return false;
+    }
+    let Some(id) = model
+        .get("id")
+        .or_else(|| model.get("name"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    // 图片生成、语音等专用模型也可能支持 generateContent，按型号词段排除。
+    !id.to_ascii_lowercase()
+        .split(['-', '_', '.', '/'])
+        .any(|part| {
+            matches!(
+                part,
+                "image"
+                    | "imagen"
+                    | "veo"
+                    | "lyria"
+                    | "banana"
+                    | "omni"
+                    | "tts"
+                    | "audio"
+                    | "live"
+                    | "transcribe"
+                    | "embedding"
+                    | "embeddings"
+                    | "aqa"
+            )
+        })
 }
 
 fn normalize_model_items(models: &[Value], openrouter: bool) -> Vec<ProviderModelItem> {

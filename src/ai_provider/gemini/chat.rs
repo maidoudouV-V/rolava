@@ -183,6 +183,8 @@ pub(super) fn validate_response(raw: &Value) -> anyhow::Result<()> {
     let candidate = raw
         .pointer("/candidates/0")
         .ok_or_else(|| anyhow!("Gemini 响应缺少候选内容：{}", raw))?;
+    // TODO: 长输出续传尚未实现，CONTINUATION 在此按未完成响应处理。
+    // 续传需保持原始请求不变，携带候选内容的 continuationToken，直到结束后合并各段 parts。
     if candidate.get("finishReason").and_then(Value::as_str) != Some("STOP") {
         bail!("Gemini 响应未正常完成：{}", raw);
     }
@@ -315,8 +317,8 @@ mod tests {
             content: ToolChatUserContent::text("你好"),
         }];
         for (effort, level) in [
-            ("none", "minimal"),
-            ("minimal", "minimal"),
+            ("none", "low"),
+            ("minimal", "low"),
             ("low", "low"),
             ("medium", "medium"),
             ("high", "high"),

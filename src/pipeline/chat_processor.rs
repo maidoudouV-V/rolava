@@ -46,6 +46,7 @@ pub struct ChatProcessor {
 
 struct BuiltContext {
     messages: Vec<ToolChatMessage>,
+    instruction_prompt_index: usize,
     unread_message_ids: Vec<i64>,
     unread_message_time: Option<String>,
     pending_expired_group_memory_ids: Vec<i64>,
@@ -329,6 +330,8 @@ impl ChatProcessor {
             let assistant_message = response.assistant_message();
             let tool_calls = response.tool_calls;
             if tool_calls.is_empty() {
+                self.runtime_context
+                    .remember_assistant_response(assistant_message, emitted_message_ids);
                 break;
             }
 
@@ -413,6 +416,7 @@ impl ChatProcessor {
             }) {
                 match self.refresh_instruction_prompt(
                     &mut request_messages,
+                    built_context.instruction_prompt_index,
                     unread_message_time.as_deref(),
                 ) {
                     Ok(pending_ids) => {
@@ -455,10 +459,13 @@ impl ChatProcessor {
         }
         if conversation_effect == ConversationEffect::End {
             self.end_conversation();
-        } else if matches!(
-            self.message_target.conversation.kind,
-            ConversationKind::Group
-        ) && !tool_round_history.is_empty()
+        } else if !tool_round_history.is_empty()
+            && (matches!(
+                self.message_target.conversation.kind,
+                ConversationKind::Group
+            ) || tool_round_history
+                .iter()
+                .any(ToolRoundHistory::has_gemini_response))
         {
             match ActiveToolHistory::new(
                 built_context.latest_message_id,
@@ -694,15 +701,21 @@ impl ChatProcessor {
                 } else {
                     Vec::new()
                 };
-                Self::append_chat_message(
-                    &mut context,
-                    db_msg,
-                    &self.message_target.bot_id,
-                    pending_block_boundary,
-                    &mut last_rendered_date,
-                    &mut unread_message_ids,
-                    image_data_urls,
-                );
+                if db_msg.sender_id != self.message_target.bot_id
+                    || !self
+                        .runtime_context
+                        .append_assistant_response(db_msg.id, &mut context)
+                {
+                    Self::append_chat_message(
+                        &mut context,
+                        db_msg,
+                        &self.message_target.bot_id,
+                        pending_block_boundary,
+                        &mut last_rendered_date,
+                        &mut unread_message_ids,
+                        image_data_urls,
+                    );
+                }
                 pending_block_boundary = false;
             }
 
@@ -715,6 +728,7 @@ impl ChatProcessor {
         }
 
         // 动态 instruction 放在聊天历史之后，临时任务说明紧随其后。
+        let instruction_prompt_index = context.len();
         context.push(ToolChatMessage::System {
             content: rendered_instruction_prompt.content,
         });
@@ -726,6 +740,7 @@ impl ChatProcessor {
 
         Ok(BuiltContext {
             messages: context,
+            instruction_prompt_index,
             unread_message_ids,
             unread_message_time,
             pending_expired_group_memory_ids: rendered_instruction_prompt
@@ -1014,13 +1029,12 @@ impl ChatProcessor {
     fn refresh_instruction_prompt(
         &self,
         messages: &mut [ToolChatMessage],
+        instruction_prompt_index: usize,
         unread_message_time: Option<&str>,
     ) -> anyhow::Result<Vec<i64>> {
         let instruction_prompt = self.render_instruction_prompt(unread_message_time)?;
-        let Some(content) = messages.iter_mut().rev().find_map(|message| match message {
-            ToolChatMessage::System { content } => Some(content),
-            _ => None,
-        }) else {
+        let Some(ToolChatMessage::System { content }) = messages.get_mut(instruction_prompt_index)
+        else {
             anyhow::bail!("工具循环上下文缺少 instruction 提示词");
         };
         *content = instruction_prompt.content;

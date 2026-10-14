@@ -244,13 +244,11 @@ impl ModelCatalog {
             references: HashMap::new(),
             model_count,
         };
-        let mut base_ids = AliasIndex::default();
         let mut groups: BTreeMap<String, ReferenceGroup> = BTreeMap::new();
         for (id, model) in &raw.models {
             let (author, slug) = id.split_once('/').unwrap_or(("", id));
             catalog.authors.insert(author.to_ascii_lowercase());
             for alias in [id.as_str(), slug] {
-                base_ids.insert(alias, id);
                 catalog.ids.insert(alias, id);
             }
             catalog.names.insert(&model.name, id);
@@ -266,38 +264,32 @@ impl ModelCatalog {
             }
             let mut index = ProviderIndex::default();
             for (id, model) in provider.models {
-                let qualified_id = format!("{provider_id}/{id}");
-                let canonical = model.canonical_model_id.clone().unwrap_or_else(|| {
-                    if raw.models.contains_key(&qualified_id) {
-                        qualified_id.clone()
-                    } else {
-                        base_ids
-                            .find(&id)
-                            .filter(|targets| targets.len() == 1)
-                            .and_then(|targets| targets.first())
-                            .cloned()
-                            .unwrap_or_else(|| qualified_id.clone())
-                    }
-                });
+                let canonical = model
+                    .canonical_model_id
+                    .as_deref()
+                    .filter(|canonical| !canonical.trim().is_empty());
                 let mut metadata = model.metadata();
                 if metadata.vision.is_none() {
-                    metadata.vision = raw
-                        .models
-                        .get(&canonical)
+                    metadata.vision = canonical
+                        .and_then(|canonical| raw.models.get(canonical))
                         .and_then(|base| base.metadata().vision);
                 }
                 index.ids.insert(&id, &id);
                 index.names.insert(&model.name, &id);
                 index.models.insert(id.clone(), metadata.clone());
+                // 缺少标准模型关联的记录仅用于对应供应商，不参与跨供应商匹配。
+                let Some(canonical) = canonical else {
+                    continue;
+                };
                 for alias in [id.as_str(), id.rsplit('/').next().unwrap_or(&id)] {
-                    catalog.ids.insert(alias, &canonical);
+                    catalog.ids.insert(alias, canonical);
                 }
-                catalog.names.insert(&model.name, &canonical);
-                groups.entry(canonical).or_default().entries.push((
-                    provider_id.clone(),
-                    id,
-                    metadata,
-                ));
+                catalog.names.insert(&model.name, canonical);
+                groups
+                    .entry(canonical.to_string())
+                    .or_default()
+                    .entries
+                    .push((provider_id.clone(), id, metadata));
             }
             catalog.providers.insert(provider_id, index);
         }

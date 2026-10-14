@@ -3,12 +3,15 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { setTimeout: delay } = require('node:timers/promises');
 
 const MAX_OUTPUT_IMAGES = 1;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 50_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_REQUEST_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 1_000;
 const RANDOM_NAME_ATTEMPTS = 20;
 const RANDOM_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -197,39 +200,71 @@ async function callGeminiGenerateContent(config, requestBody) {
 
   const endpoint = `${config.baseUrl}/models/${encodeURIComponent(config.modelName)}:generateContent`;
   const controller = new AbortController();
+  const deadline = performance.now() + REQUEST_TIMEOUT_MS;
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': config.apiKey,
-      },
-      body: serializedBody,
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new SkillError('UPSTREAM_ERROR', `图片生成接口返回 HTTP ${response.status}`);
-    }
-    try {
-      if (Number(response.headers.get('content-length')) > MAX_RESPONSE_BYTES) {
-        throw new SkillError('PAYLOAD_TOO_LARGE', '图片生成响应过大');
+    for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt += 1) {
+      if (controller.signal.aborted || performance.now() >= deadline) {
+        throw new SkillError('TIMEOUT', '图片生成请求超时');
       }
-      const chunks = [];
-      let size = 0;
-      for await (const chunk of response.body) {
-        size += chunk.length;
-        if (size > MAX_RESPONSE_BYTES) {
-          controller.abort();
-          throw new SkillError('PAYLOAD_TOO_LARGE', '图片生成响应过大');
+      let failure;
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': config.apiKey,
+          },
+          body: serializedBody,
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          failure = new SkillError('UPSTREAM_ERROR', `图片生成接口返回 HTTP ${response.status}`);
+          if (response.body) await response.body.cancel().catch(() => {});
+          if (response.status !== 408 && response.status !== 429 && response.status < 500) {
+            throw failure;
+          }
+        } else {
+          if (!response.body) {
+            throw new SkillError('UPSTREAM_ERROR', '图片生成接口返回了无效 JSON');
+          }
+          if (Number(response.headers.get('content-length')) > MAX_RESPONSE_BYTES) {
+            if (response.body) await response.body.cancel().catch(() => {});
+            throw new SkillError('PAYLOAD_TOO_LARGE', '图片生成响应过大');
+          }
+          const chunks = [];
+          let size = 0;
+          for await (const chunk of response.body) {
+            size += chunk.length;
+            if (size > MAX_RESPONSE_BYTES) {
+              controller.abort();
+              throw new SkillError('PAYLOAD_TOO_LARGE', '图片生成响应过大');
+            }
+            chunks.push(chunk);
+          }
+          if (controller.signal.aborted || performance.now() >= deadline) {
+            throw new SkillError('TIMEOUT', '图片生成请求超时');
+          }
+          try {
+            return JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
+          } catch {
+            throw new SkillError('UPSTREAM_ERROR', '图片生成接口返回了无效 JSON');
+          }
         }
-        chunks.push(chunk);
+      } catch (error) {
+        if (error instanceof SkillError) throw error;
+        if (controller.signal.aborted || (error && error.name === 'AbortError')) {
+          throw new SkillError('TIMEOUT', '图片生成请求超时');
+        }
+        failure = new SkillError('UPSTREAM_ERROR', '无法连接图片生成接口');
       }
-      return JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
-    } catch (error) {
-      if (error instanceof SkillError) throw error;
-      if (controller.signal.aborted) throw error;
-      throw new SkillError('UPSTREAM_ERROR', '图片生成接口返回了无效 JSON');
+      if (attempt === MAX_REQUEST_ATTEMPTS) throw failure;
+      const remaining = deadline - performance.now();
+      if (controller.signal.aborted || remaining <= 0) {
+        throw new SkillError('TIMEOUT', '图片生成请求超时');
+      }
+      if (RETRY_DELAY_MS >= remaining) throw failure;
+      await delay(RETRY_DELAY_MS, undefined, { signal: controller.signal });
     }
   } catch (error) {
     if (error instanceof SkillError) throw error;

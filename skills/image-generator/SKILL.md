@@ -29,3 +29,5 @@ node scripts/image-generate.js --prompt="编辑要求" --image="/data/received_i
 ```
 
 每次调用只生成或编辑一张图片。输入图片必须来自 `/data/images/` 或 `/data/received_images/`。成功后使用返回的 `paths`；若返回 `text`，一并参考该说明。
+
+脚本自动重试临时网络错误；最终失败时告知原因，不要自行重复调用。

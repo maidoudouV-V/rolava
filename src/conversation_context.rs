@@ -2,7 +2,17 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 
-use crate::ai_provider::ToolChatMessage;
+use crate::ai_provider::{ReasoningPayload, ToolChatMessage};
+
+fn has_gemini_response(message: &ToolChatMessage) -> bool {
+    matches!(
+        message,
+        ToolChatMessage::Assistant {
+            reasoning: Some(ReasoningPayload::Structured(payload)),
+            ..
+        } if payload.get("provider").and_then(|value| value.as_str()) == Some("gemini")
+    )
+}
 
 /// 一个只在当前进程内保留的完整工具调用轮次。
 #[derive(Debug, Clone)]
@@ -12,16 +22,17 @@ pub struct ToolRoundHistory {
 }
 
 impl ToolRoundHistory {
-    /// 跨请求只保留工具协议，模型推理仍只存在于当前工具循环。
+    /// Gemini 原始响应随工具协议保留，签名、上游调用 ID 和内容块用于后续原样回传。
     pub fn new(assistant: ToolChatMessage, tool_results: Vec<ToolChatMessage>) -> Result<Self> {
+        let preserve_response = has_gemini_response(&assistant);
         let assistant = match assistant {
             ToolChatMessage::Assistant {
                 content,
+                reasoning,
                 tool_calls,
-                ..
             } if !tool_calls.is_empty() => ToolChatMessage::Assistant {
                 content,
-                reasoning: None,
+                reasoning: if preserve_response { reasoning } else { None },
                 tool_calls,
             },
             _ => anyhow::bail!("内存工具轮次缺少 assistant tool_calls"),
@@ -37,6 +48,10 @@ impl ToolRoundHistory {
     fn extend_messages(&self, messages: &mut Vec<ToolChatMessage>) {
         messages.push(self.assistant.clone());
         messages.extend(self.tool_results.iter().cloned());
+    }
+
+    pub fn has_gemini_response(&self) -> bool {
+        has_gemini_response(&self.assistant)
     }
 
     fn validate(&self) -> Result<()> {
@@ -116,12 +131,20 @@ impl ActiveToolHistory {
     }
 }
 
+/// 原始模型回复与实际发送的 QQ 气泡对应，回传时保持一个完整 model 消息。
+#[derive(Debug)]
+struct AssistantResponseHistory {
+    assistant: ToolChatMessage,
+    message_ids: Vec<i64>,
+}
+
 /// 单个 ConversationActor 在本次进程生命周期内维护的上下文布局。
 #[derive(Debug, Default)]
 pub struct RuntimeContextState {
     loaded_message_ids: Vec<i64>,
     sealed_after_message_ids: HashSet<i64>,
     active_tool_histories: Vec<ActiveToolHistory>,
+    assistant_responses: Vec<AssistantResponseHistory>,
 }
 
 impl RuntimeContextState {
@@ -150,6 +173,10 @@ impl RuntimeContextState {
         for history in &mut self.active_tool_histories {
             history.retain_visible_messages(&visible_ids);
         }
+        // 回复的任一气泡被删除或淘汰时回退数据库正文，避免重新引入窗口外的内容。
+        self.assistant_responses.retain(|response| {
+            response.message_ids.iter().all(|id| visible_ids.contains(id))
+        });
         self.loaded_message_ids.clear();
         self.loaded_message_ids.extend_from_slice(message_ids);
         self.validate()?;
@@ -175,7 +202,46 @@ impl RuntimeContextState {
         self.validate()
     }
 
-    /// 对话结束后只保留 messages 中已经真实发送的正文，不再保留工具协议。
+    pub fn remember_assistant_response(
+        &mut self,
+        assistant: ToolChatMessage,
+        message_ids: Vec<i64>,
+    ) {
+        if message_ids.is_empty() || !has_gemini_response(&assistant) {
+            return;
+        }
+        if !matches!(
+            &assistant,
+            ToolChatMessage::Assistant { tool_calls, .. } if tool_calls.is_empty()
+        ) {
+            return;
+        }
+        self.assistant_responses.push(AssistantResponseHistory {
+            assistant,
+            message_ids,
+        });
+    }
+
+    /// 原始回复在第一个气泡的位置回传，其余气泡跳过，避免重复发送同一 model 响应。
+    pub fn append_assistant_response(
+        &self,
+        message_id: i64,
+        messages: &mut Vec<ToolChatMessage>,
+    ) -> bool {
+        let Some(response) = self
+            .assistant_responses
+            .iter()
+            .find(|response| response.message_ids.contains(&message_id))
+        else {
+            return false;
+        };
+        if response.message_ids.first() == Some(&message_id) {
+            messages.push(response.assistant.clone());
+        }
+        true
+    }
+
+    /// 对话结束后清理工具轮次；已发送普通回复的协议载荷随聊天窗口保留。
     pub fn compact_finished_conversation(&mut self) -> usize {
         let removed = self.active_tool_histories.len();
         self.active_tool_histories.clear();

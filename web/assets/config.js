@@ -137,7 +137,11 @@ export class ConfigController {
 
   reasoningOptions(providerType, selected) {
     const automatic = providerType === "gemini" ? "自动（Gemini 默认）" : providerType === "openrouter" ? "自动（路由默认）" : "自动（模型默认）";
-    const levels = ["none", "minimal", "low", "medium", "high", "xhigh"];
+    const levels = providerType === "gemini" ? ["low", "medium", "high"] : ["none", "minimal", "low", "medium", "high", "xhigh"];
+    if (providerType === "gemini") {
+      if (selected === "none" || selected === "minimal") selected = "low";
+      if (selected === "xhigh") selected = "high";
+    }
     const options = [["auto", automatic], ...levels.map(level => [level, level])];
     if (!options.some(([value]) => value === selected)) selected = "auto";
     return options.map(([value, label]) => `<option value="${value}" ${value === (selected || "auto") ? "selected" : ""}>${label}</option>`).join("");
