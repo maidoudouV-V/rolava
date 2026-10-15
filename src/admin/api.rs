@@ -1,117 +1,56 @@
+use super::auth::{require_admin, verify_auth};
 use super::config_store::{
     list_prompt_files, read_prompt, write_admin_config, write_prompt, AdminConfigUpdate,
     AdminConfigView, AdminProviderConfig,
 };
-use super::log_buffer::AdminLogBuffer;
+use super::error::ApiError;
 use super::skill_store::{
     list_skill_files, list_skills, normalize_enabled_names, read_skill_file, write_skill_file,
 };
+use super::state::AdminState;
 use crate::ai_provider::{
     gemini::GeminiProvider, openai_compatible::OpenAICompatibleProvider,
     openai_responses::OpenAIResponsesProvider, openrouter::OpenRouterProvider, AIProvider,
     ExtraBody, ToolChatMessage, ToolChatUserContent,
 };
 use crate::chat_history::load_chat_history_context;
-use crate::config::{
-    validate_skill_environment_groups, AppConfig, ModelConfig, SkillEnvironmentGroups,
-};
+use crate::config::{validate_skill_environment_groups, ModelConfig, SkillEnvironmentGroups};
 use crate::history_compression::render_summary_date_heading;
-use crate::memory::{GroupMemorySession, UserMemoryService, MAX_RETENTION_DAYS, SECONDS_PER_DAY};
-use crate::model_metadata::{ModelMetadataStore, ModelPricing};
-use crate::repository::db_manager::{ConversationRecord, QQChatContextManager};
-use crate::runtime_state::{RuntimeGroupMember, RuntimeState};
-use crate::scheduler::SchedulerService;
+use crate::memory::{GroupMemorySession, MAX_RETENTION_DAYS, SECONDS_PER_DAY};
+use crate::model_metadata::ModelPricing;
+use crate::repository::db_manager::ConversationRecord;
+use crate::request_statistics::RequestRecorder;
+use crate::runtime_state::RuntimeGroupMember;
 use crate::tools::ToolRegistry;
 use crate::transport::message::{
     preferred_sender_name, Conversation, ConversationKind, MessageTarget,
 };
-use crate::transport::onebot::OneBotHttpServer;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::http::StatusCode;
+use axum::middleware;
+use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{Local, Timelike, Utc};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
 const GROUP_MEMBER_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
-#[derive(Clone)]
-pub struct AdminState {
-    app_config: Arc<RwLock<Arc<AppConfig>>>,
-    // 与运行中的主模型一致；仅保存配置但未重启时，不提前切换窗口大小。
-    group_context_history_limit: u32,
-    direct_context_history_limit: u32,
-    context_summary_days: u16,
-    // 使用启动时的值，确保页面与运行中的模型上下文一致。
-    context_summary_enabled: bool,
-    pub config_path: PathBuf,
-    pub db_manager: Arc<QQChatContextManager>,
-    pub scheduler: Arc<SchedulerService>,
-    pub onebot: Arc<OneBotHttpServer>,
-    pub runtime: Arc<RuntimeState>,
-    pub logs: Arc<AdminLogBuffer>,
-    pub restart: CancellationToken,
-    pub started_at: i64,
-    user_memory: Arc<UserMemoryService>,
-    model_metadata: Arc<ModelMetadataStore>,
-}
-
-impl AdminState {
-    pub fn new(
-        app_config: Arc<AppConfig>,
-        config_path: PathBuf,
-        db_manager: Arc<QQChatContextManager>,
-        scheduler: Arc<SchedulerService>,
-        onebot: Arc<OneBotHttpServer>,
-        runtime: Arc<RuntimeState>,
-        logs: Arc<AdminLogBuffer>,
-        restart: CancellationToken,
-        model_metadata: Arc<ModelMetadataStore>,
-    ) -> Self {
-        Self {
-            group_context_history_limit: app_config.app.group_max_history_messages,
-            direct_context_history_limit: app_config.app.direct_max_history_messages,
-            context_summary_days: app_config.app.history_summary_days,
-            context_summary_enabled: app_config.app.history_summary_enabled,
-            user_memory: Arc::new(UserMemoryService::new(db_manager.clone())),
-            app_config: Arc::new(RwLock::new(app_config)),
-            config_path,
-            db_manager,
-            scheduler,
-            onebot,
-            runtime,
-            logs,
-            restart,
-            model_metadata,
-            started_at: Utc::now().timestamp(),
-        }
-    }
-
-    /// 管理后台使用可替换快照，普通保存后刷新页面也能读取最新配置。
-    fn app_config(&self) -> Arc<AppConfig> {
-        self.app_config.read().clone()
-    }
-
-    fn replace_app_config(&self, config: AppConfig) {
-        *self.app_config.write() = Arc::new(config);
-    }
-}
-
 pub fn router(state: Arc<AdminState>) -> Router {
     let api = Router::new()
         .route("/auth/verify", post(verify_auth))
         .route("/status", get(status))
+        .route(
+            "/request-statistics",
+            get(super::request_statistics::get_statistics),
+        )
         .route("/logs", get(logs))
         .route("/config", get(get_config).put(put_config))
         .route("/test/onebot", post(test_onebot))
@@ -195,37 +134,6 @@ async fn admin_path_redirect() -> Redirect {
 
 async fn admin_index() -> Result<Html<String>, ApiError> {
     Ok(Html(tokio::fs::read_to_string("web/index.html").await?))
-}
-
-async fn require_admin(
-    State(state): State<Arc<AdminState>>,
-    headers: HeaderMap,
-    request: axum::extract::Request,
-    next: Next,
-) -> Response {
-    let app_config = state.app_config();
-    if bearer_token(&headers)
-        .is_some_and(|token| constant_time_equals(token, &app_config.admin.token))
-    {
-        return next.run(request).await;
-    }
-    ApiError::new(StatusCode::UNAUTHORIZED, "管理 Token 无效").into_response()
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-}
-
-fn constant_time_equals(actual: &str, expected: &str) -> bool {
-    actual.len() == expected.len() && actual.as_bytes().ct_eq(expected.as_bytes()).into()
-}
-
-async fn verify_auth() -> Json<Value> {
-    Json(json!({ "authenticated": true }))
 }
 
 #[derive(Serialize)]
@@ -357,7 +265,12 @@ async fn test_model(
     let key = resolve_provider_key(&state, &request.provider);
     let extra_body = ExtraBody::parse(&request.model.extra_body)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let provider: Box<dyn AIProvider + Send + Sync> = match request.provider.r#type.as_str() {
+    let recorder = RequestRecorder::new(
+        state.request_statistics.clone(),
+        request.provider.name.clone(),
+        request.model.name.clone(),
+    );
+    let mut provider: Box<dyn AIProvider + Send + Sync> = match request.provider.r#type.as_str() {
         "openai_compatible" => Box::new(
             OpenAICompatibleProvider::new(
                 key,
@@ -400,6 +313,7 @@ async fn test_model(
         ),
         _ => return Err(ApiError::bad_request("不支持的 Provider 类型")),
     };
+    provider.set_request_recorder(recorder);
     let response = tokio::time::timeout(
         Duration::from_secs(30),
         provider.chat_completions(
@@ -1452,43 +1366,5 @@ async fn ensure_conversation_member(
         Ok(())
     } else {
         Err(ApiError::bad_request("指定 QQ 号不是当前会话成员"))
-    }
-}
-
-pub struct ApiError {
-    status: StatusCode,
-    message: String,
-}
-
-impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-        }
-    }
-
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, message)
-    }
-
-    fn not_found(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::NOT_FOUND, message)
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
-    }
-}
-
-impl<E> From<E> for ApiError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(error: E) -> Self {
-        let error = error.into();
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", error))
     }
 }

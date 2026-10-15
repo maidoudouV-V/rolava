@@ -232,11 +232,7 @@ pub(super) fn parse_response(text: &str, model: &str) -> anyhow::Result<ToolChat
     if answer.trim().is_empty() && calls.is_empty() {
         bail!("Gemini 响应内容为空");
     }
-    let usage = raw.get("usageMetadata").map(|usage| ChatUsage {
-        prompt_tokens: usage.get("promptTokenCount").and_then(Value::as_u64),
-        completion_tokens: usage.get("candidatesTokenCount").and_then(Value::as_u64),
-        total_tokens: usage.get("totalTokenCount").and_then(Value::as_u64),
-    });
+    let usage = ChatUsage::from_gemini(&raw);
     Ok(ToolChatResponse {
         content: (!answer.trim().is_empty()).then_some(answer),
         reasoning: ReasoningState {

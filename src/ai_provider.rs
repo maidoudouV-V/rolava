@@ -84,7 +84,7 @@ pub struct ContextMessage {
     pub content: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatUsage {
     /// 本次请求输入消耗的 token 总数。
     pub prompt_tokens: Option<u64>,
@@ -92,6 +92,33 @@ pub struct ChatUsage {
     pub completion_tokens: Option<u64>,
     /// 本次请求总共消耗的 token 数。
     pub total_tokens: Option<u64>,
+    /// 输入中从缓存读取的 token 数，未返回时为空。
+    pub cached_tokens: Option<u64>,
+}
+
+impl ChatUsage {
+    pub(crate) fn from_openrouter(raw: &Value) -> Option<Self> {
+        let usage = raw.get("usage")?.as_object()?;
+        Some(Self {
+            prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
+            completion_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
+            total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+            cached_tokens: usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64),
+        })
+    }
+
+    pub(crate) fn from_gemini(raw: &Value) -> Option<Self> {
+        let usage = raw.get("usageMetadata")?.as_object()?;
+        Some(Self {
+            prompt_tokens: usage.get("promptTokenCount").and_then(Value::as_u64),
+            completion_tokens: usage.get("candidatesTokenCount").and_then(Value::as_u64),
+            total_tokens: usage.get("totalTokenCount").and_then(Value::as_u64),
+            cached_tokens: usage.get("cachedContentTokenCount").and_then(Value::as_u64),
+        })
+    }
 }
 
 /// 工具调用下一轮需要原样回传的推理载荷。
@@ -250,6 +277,9 @@ impl ToolChatResponse {
 // ========== 通用 Provider Trait ==========
 #[async_trait]
 pub trait AIProvider {
+    /// 支持统计的供应商在实际请求入口使用此记录器。
+    fn set_request_recorder(&mut self, _recorder: crate::request_statistics::RequestRecorder) {}
+
     /// 统一的聊天请求。tools 为空时是普通文本请求，非空时允许模型返回工具调用。
     async fn chat_completions(
         &self,

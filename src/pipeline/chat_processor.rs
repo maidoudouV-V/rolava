@@ -205,6 +205,7 @@ impl ChatProcessor {
             "set_user_memory",
             "delete_user_memory",
             "set_conversation_state",
+            "finish_response",
         ]);
         if tools.get("set_user_memory").is_none() {
             return;
@@ -400,7 +401,7 @@ impl ChatProcessor {
             }
 
             if !Self::should_continue_tool_loop(&tool_results) {
-                debug!("本轮工具均不需要 AI 后续响应，结束工具循环");
+                debug!("本轮工具执行完成，结束工具循环");
                 break;
             }
 
@@ -482,8 +483,14 @@ impl ChatProcessor {
         }
     }
 
-    /// 任意工具要求 AI 后续处理时，回传本轮全部工具结果并继续循环。
+    /// finish_response 成功时结束循环，否则按工具结果决定是否继续请求 AI。
     fn should_continue_tool_loop(tool_results: &[ToolResult]) -> bool {
+        if tool_results
+            .iter()
+            .any(|result| !result.is_error && result.tool_name == "finish_response")
+        {
+            return false;
+        }
         tool_results
             .iter()
             .any(|result| result.requires_ai_response)
@@ -629,7 +636,10 @@ impl ChatProcessor {
         );
         let system_prompt = crate::config::render_prompt_sections(
             &self.services.app_config.prompt_config.system_prompt,
-            &[("group_conversation", group_conversation)],
+            &[
+                ("group_conversation", group_conversation),
+                ("direct_conversation", !group_conversation),
+            ],
         )?;
         let mut context = vec![
             ToolChatMessage::System {

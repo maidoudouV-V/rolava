@@ -335,6 +335,7 @@ fn parse_openai_responses_response(response_text: &str) -> anyhow::Result<ToolCh
         prompt_tokens: usage.get("input_tokens").and_then(Value::as_u64),
         completion_tokens: usage.get("output_tokens").and_then(Value::as_u64),
         total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+        cached_tokens: None,
     });
     let display_text = (!reasoning_summaries.is_empty()).then(|| reasoning_summaries.join("\n"));
     let replay = (!output.is_empty()).then(|| {

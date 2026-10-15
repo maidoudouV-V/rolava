@@ -2,6 +2,7 @@ use crate::ai_provider::{
     AIProvider, ChatUsage, ExtraBody, ReasoningPayload, ReasoningState, ToolChatContentPart,
     ToolChatMessage, ToolChatResponse, ToolChatUserContent,
 };
+use crate::request_statistics::{RequestMeasurement, RequestRecorder};
 use crate::tools::{ToolCall, ToolDefinition};
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
@@ -25,6 +26,7 @@ pub struct OpenRouterProvider {
     max_tokens: Option<i32>,
     reasoning_effort: String,
     extra_body: ExtraBody,
+    request_recorder: Option<RequestRecorder>,
 }
 
 impl OpenRouterProvider {
@@ -43,6 +45,7 @@ impl OpenRouterProvider {
             max_tokens,
             reasoning_effort: reasoning_effort.into(),
             extra_body: ExtraBody::default(),
+            request_recorder: None,
         }
     }
 
@@ -77,30 +80,49 @@ impl OpenRouterProvider {
                 .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
             "AI Provider 完整请求"
         );
+        let mut measurement = RequestMeasurement::begin(
+            self.request_recorder.as_ref(),
+            "openrouter",
+            &self.model,
+            "chat",
+        );
+        let result = async {
+            let response_text = self.send_request(&url, &body, &mut measurement).await?;
+            parse_openrouter_chat_response(&response_text)
+        }
+        .await;
+        measurement.complete(result.is_ok());
+        result
+    }
+
+    async fn send_request(
+        &self,
+        url: &str,
+        body: &Value,
+        measurement: &mut RequestMeasurement,
+    ) -> anyhow::Result<String> {
         let resp = self
             .http_client
             .post(url)
             .bearer_auth(&self.api_key)
             .header("HTTP-Referer", OPENROUTER_APP_URL)
             .header("X-OpenRouter-Title", OPENROUTER_APP_TITLE)
-            .json(&body)
+            .json(body)
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text = resp.text().await.unwrap_or_default();
-            trace!(provider = "openrouter", status = %status, response = %error_text, "AI Provider 原始错误响应");
+        let status = resp.status();
+        measurement.response_status(status.as_u16());
+        let response_text = resp.text().await?;
+        measurement.response_body(&response_text);
+        trace!(provider = "openrouter", status = %status, response = %response_text, "AI Provider 原始响应");
+        if !status.is_success() {
             return Err(anyhow!(
                 "OpenRouter API 调用失败，状态码 {}：{}",
                 status,
-                error_text
+                response_text
             ));
         }
-
-        let response_text = resp.text().await?;
-        trace!(provider = "openrouter", response = %response_text, "AI Provider 原始响应");
-        parse_openrouter_chat_response(&response_text)
+        Ok(response_text)
     }
 }
 
@@ -235,7 +257,6 @@ struct OpenRouterChatResponse {
     id: Option<String>,
     model: Option<String>,
     choices: Vec<OpenRouterChoice>,
-    usage: Option<OpenRouterUsage>,
 }
 
 #[derive(Deserialize)]
@@ -267,13 +288,6 @@ struct OpenRouterResponseToolCall {
 struct OpenRouterResponseFunctionCall {
     name: String,
     arguments: String,
-}
-
-#[derive(Deserialize)]
-struct OpenRouterUsage {
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    total_tokens: Option<u64>,
 }
 
 fn build_openrouter_chat_request<'a>(
@@ -386,6 +400,10 @@ fn openrouter_user_content(content: &ToolChatUserContent) -> OpenRouterUserConte
 
 #[async_trait]
 impl AIProvider for OpenRouterProvider {
+    fn set_request_recorder(&mut self, recorder: RequestRecorder) {
+        self.request_recorder = Some(recorder);
+    }
+
     async fn chat_completions(
         &self,
         messages: &[ToolChatMessage],
@@ -434,39 +452,28 @@ impl AIProvider for OpenRouterProvider {
             "视觉 Provider 请求"
         );
 
-        let resp = self
-            .http_client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .header("HTTP-Referer", OPENROUTER_APP_URL)
-            .header("X-OpenRouter-Title", OPENROUTER_APP_TITLE)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text = resp.text().await.unwrap_or_default();
-            trace!(provider = "openrouter", status = %status, response = %error_text, "视觉 Provider 原始错误响应");
-            return Err(anyhow!(
-                "OpenRouter 视觉 API 调用失败，状态码 {}：{}",
-                status,
-                error_text
-            ));
+        let mut measurement = RequestMeasurement::begin(
+            self.request_recorder.as_ref(),
+            "openrouter",
+            &self.model,
+            "vision",
+        );
+        let result = async {
+            let response_text = self.send_request(&url, &body, &mut measurement).await?;
+            let raw_response: Value = serde_json::from_str(&response_text)
+                .map_err(|e| anyhow!("解析 OpenRouter 视觉响应失败：{}", e))?;
+            check_openrouter_response_error(&raw_response)?;
+            let parsed: OpenRouterChatResponse = serde_json::from_str(&response_text)
+                .map_err(|e| anyhow!("解析 OpenRouter 视觉响应失败：{}", e))?;
+            parsed
+                .choices
+                .first()
+                .and_then(|c| c.message.content.clone())
+                .ok_or_else(|| anyhow!("OpenRouter 视觉响应内容为空"))
         }
-
-        let response_text = resp.text().await?;
-        trace!(provider = "openrouter", response = %response_text, "视觉 Provider 原始响应");
-        let raw_response: Value = serde_json::from_str(&response_text)
-            .map_err(|e| anyhow!("解析 OpenRouter 视觉响应失败：{}", e))?;
-        check_openrouter_response_error(&raw_response)?;
-        let parsed: OpenRouterChatResponse = serde_json::from_str(&response_text)
-            .map_err(|e| anyhow!("解析 OpenRouter 视觉响应失败：{}", e))?;
-        parsed
-            .choices
-            .get(0)
-            .and_then(|c| c.message.content.clone())
-            .ok_or_else(|| anyhow!("OpenRouter 视觉响应内容为空"))
+        .await;
+        measurement.complete(result.is_ok());
+        result
     }
 }
 
@@ -549,11 +556,7 @@ fn parse_openrouter_chat_response(response_text: &str) -> anyhow::Result<ToolCha
         );
     }
 
-    let usage = parsed.usage.map(|usage| ChatUsage {
-        prompt_tokens: usage.prompt_tokens,
-        completion_tokens: usage.completion_tokens,
-        total_tokens: usage.total_tokens,
-    });
+    let usage = ChatUsage::from_openrouter(&raw_response);
 
     Ok(ToolChatResponse {
         content,

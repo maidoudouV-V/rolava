@@ -5,7 +5,7 @@ use anyhow::{bail, Result};
 
 use super::{
     AgentWebSearchTool, CreateScheduledTaskTool, DeleteGroupMemoryTool, DeleteScheduledTaskTool,
-    DeleteUserMemoryTool, GetScheduledTaskTool, ReadContentTool, RunScriptTool,
+    DeleteUserMemoryTool, FinishResponseTool, GetScheduledTaskTool, ReadContentTool, RunScriptTool,
     SendQqSpecialMessageTool, SetConversationStateTool, SetGroupMemoryTool, SetUserMemoryTool,
     Tool, ToolCall, ToolContext, ToolDefinition, ToolResult, UpdateScheduledTaskTool,
     WaitForReplyTool,
@@ -59,6 +59,8 @@ impl ToolRegistry {
         if group_conversation {
             // 状态工具只控制群聊的 AI 前置过滤，私聊不需要注册。
             registry.register(SetConversationStateTool).unwrap();
+        } else {
+            registry.register(FinishResponseTool).unwrap();
         }
         registry
     }

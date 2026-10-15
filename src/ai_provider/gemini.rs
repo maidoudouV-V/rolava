@@ -2,6 +2,7 @@ use crate::ai_provider::{
     context_messages_without_tools, AIProvider, ChatUsage, ContextMessage, ExtraBody, MessageRole,
     ReasoningState, ToolChatMessage, ToolChatResponse,
 };
+use crate::request_statistics::{RequestMeasurement, RequestRecorder};
 use crate::tools::ToolDefinition;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -22,6 +23,7 @@ pub struct GeminiProvider {
     max_tokens: Option<i32>,
     reasoning_effort: String,
     extra_body: ExtraBody,
+    request_recorder: Option<RequestRecorder>,
 }
 
 impl GeminiProvider {
@@ -46,6 +48,7 @@ impl GeminiProvider {
             max_tokens,
             reasoning_effort: reasoning_effort.into(),
             extra_body: ExtraBody::default(),
+            request_recorder: None,
         }
     }
 
@@ -167,6 +170,10 @@ struct GeminiResponsePart {
 
 #[async_trait]
 impl AIProvider for GeminiProvider {
+    fn set_request_recorder(&mut self, recorder: RequestRecorder) {
+        self.request_recorder = Some(recorder);
+    }
+
     async fn chat_completions(
         &self,
         messages: &[ToolChatMessage],
@@ -180,8 +187,19 @@ impl AIProvider for GeminiProvider {
                 .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
             "AI Provider 完整请求"
         );
-        let response_text = self.send_generate_content(&body).await?;
-        chat::parse_response(&response_text, &self.model)
+        let mut measurement = RequestMeasurement::begin(
+            self.request_recorder.as_ref(),
+            "gemini",
+            &self.model,
+            "chat",
+        );
+        let result = async {
+            let response_text = self.send_generate_content(&body, &mut measurement).await?;
+            chat::parse_response(&response_text, &self.model)
+        }
+        .await;
+        measurement.complete(result.is_ok());
+        result
     }
 
     async fn describe_image(&self, image_data_url: &str, prompt: &str) -> anyhow::Result<String> {
@@ -219,10 +237,21 @@ impl AIProvider for GeminiProvider {
             "视觉 Provider 请求"
         );
 
-        let response_text = self.send_generate_content(&body).await?;
-        let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
-            .map_err(|err| anyhow!("解析 Gemini 视觉响应失败：{}", err))?;
-        extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Gemini 视觉响应内容为空"))
+        let mut measurement = RequestMeasurement::begin(
+            self.request_recorder.as_ref(),
+            "gemini",
+            &self.model,
+            "vision",
+        );
+        let result = async {
+            let response_text = self.send_generate_content(&body, &mut measurement).await?;
+            let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
+                .map_err(|err| anyhow!("解析 Gemini 视觉响应失败：{}", err))?;
+            extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Gemini 视觉响应内容为空"))
+        }
+        .await;
+        measurement.complete(result.is_ok());
+        result
     }
 
     async fn web_search(&self, question: &str) -> anyhow::Result<String> {
@@ -235,12 +264,21 @@ impl AIProvider for GeminiProvider {
             "联网搜索 Provider 完整请求"
         );
 
-        let response_text = self.send_generate_content(&body).await?;
-        let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
-            .map_err(|err| anyhow!("解析 Gemini 联网搜索响应失败：{}", err))?;
-        let answer =
-            extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Gemini 联网搜索响应内容为空"))?;
-        Ok(answer)
+        let mut measurement = RequestMeasurement::begin(
+            self.request_recorder.as_ref(),
+            "gemini",
+            &self.model,
+            "web_search",
+        );
+        let result = async {
+            let response_text = self.send_generate_content(&body, &mut measurement).await?;
+            let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
+                .map_err(|err| anyhow!("解析 Gemini 联网搜索响应失败：{}", err))?;
+            extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Gemini 联网搜索响应内容为空"))
+        }
+        .await;
+        measurement.complete(result.is_ok());
+        result
     }
 }
 
@@ -276,6 +314,7 @@ impl GeminiProvider {
     async fn send_generate_content(
         &self,
         body: &(impl Serialize + Sync),
+        measurement: &mut RequestMeasurement,
     ) -> anyhow::Result<String> {
         let body = self.request_body(body)?;
         let url = self.generate_content_url();
@@ -291,10 +330,12 @@ impl GeminiProvider {
             .with_context(|| format!("Gemini 请求失败：{}", url))?;
 
         let status = resp.status();
+        measurement.response_status(status.as_u16());
         let response_text = resp
             .text()
             .await
             .with_context(|| format!("读取 Gemini 响应失败：{}，HTTP {}", url, status))?;
+        measurement.response_body(&response_text);
         trace!(provider = "gemini", status = %status, response = %response_text, "AI Provider 原始响应");
         if !status.is_success() {
             return Err(anyhow!(

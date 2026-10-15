@@ -182,6 +182,7 @@ pub fn render_prompt_sections(template: &str, conditions: &[(&str, bool)]) -> Re
                 "memory",
                 "group_memory",
                 "group_conversation",
+                "direct_conversation",
                 "agent_web_search",
                 "unread",
             ]

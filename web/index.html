@@ -7,6 +7,7 @@
   <title>Rolava Studio</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b8b62'/%3E%3Ctext x='16' y='22' text-anchor='middle' fill='white' font-family='Arial' font-size='17' font-weight='700'%3ER%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="./assets/app.css">
+  <link rel="stylesheet" href="./assets/statistics.css">
   <script src="./assets/lucide.min.js" defer></script>
   <script type="module" src="./assets/app.js"></script>
 </head>
@@ -29,6 +30,7 @@
         <p>工作区</p>
         <button class="nav-button active" data-page="overview"><i data-lucide="sparkles"></i>概览</button>
         <button class="nav-button" data-page="conversations"><i data-lucide="messages-square"></i>会话管理</button>
+        <button class="nav-button" data-page="statistics"><i data-lucide="chart-no-axes-combined"></i>请求统计</button>
         <button class="nav-button" data-page="skills"><i data-lucide="blocks"></i>Skills</button>
         <button class="nav-button" data-page="logs"><i data-lucide="scroll-text"></i>运行日志</button>
         <p>机器人设置</p>
@@ -81,6 +83,34 @@
               <div class="empty detail-empty"><i data-lucide="message-square-dashed"></i><strong>选择一个会话</strong><span>查看最新消息、记忆和定时任务</span></div>
             </section>
           </div>
+        </section>
+
+        <section class="page" id="page-statistics">
+          <div class="page-heading"><div><p class="eyebrow">REQUEST STATISTICS</p><h1>请求统计</h1><p>查看 OpenRouter 与 Gemini 每次请求的 Token 用量。</p></div><button class="button" type="button" id="statistics-refresh"><i data-lucide="refresh-cw"></i>刷新</button></div>
+          <section class="section-block statistics-filters">
+            <div class="statistics-presets" role="group" aria-label="快捷时间范围">
+              <button class="button small" type="button" data-statistics-hours="1">最近 1H</button>
+              <button class="button small active" type="button" data-statistics-hours="24" aria-pressed="true">最近 24H</button>
+              <button class="button small" type="button" data-statistics-hours="168">最近 7 天</button>
+              <button class="button small" type="button" data-statistics-hours="720">最近 30 天</button>
+            </div>
+            <form class="statistics-range"><label>开始时间<input id="statistics-start" type="datetime-local" step="1" required></label><label>结束时间<input id="statistics-end" type="datetime-local" step="1" required></label><button class="button primary" type="submit"><i data-lucide="search"></i>查询</button></form>
+            <p class="statistics-range-label" id="statistics-range-label" aria-live="polite">默认查询最近 24 小时</p>
+          </section>
+          <div class="metric-grid">
+            <article><div><small>请求次数</small><strong id="statistics-requests">—</strong><p id="statistics-request-detail">等待查询</p></div></article>
+            <article><div><small>输入 Token</small><strong id="statistics-input">—</strong><p>包含命中缓存的输入</p></div></article>
+            <article><div><small>输出 Token</small><strong id="statistics-output">—</strong><p>供应商返回的输出用量</p></div></article>
+            <article><div><small>总 Token</small><strong id="statistics-total">—</strong><p>供应商返回的总用量</p></div></article>
+            <article><div><small>缓存命中率</small><strong id="statistics-cache-rate">—</strong><p>仅含返回缓存数据的请求</p></div></article>
+          </div>
+          <p class="statistics-caption" id="statistics-coverage" aria-live="polite">未返回的用量显示为 —，汇总只计入已返回的值。</p>
+          <section class="section-block">
+            <div class="section-header"><div><h2>请求明细</h2><p>按请求开始时间倒序排列；每次重试、每轮工具请求分别记录。</p></div></div>
+            <div class="table-wrap statistics-table"><table><thead><tr><th scope="col">请求时间</th><th scope="col">供应商</th><th scope="col">模型</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col" class="statistics-number">输入 Token</th><th scope="col" class="statistics-number">输出 Token</th><th scope="col" class="statistics-number">总 Token</th><th scope="col" class="statistics-number">缓存命中率</th><th scope="col" class="statistics-number">耗时</th></tr></thead><tbody id="statistics-rows"><tr><td colspan="10" class="empty">选择时间范围查看请求记录</td></tr></tbody></table></div>
+            <div class="statistics-pagination"><span id="statistics-page-label">第 1 页 · 每页 50 条</span><button class="button small" type="button" id="statistics-previous" disabled>上一页</button><button class="button small" type="button" id="statistics-next" disabled>下一页</button></div>
+            <p class="statistics-retention">请求明细长期保留；仅统计启用此功能后的请求。</p>
+          </section>
         </section>
 
         <section class="page" id="page-logs">

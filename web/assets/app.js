@@ -4,9 +4,11 @@ import { ConversationsController } from "./conversations.js";
 import { LogsController } from "./logs.js";
 import { PromptController } from "./prompts.js";
 import { SkillsController } from "./skills.js";
+import { StatisticsController } from "./statistics.js";
 import { escapeHtml, formatTime, initial, refreshIcons, toast } from "./ui.js";
 
 const pageNames = {
+  statistics: "请求统计",
   overview: "概览", conversations: "会话管理", skills: "Skills", logs: "运行日志", connection: "连接配置",
   models: "模型服务", behavior: "消息行为", prompts: "角色与提示词", access: "权限与工具",
 };
@@ -37,6 +39,7 @@ const companionMessages = [
 ];
 
 const conversations = new ConversationsController();
+const statistics = new StatisticsController();
 new LogsController();
 const config = new ConfigController({ onRestart: restart, onDirty: markDirty });
 const prompts = new PromptController({ onRestart: restart });
@@ -84,6 +87,7 @@ async function enterApp() {
 }
 
 function showPage(page) {
+  if (page === "statistics") statistics.open();
   document.querySelectorAll(".page").forEach(element => element.classList.toggle("active", element.id === `page-${page}`));
   document.querySelectorAll(".nav-button").forEach(button => button.classList.toggle("active", button.dataset.page === page));
   document.getElementById("page-name").textContent = pageNames[page] || "Rolava";

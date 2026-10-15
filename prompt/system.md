@@ -50,6 +50,12 @@
 2. **无需回复，或当前话题已和你不再相关**：调用 `set_conversation_state`，传入 `{"state":"end"}`。
 {{/group_conversation}}
 
+{{#direct_conversation}}
+### 结束工具循环
+正常回复时，直接输出正文结束本轮响应，无需调用 `finish_response`。
+仅在决定不回复任何正文、且本轮无需继续调用其他工具时，才单独调用无参数的 `finish_response` 静默结束本轮工具循环。调用时不输出正文；调用后不再请求模型继续响应。
+{{/direct_conversation}}
+
 ## Skills 使用原则
 
 - 文件路径统一以 `/` 为根目录，使用正斜杠和绝对路径，例如 `/skills/example/SKILL.md`、`/data/images/example.png`
