@@ -8,6 +8,7 @@ use crate::config::AppConfig;
 use crate::conversation_control::ConversationControl;
 use crate::message_ingestion::MessageIngestionService;
 use crate::repository::db_manager::{ChatMessage, QQChatContextManager};
+use crate::request_statistics::{with_request_purpose, RequestPurpose};
 use crate::transport::message::{
     preferred_sender_name, readable_message_text, ConversationKind, IncomingMessage,
 };
@@ -140,14 +141,14 @@ impl ConversationFilter {
                         Vec::new()
                     }
                     None => {
-                        warn!("无法识别消息过滤结果，继续后续处理");
-                        accepted_messages
+                        warn!("无法识别消息过滤结果，拦截当前消息");
+                        Vec::new()
                     }
                 }
             }
             Err(err) => {
-                warn!(error = %format!("{err:#}"), "消息过滤模型请求失败，继续后续处理");
-                accepted_messages
+                warn!(error = %format!("{err:#}"), "消息过滤模型请求失败，拦截当前消息");
+                Vec::new()
             }
         }
     }
@@ -317,7 +318,11 @@ impl ConversationFilter {
                     self.app_config.app.filter_model_name
                 )
             })?;
-        provider.chat_completions(&messages, &[]).await
+        with_request_purpose(
+            RequestPurpose::Filter,
+            provider.chat_completions(&messages, &[]),
+        )
+        .await
     }
 
     fn parse_filter_action(content: &str) -> Option<FilterAction> {

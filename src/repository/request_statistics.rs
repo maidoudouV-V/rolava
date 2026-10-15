@@ -6,7 +6,9 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 
 use crate::ai_provider::ChatUsage;
-use crate::request_statistics::{RequestRecord, RequestStatisticsPage, RequestSummary};
+use crate::request_statistics::{
+    RequestCost, RequestRecord, RequestStatisticsPage, RequestSummary,
+};
 
 /// 独立的 SQLite 统计库，时间索引用于范围汇总与游标分页。
 pub struct RequestStatisticsStore {
@@ -29,8 +31,11 @@ impl RequestStatisticsStore {
             )
         });
         let pool = Pool::builder().max_size(3).build(manager)?;
-        pool.get()?.execute_batch(
-            "CREATE TABLE IF NOT EXISTS ai_requests (
+        {
+            let mut connection = pool.get()?;
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS ai_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 started_at INTEGER NOT NULL,
                 provider_type TEXT NOT NULL,
@@ -38,20 +43,71 @@ impl RequestStatisticsStore {
                 model_name TEXT NOT NULL,
                 model TEXT NOT NULL,
                 operation TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                response_kind TEXT,
                 outcome TEXT NOT NULL,
                 http_status INTEGER,
                 elapsed_ms INTEGER NOT NULL,
                 prompt_tokens INTEGER,
                 completion_tokens INTEGER,
                 total_tokens INTEGER,
-                cached_tokens INTEGER
-             );
-             CREATE INDEX IF NOT EXISTS idx_ai_requests_time
+                cached_tokens INTEGER,
+                input_price_per_million REAL,
+                output_price_per_million REAL,
+                cache_read_price_per_million REAL,
+                estimated_cost_usd REAL
+             );",
+            )?;
+            let columns = {
+                let mut statement = transaction.prepare("PRAGMA table_info(ai_requests)")?;
+                let columns = statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                columns
+            };
+            let mut legacy_schema = false;
+            if !columns.iter().any(|column| column == "purpose") {
+                transaction.execute_batch(
+                    "ALTER TABLE ai_requests ADD COLUMN purpose TEXT NOT NULL DEFAULT 'unknown';",
+                )?;
+                legacy_schema = true;
+            }
+            if !columns.iter().any(|column| column == "response_kind") {
+                transaction
+                    .execute_batch("ALTER TABLE ai_requests ADD COLUMN response_kind TEXT;")?;
+                legacy_schema = true;
+            }
+            if legacy_schema {
+                // 旧结构无法还原调用用途和响应类型，仅清空该结构的统计明细。
+                transaction.execute("DELETE FROM ai_requests", [])?;
+            }
+            for column in [
+                "input_price_per_million",
+                "output_price_per_million",
+                "cache_read_price_per_million",
+                "estimated_cost_usd",
+            ] {
+                if !columns.iter().any(|existing| existing == column) {
+                    transaction.execute_batch(&format!(
+                        "ALTER TABLE ai_requests ADD COLUMN {column} REAL;"
+                    ))?;
+                    if column == "estimated_cost_usd" {
+                        transaction.execute_batch("DROP INDEX IF EXISTS idx_ai_requests_usage;")?;
+                    }
+                }
+            }
+            transaction.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_ai_requests_time
              ON ai_requests (started_at DESC, id DESC);
              CREATE INDEX IF NOT EXISTS idx_ai_requests_usage
              ON ai_requests (started_at, outcome, prompt_tokens, completion_tokens,
-                             total_tokens, cached_tokens);",
-        )?;
+                             total_tokens, cached_tokens, estimated_cost_usd);
+             CREATE INDEX IF NOT EXISTS idx_ai_requests_purpose
+             ON ai_requests (purpose, started_at DESC, id DESC, outcome, prompt_tokens,
+                             completion_tokens, total_tokens, cached_tokens, estimated_cost_usd);",
+            )?;
+            transaction.commit()?;
+        }
         Ok(Self { pool })
     }
 
@@ -60,8 +116,11 @@ impl RequestStatisticsStore {
             "INSERT INTO ai_requests (
                 started_at, provider_type, provider_name, model_name, model, operation,
                 outcome, http_status, elapsed_ms, prompt_tokens, completion_tokens,
-                total_tokens, cached_tokens
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                total_tokens, cached_tokens, purpose, response_kind,
+                input_price_per_million, output_price_per_million,
+                cache_read_price_per_million, estimated_cost_usd
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                       ?16, ?17, ?18, ?19)",
             params![
                 record.started_at,
                 record.provider_type,
@@ -76,6 +135,12 @@ impl RequestStatisticsStore {
                 record.usage.completion_tokens,
                 record.usage.total_tokens,
                 record.usage.cached_tokens,
+                record.purpose,
+                record.response_kind,
+                record.cost.input_price_per_million,
+                record.cost.output_price_per_million,
+                record.cost.cache_read_price_per_million,
+                record.cost.estimated_cost_usd,
             ],
         )?;
         Ok(())
@@ -85,15 +150,21 @@ impl RequestStatisticsStore {
         &self,
         start: i64,
         end: i64,
+        purpose: Option<&str>,
         cursor: Option<(i64, i64)>,
         limit: u32,
         include_summary: bool,
     ) -> Result<RequestStatisticsPage> {
         let mut connection = self.pool.get()?;
         let transaction = connection.transaction()?;
+        let purpose_filter = if purpose.is_some() {
+            "AND purpose = ?3"
+        } else {
+            "AND ?3 IS NULL"
+        };
         let summary = if include_summary {
             Some(transaction.query_row(
-                "SELECT COUNT(*),
+                &format!("SELECT COUNT(*),
                     COUNT(CASE WHEN outcome = 'success' THEN 1 END),
                     COUNT(CASE WHEN outcome = 'failed' THEN 1 END),
                     COUNT(CASE WHEN outcome = 'interrupted' THEN 1 END),
@@ -101,9 +172,10 @@ impl RequestStatisticsStore {
                         OR total_tokens IS NOT NULL OR cached_tokens IS NOT NULL THEN 1 END),
                     SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens), SUM(cached_tokens),
                     SUM(CASE WHEN cached_tokens IS NOT NULL AND prompt_tokens > 0 THEN cached_tokens END),
-                    SUM(CASE WHEN cached_tokens IS NOT NULL AND prompt_tokens > 0 THEN prompt_tokens END)
-                 FROM ai_requests WHERE started_at >= ?1 AND started_at < ?2",
-                params![start, end],
+                    SUM(CASE WHEN cached_tokens IS NOT NULL AND prompt_tokens > 0 THEN prompt_tokens END),
+                    COUNT(estimated_cost_usd), SUM(estimated_cost_usd)
+                 FROM ai_requests WHERE started_at >= ?1 AND started_at < ?2 {purpose_filter}"),
+                params![start, end, purpose],
                 |row| {
                     let cache_hits: Option<f64> = row.get(9)?;
                     let cache_inputs: Option<f64> = row.get(10)?;
@@ -122,6 +194,8 @@ impl RequestStatisticsStore {
                         cache_hit_rate: cache_hits.zip(cache_inputs)
                             .filter(|(_, inputs)| *inputs > 0.0)
                             .map(|(hits, inputs)| hits / inputs),
+                        cost_known_requests: row.get(11)?,
+                        estimated_cost_usd: row.get(12)?,
                     })
                 },
             )?)
@@ -130,18 +204,21 @@ impl RequestStatisticsStore {
         };
         let limit = limit.clamp(1, 100);
         let (cursor_time, cursor_id) = cursor.unwrap_or((i64::MAX, i64::MAX));
-        let mut statement = transaction.prepare(
+        let mut statement = transaction.prepare(&format!(
             "SELECT id, started_at, provider_type, provider_name, model_name, model, operation,
                     outcome, http_status, elapsed_ms, prompt_tokens, completion_tokens,
-                    total_tokens, cached_tokens
+                    total_tokens, cached_tokens, purpose, response_kind,
+                    input_price_per_million, output_price_per_million,
+                    cache_read_price_per_million, estimated_cost_usd
              FROM ai_requests
              WHERE started_at >= ?1 AND started_at < ?2
-               AND (started_at, id) < (?3, ?4)
-             ORDER BY started_at DESC, id DESC LIMIT ?5",
-        )?;
+               {purpose_filter}
+               AND (started_at, id) < (?4, ?5)
+             ORDER BY started_at DESC, id DESC LIMIT ?6"
+        ))?;
         let mut items = statement
             .query_map(
-                params![start, end, cursor_time, cursor_id, limit + 1],
+                params![start, end, purpose, cursor_time, cursor_id, limit + 1],
                 |row| {
                     Ok(RequestRecord {
                         id: row.get(0)?,
@@ -151,6 +228,8 @@ impl RequestStatisticsStore {
                         model_name: row.get(4)?,
                         model: row.get(5)?,
                         operation: row.get(6)?,
+                        purpose: row.get(14)?,
+                        response_kind: row.get(15)?,
                         outcome: row.get(7)?,
                         http_status: row.get(8)?,
                         elapsed_ms: row.get(9)?,
@@ -159,6 +238,12 @@ impl RequestStatisticsStore {
                             completion_tokens: row.get(11)?,
                             total_tokens: row.get(12)?,
                             cached_tokens: row.get(13)?,
+                        },
+                        cost: RequestCost {
+                            input_price_per_million: row.get(16)?,
+                            output_price_per_million: row.get(17)?,
+                            cache_read_price_per_million: row.get(18)?,
+                            estimated_cost_usd: row.get(19)?,
                         },
                     })
                 },

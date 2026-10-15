@@ -86,7 +86,7 @@
         </section>
 
         <section class="page" id="page-statistics">
-          <div class="page-heading"><div><p class="eyebrow">REQUEST STATISTICS</p><h1>请求统计</h1><p>查看 OpenRouter 与 Gemini 每次请求的 Token 用量。</p></div><button class="button" type="button" id="statistics-refresh"><i data-lucide="refresh-cw"></i>刷新</button></div>
+          <div class="page-heading"><div><p class="eyebrow">REQUEST STATISTICS</p><h1>请求统计</h1><p>查看 OpenRouter、Gemini 与 OpenAI Compatible 的请求用量及预估费用。</p></div><button class="button" type="button" id="statistics-refresh"><i data-lucide="refresh-cw"></i>刷新</button></div>
           <section class="section-block statistics-filters">
             <div class="statistics-presets" role="group" aria-label="快捷时间范围">
               <button class="button small" type="button" data-statistics-hours="1">最近 1H</button>
@@ -94,22 +94,23 @@
               <button class="button small" type="button" data-statistics-hours="168">最近 7 天</button>
               <button class="button small" type="button" data-statistics-hours="720">最近 30 天</button>
             </div>
-            <form class="statistics-range"><label>开始时间<input id="statistics-start" type="datetime-local" step="1" required></label><label>结束时间<input id="statistics-end" type="datetime-local" step="1" required></label><button class="button primary" type="submit"><i data-lucide="search"></i>查询</button></form>
+            <form class="statistics-range"><label>模型用途<select id="statistics-purpose"><option value="chat" selected>主模型</option><option value="all">全部用途</option><option value="filter">前置过滤</option><option value="vision">图片理解</option><option value="web_search">联网搜索</option><option value="history_summary">历史摘要</option><option value="memory_review">记忆整理</option><option value="model_test">模型测试</option><option value="unknown">未标注</option></select></label><label>开始时间<input id="statistics-start" type="datetime-local" step="1" required></label><label>结束时间<input id="statistics-end" type="datetime-local" step="1" required></label><button class="button primary" type="submit"><i data-lucide="search"></i>查询</button></form>
             <p class="statistics-range-label" id="statistics-range-label" aria-live="polite">默认查询最近 24 小时</p>
           </section>
           <div class="metric-grid">
             <article><div><small>请求次数</small><strong id="statistics-requests">—</strong><p id="statistics-request-detail">等待查询</p></div></article>
             <article><div><small>输入 Token</small><strong id="statistics-input">—</strong><p>包含命中缓存的输入</p></div></article>
-            <article><div><small>输出 Token</small><strong id="statistics-output">—</strong><p>供应商返回的输出用量</p></div></article>
+            <article><div><small>输出 Token</small><strong id="statistics-output">—</strong><p>输出用量，包含思考 Token</p></div></article>
             <article><div><small>总 Token</small><strong id="statistics-total">—</strong><p>供应商返回的总用量</p></div></article>
             <article><div><small>缓存命中率</small><strong id="statistics-cache-rate">—</strong><p>仅含返回缓存数据的请求</p></div></article>
+            <article><div><small>预估费用（USD）</small><strong id="statistics-cost">未知</strong><p id="statistics-cost-detail">仅汇总已知费用</p></div></article>
           </div>
           <p class="statistics-caption" id="statistics-coverage" aria-live="polite">未返回的用量显示为 —，汇总只计入已返回的值。</p>
           <section class="section-block">
             <div class="section-header"><div><h2>请求明细</h2><p>按请求开始时间倒序排列；每次重试、每轮工具请求分别记录。</p></div></div>
-            <div class="table-wrap statistics-table"><table><thead><tr><th scope="col">请求时间</th><th scope="col">供应商</th><th scope="col">模型</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col" class="statistics-number">输入 Token</th><th scope="col" class="statistics-number">输出 Token</th><th scope="col" class="statistics-number">总 Token</th><th scope="col" class="statistics-number">缓存命中率</th><th scope="col" class="statistics-number">耗时</th></tr></thead><tbody id="statistics-rows"><tr><td colspan="10" class="empty">选择时间范围查看请求记录</td></tr></tbody></table></div>
+            <div class="table-wrap statistics-table"><table><thead><tr><th scope="col">请求时间</th><th scope="col">供应商</th><th scope="col">模型</th><th scope="col">模型用途</th><th scope="col">响应类型</th><th scope="col">状态</th><th scope="col" class="statistics-number">输入 Token</th><th scope="col" class="statistics-number">输出 Token</th><th scope="col" class="statistics-number">总 Token</th><th scope="col" class="statistics-number">缓存命中率</th><th scope="col" class="statistics-number">预估费用（USD）</th><th scope="col" class="statistics-number">耗时</th></tr></thead><tbody id="statistics-rows"><tr><td colspan="12" class="empty">选择时间范围查看请求记录</td></tr></tbody></table></div>
             <div class="statistics-pagination"><span id="statistics-page-label">第 1 页 · 每页 50 条</span><button class="button small" type="button" id="statistics-previous" disabled>上一页</button><button class="button small" type="button" id="statistics-next" disabled>下一页</button></div>
-            <p class="statistics-retention">请求明细长期保留；仅统计启用此功能后的请求。</p>
+            <p class="statistics-retention">请求明细长期保留。费用按请求当时的参考单价估算 Token 消耗，包含缓存读取，暂不考虑缓存写入价格；缺少价格或必要用量时为未知，费用汇总仅包含已知记录。</p>
           </section>
         </section>
 

@@ -88,7 +88,7 @@ pub struct ContextMessage {
 pub struct ChatUsage {
     /// 本次请求输入消耗的 token 总数。
     pub prompt_tokens: Option<u64>,
-    /// 本次请求输出消耗的 token 总数。
+    /// 本次请求输出消耗的 token 总数，包含供应商报告的思考用量。
     pub completion_tokens: Option<u64>,
     /// 本次请求总共消耗的 token 数。
     pub total_tokens: Option<u64>,
@@ -97,7 +97,8 @@ pub struct ChatUsage {
 }
 
 impl ChatUsage {
-    pub(crate) fn from_openrouter(raw: &Value) -> Option<Self> {
+    /// Chat Completions 的缓存和推理明细已包含在输入、输出总量中，不重复相加。
+    pub(crate) fn from_chat_completions(raw: &Value) -> Option<Self> {
         let usage = raw.get("usage")?.as_object()?;
         Some(Self {
             prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
@@ -112,11 +113,24 @@ impl ChatUsage {
 
     pub(crate) fn from_gemini(raw: &Value) -> Option<Self> {
         let usage = raw.get("usageMetadata")?.as_object()?;
+        let prompt_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
+        let thoughts = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+        let completion_tokens = usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .or_else(|| thoughts.map(|_| 0))
+            .and_then(|candidates| candidates.checked_add(thoughts.unwrap_or(0)));
+        // Gemini 的缓存计数是隐式 presence 的整数，ProtoJSON 会省略值为 0 的字段。
+        // 仅在已返回输入用量且缓存字段缺省时归为 0；无用量或无效字段仍保留为空。
+        let cached_tokens = match usage.get("cachedContentTokenCount") {
+            Some(value) => value.as_u64(),
+            None => prompt_tokens.map(|_| 0),
+        };
         Some(Self {
-            prompt_tokens: usage.get("promptTokenCount").and_then(Value::as_u64),
-            completion_tokens: usage.get("candidatesTokenCount").and_then(Value::as_u64),
+            prompt_tokens,
+            completion_tokens,
             total_tokens: usage.get("totalTokenCount").and_then(Value::as_u64),
-            cached_tokens: usage.get("cachedContentTokenCount").and_then(Value::as_u64),
+            cached_tokens,
         })
     }
 }

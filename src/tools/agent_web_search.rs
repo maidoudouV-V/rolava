@@ -6,6 +6,7 @@ use tracing::warn;
 
 use crate::ai_provider::run_ai_request_with_timeout;
 use crate::config::render_prompt_template;
+use crate::request_statistics::{with_request_purpose, RequestPurpose};
 
 use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 
@@ -73,7 +74,10 @@ impl Tool for AgentWebSearchTool {
             let search_result = run_ai_request_with_timeout(
                 timeout_seconds,
                 "联网搜索 API 请求",
-                provider.web_search(&search_prompt),
+                with_request_purpose(
+                    RequestPurpose::WebSearch,
+                    provider.web_search(&search_prompt),
+                ),
             )
             .await;
 

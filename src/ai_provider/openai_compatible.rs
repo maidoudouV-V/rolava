@@ -2,6 +2,7 @@ use crate::ai_provider::{
     AIProvider, ChatUsage, ExtraBody, ReasoningPayload, ReasoningState, ToolChatContentPart,
     ToolChatMessage, ToolChatResponse, ToolChatUserContent,
 };
+use crate::request_statistics::{RequestMeasurement, RequestRecorder};
 use crate::tools::{ToolCall, ToolDefinition};
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
@@ -24,6 +25,7 @@ pub struct OpenAICompatibleProvider {
     max_tokens: Option<i32>,
     reasoning_effort: String,
     extra_body: ExtraBody,
+    request_recorder: Option<RequestRecorder>,
 }
 
 impl OpenAICompatibleProvider {
@@ -42,12 +44,47 @@ impl OpenAICompatibleProvider {
             max_tokens,
             reasoning_effort: reasoning_effort.into(),
             extra_body: ExtraBody::default(),
+            request_recorder: None,
         }
     }
 
     pub fn with_extra_body(mut self, extra_body: ExtraBody) -> Self {
         self.extra_body = extra_body;
         self
+    }
+
+    async fn send_request(
+        &self,
+        body: &Value,
+        api_name: &str,
+        measurement: &mut RequestMeasurement,
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let resp = self
+            .http_client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        measurement.response_status(status.as_u16());
+        let response_text = if status.is_success() {
+            resp.text().await?
+        } else {
+            resp.text().await.unwrap_or_default()
+        };
+        measurement.response_body(&response_text);
+        trace!(provider = "openai_compatible", status = %status, response = %response_text, "AI Provider 原始响应");
+        if !status.is_success() {
+            return Err(anyhow!(
+                "{} 调用失败，状态码 {}：{}",
+                api_name,
+                status,
+                response_text
+            ));
+        }
+        Ok(response_text)
     }
 }
 
@@ -186,7 +223,6 @@ struct OpenAICompatibleChatResponse {
     id: Option<String>,
     model: Option<String>,
     choices: Option<Vec<OpenAICompatibleChoice>>,
-    usage: Option<OpenAICompatibleUsage>,
 }
 #[derive(Deserialize)]
 struct OpenAICompatibleChoice {
@@ -215,13 +251,6 @@ struct OpenAICompatibleResponseToolCall {
 struct OpenAICompatibleResponseFunctionCall {
     name: String,
     arguments: String,
-}
-
-#[derive(Deserialize)]
-struct OpenAICompatibleUsage {
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    total_tokens: Option<u64>,
 }
 
 fn build_openai_compatible_request<'a>(
@@ -325,12 +354,15 @@ fn openai_user_content(content: &ToolChatUserContent) -> OpenAICompatibleUserCon
 
 #[async_trait]
 impl AIProvider for OpenAICompatibleProvider {
+    fn set_request_recorder(&mut self, recorder: RequestRecorder) {
+        self.request_recorder = Some(recorder);
+    }
+
     async fn chat_completions(
         &self,
         messages: &[ToolChatMessage],
         tools: &[ToolDefinition],
     ) -> anyhow::Result<ToolChatResponse> {
-        let url = format!("{}/chat/completions", self.base_url);
         let body = self.extra_body.merge(build_openai_compatible_request(
             &self.model,
             self.max_tokens,
@@ -345,32 +377,24 @@ impl AIProvider for OpenAICompatibleProvider {
                 .unwrap_or_else(|error| format!("序列化请求失败: {}", error)),
             "AI Provider 完整请求"
         );
-        let resp = self
-            .http_client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text = resp.text().await.unwrap_or_default();
-            trace!(provider = "openai_compatible", status = %status, response = %error_text, "AI Provider 原始错误响应");
-            return Err(anyhow!(
-                "OpenAI Compatible API 调用失败，状态码 {}：{}",
-                status,
-                error_text
-            ));
+        let mut measurement = RequestMeasurement::begin(
+            self.request_recorder.as_ref(),
+            "openai_compatible",
+            &self.model,
+            "chat",
+        );
+        let result = async {
+            let response_text = self
+                .send_request(&body, "OpenAI Compatible API", &mut measurement)
+                .await?;
+            parse_openai_compatible_chat_response(&response_text)
         }
-
-        let response_text = resp.text().await?;
-        trace!(provider = "openai_compatible", response = %response_text, "AI Provider 原始响应");
-        parse_openai_compatible_chat_response(&response_text)
+        .await;
+        measurement.complete(result.is_ok());
+        result
     }
 
     async fn describe_image(&self, image_data_url: &str, prompt: &str) -> anyhow::Result<String> {
-        let url = format!("{}/chat/completions", self.base_url);
         let body = self.extra_body.merge(OpenAICompatibleVisionRequest {
             model: &self.model,
             messages: vec![OpenAICompatibleVisionMessage {
@@ -396,38 +420,30 @@ impl AIProvider for OpenAICompatibleProvider {
             "视觉 Provider 请求"
         );
 
-        let resp = self
-            .http_client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text = resp.text().await.unwrap_or_default();
-            trace!(provider = "openai_compatible", status = %status, response = %error_text, "视觉 Provider 原始错误响应");
-            return Err(anyhow!(
-                "OpenAI Compatible 视觉 API 调用失败，状态码 {}：{}",
-                status,
-                error_text
-            ));
+        let mut measurement = RequestMeasurement::begin(
+            self.request_recorder.as_ref(),
+            "openai_compatible",
+            &self.model,
+            "vision",
+        );
+        let result = async {
+            let response_text = self
+                .send_request(&body, "OpenAI Compatible 视觉 API", &mut measurement)
+                .await?;
+            let parsed =
+                parse_openai_compatible_response(&response_text, "OpenAI Compatible 视觉响应")?;
+            first_choice(&parsed, &response_text, "OpenAI Compatible 视觉响应")?
+                .message
+                .content
+                .clone()
+                .ok_or_else(|| anyhow!("OpenAI Compatible 视觉响应内容为空"))
         }
-
-        let response_text = resp.text().await?;
-        trace!(provider = "openai_compatible", response = %response_text, "视觉 Provider 原始响应");
-        let parsed =
-            parse_openai_compatible_response(&response_text, "OpenAI Compatible 视觉响应")?;
-        first_choice(&parsed, &response_text, "OpenAI Compatible 视觉响应")?
-            .message
-            .content
-            .clone()
-            .ok_or_else(|| anyhow!("OpenAI Compatible 视觉响应内容为空"))
+        .await;
+        measurement.complete(result.is_ok());
+        result
     }
 
     async fn web_search(&self, question: &str) -> anyhow::Result<String> {
-        let url = format!("{}/chat/completions", self.base_url);
         let body = self.extra_body.merge(OpenAICompatibleWebSearchRequest {
             model: &self.model,
             messages: vec![OpenAICompatibleToolMessage::User {
@@ -445,38 +461,31 @@ impl AIProvider for OpenAICompatibleProvider {
             "联网搜索 Provider 完整请求"
         );
 
-        let resp = self
-            .http_client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text = resp.text().await.unwrap_or_default();
-            trace!(provider = "openai_compatible", status = %status, response = %error_text, "联网搜索 Provider 原始错误响应");
-            return Err(anyhow!(
-                "OpenAI Compatible 联网搜索 API 调用失败，状态码 {}：{}",
-                status,
-                error_text
-            ));
+        let mut measurement = RequestMeasurement::begin(
+            self.request_recorder.as_ref(),
+            "openai_compatible",
+            &self.model,
+            "web_search",
+        );
+        let result = async {
+            let response_text = self
+                .send_request(&body, "OpenAI Compatible 联网搜索 API", &mut measurement)
+                .await?;
+            let parsed =
+                parse_openai_compatible_response(&response_text, "OpenAI Compatible 联网搜索响应")?;
+            let choice = first_choice(&parsed, &response_text, "OpenAI Compatible 联网搜索响应")?;
+            choice
+                .message
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|content| !content.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("OpenAI Compatible 联网搜索响应内容为空"))
         }
-
-        let response_text = resp.text().await?;
-        trace!(provider = "openai_compatible", response = %response_text, "联网搜索 Provider 原始响应");
-        let parsed =
-            parse_openai_compatible_response(&response_text, "OpenAI Compatible 联网搜索响应")?;
-        let choice = first_choice(&parsed, &response_text, "OpenAI Compatible 联网搜索响应")?;
-        choice
-            .message
-            .content
-            .as_deref()
-            .map(str::trim)
-            .filter(|content| !content.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("OpenAI Compatible 联网搜索响应内容为空"))
+        .await;
+        measurement.complete(result.is_ok());
+        result
     }
 }
 
@@ -513,12 +522,7 @@ fn parse_openai_compatible_chat_response(response_text: &str) -> anyhow::Result<
         );
     }
 
-    let usage = parsed.usage.map(|usage| ChatUsage {
-        prompt_tokens: usage.prompt_tokens,
-        completion_tokens: usage.completion_tokens,
-        total_tokens: usage.total_tokens,
-        cached_tokens: None,
-    });
+    let usage = ChatUsage::from_chat_completions(&raw_response);
 
     Ok(ToolChatResponse {
         content,

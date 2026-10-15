@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use super::error::ApiError;
 use super::state::AdminState;
+use crate::request_statistics::RequestPurpose;
 
 #[derive(Deserialize)]
 pub(super) struct StatisticsQuery {
@@ -16,6 +17,7 @@ pub(super) struct StatisticsQuery {
     cursor: Option<String>,
     limit: Option<u32>,
     summary: Option<bool>,
+    purpose: Option<String>,
 }
 
 pub(super) async fn get_statistics(
@@ -45,10 +47,17 @@ pub(super) async fn get_statistics(
         })
         .transpose()?;
     let store = state.request_statistics.clone();
+    let purpose = query.purpose.as_deref().unwrap_or("chat");
+    if purpose != "all" && !RequestPurpose::is_valid(purpose) {
+        return Err(ApiError::bad_request("请求统计模型用途无效"));
+    }
+    let purpose = (purpose != "all").then(|| purpose.to_string());
+    let response_purpose = purpose.clone().unwrap_or_else(|| "all".to_string());
     let page = tokio::task::spawn_blocking(move || {
         store.query(
             start,
             end,
+            purpose.as_deref(),
             cursor,
             query.limit.unwrap_or(50),
             query.summary.unwrap_or(true),
@@ -61,5 +70,6 @@ pub(super) async fn get_statistics(
         "next_cursor": page.next_cursor,
         "start": start,
         "end": end,
+        "purpose": response_purpose,
     })))
 }

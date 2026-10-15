@@ -10,7 +10,7 @@ use crate::config::AppConfig;
 use crate::memory::UserMemoryService;
 use crate::model_metadata::ModelMetadataStore;
 use crate::repository::db_manager::QQChatContextManager;
-use crate::request_statistics::RequestStatisticsStore;
+use crate::request_statistics::{RequestPricing, RequestStatisticsStore};
 use crate::runtime_state::RuntimeState;
 use crate::scheduler::SchedulerService;
 use crate::transport::onebot::OneBotHttpServer;
@@ -35,6 +35,7 @@ pub struct AdminState {
     pub(super) user_memory: Arc<UserMemoryService>,
     pub(super) model_metadata: Arc<ModelMetadataStore>,
     pub request_statistics: Arc<RequestStatisticsStore>,
+    pub request_pricing: Arc<RequestPricing>,
 }
 
 impl AdminState {
@@ -49,9 +50,11 @@ impl AdminState {
         restart: CancellationToken,
         model_metadata: Arc<ModelMetadataStore>,
         request_statistics: Arc<RequestStatisticsStore>,
+        request_pricing: Arc<RequestPricing>,
     ) -> Self {
         Self {
             request_statistics,
+            request_pricing,
             group_context_history_limit: app_config.app.group_max_history_messages,
             direct_context_history_limit: app_config.app.direct_max_history_messages,
             context_summary_days: app_config.app.history_summary_days,

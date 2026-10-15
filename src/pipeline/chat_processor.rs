@@ -16,6 +16,7 @@ use crate::history_compression::render_summary_date_heading;
 use crate::memory::{GroupMemorySession, UserMemorySession};
 use crate::message_enricher::{read_image_bytes, MessageEnricher};
 use crate::repository::db_manager::{ChatMessage, ConversationDailySummary};
+use crate::request_statistics::{with_request_purpose, RequestPurpose};
 use crate::tools::{
     ConversationEffect, ConversationToolContext, ToolContext, ToolDefinition, ToolRegistry,
     ToolResult, ToolServices,
@@ -286,7 +287,7 @@ impl ChatProcessor {
                 tool_count = tool_definitions.len()
             );
             let response = match self
-                .request_ai(&request_messages, &tool_definitions)
+                .request_ai(&request_messages, &tool_definitions, silent)
                 .instrument(ai_span)
                 .await
             {
@@ -506,6 +507,7 @@ impl ChatProcessor {
         &self,
         messages: &[ToolChatMessage],
         tool_definitions: &[ToolDefinition],
+        memory_review: bool,
     ) -> anyhow::Result<ToolChatResponse> {
         let max_attempts = self.services.app_config.app.ai_request_max_attempts();
         let session_id = self.openrouter_session_id();
@@ -523,10 +525,17 @@ impl ChatProcessor {
                 run_ai_request_with_timeout(
                     self.services.app_config.app.ai_request_timeout_seconds,
                     "聊天模型 API 请求",
-                    chat_provider.chat_completions_with_session(
-                        messages,
-                        tool_definitions,
-                        Some(&session_id),
+                    with_request_purpose(
+                        if memory_review {
+                            RequestPurpose::MemoryReview
+                        } else {
+                            RequestPurpose::Chat
+                        },
+                        chat_provider.chat_completions_with_session(
+                            messages,
+                            tool_definitions,
+                            Some(&session_id),
+                        ),
                     ),
                 )
                 .await

@@ -22,6 +22,23 @@ pub struct ModelPricing {
 }
 
 impl ModelPricing {
+    pub fn from_openrouter(model: &serde_json::Value) -> Self {
+        let price = |key: &str| {
+            let value = model.get("pricing")?.get(key)?;
+            let value = value
+                .as_f64()
+                .or_else(|| value.as_str()?.parse::<f64>().ok())?;
+            let value = value * 1_000_000.0;
+            (value.is_finite() && value >= 0.0).then_some(value)
+        };
+        Self {
+            input: price("prompt"),
+            output: price("completion"),
+            cache_read: price("input_cache_read"),
+            cache_write: price("input_cache_write"),
+        }
+    }
+
     pub fn merge_missing(&mut self, other: &Self) {
         self.input = self.input.or(other.input);
         self.output = self.output.or(other.output);

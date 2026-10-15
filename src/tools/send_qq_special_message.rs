@@ -10,9 +10,9 @@ use super::{parse_arguments, Tool, ToolContext, ToolOutput};
 use crate::transport::{QqExpression, QqImage, SendOptions};
 use crate::message_enricher::{image_relative_path, read_image_bytes, MAX_IMAGE_BYTES, MAX_IMAGE_BATCH_BYTES};
 
-const DESCRIPTION: &str = r#"向当前聊天窗口发送一个表情或一张、多张图片，按 type 选择：
+const DESCRIPTION: &str = r#"向当前聊天窗口发送一个表情，特殊表情，或一张、多张图片，按 type 选择：
 - face：通过 face_name 指定准确的 QQ 表情名称，可用经典表情（如撇嘴、大哭、尴尬）或群友之前发送的表情名称。
-- dice / rps：随机掷骰子 / 包剪锤，无需 face_name。
+- dice / rps：随机掷骰子 / 随机包剪锤，无需 face_name。
 - image：通过 image_paths 数组指定图片。
 
 仅使用当前 type 对应的参数，忽略其他已定义参数。

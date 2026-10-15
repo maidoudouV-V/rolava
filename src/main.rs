@@ -150,37 +150,66 @@ async fn run_worker() -> Result<WorkerExit> {
     admin::write_enabled_skills(&config_path, &app_config.app.enabled_skills)?;
     // 只在 worker 内设置，使配置删除后的旧值不会被 supervisor 继续传给新进程。
     app_config.apply_skill_environment();
+    let admin_logs = Arc::new(admin::AdminLogBuffer::new(1000));
+    init_tracing(app_config.logging.level.as_str(), admin_logs.clone());
+    let metadata_path = config_path.with_file_name("models.dev.json");
+    let model_metadata = Arc::new(model_metadata::ModelMetadataStore::load_local(
+        &metadata_path,
+    ));
+    let request_pricing = Arc::new(request_statistics::RequestPricing::new(
+        model_metadata.clone(),
+    ));
     let request_statistics = Arc::new(request_statistics::RequestStatisticsStore::new(
         "data/ai_requests.db",
     )?);
     for model in &app_config.models {
         if let Some(provider) = app_config.ai_models.get_mut(&model.name) {
-            provider.set_request_recorder(request_statistics::RequestRecorder::new(
-                request_statistics.clone(),
-                model.provider.clone(),
-                model.name.clone(),
-            ));
+            let base_url = app_config
+                .providers
+                .iter()
+                .find(|provider| provider.name == model.provider)
+                .map(|provider| provider.base_url.clone())
+                .unwrap_or_default();
+            provider.set_request_recorder(
+                request_statistics::RequestRecorder::new(
+                    request_statistics.clone(),
+                    model.provider.clone(),
+                    model.name.clone(),
+                )
+                .with_pricing(request_pricing.clone(), base_url),
+            );
         }
     }
     let app_config = Arc::new(app_config);
-    let admin_logs = Arc::new(admin::AdminLogBuffer::new(1000));
-    init_tracing(app_config.logging.level.as_str(), admin_logs.clone());
-
     let restart = CancellationToken::new();
-    let metadata_path = config_path.with_file_name("models.dev.json");
-    let model_metadata = Arc::new(model_metadata::ModelMetadataStore::load_local(
-        &metadata_path,
-    ));
     let metadata_store = model_metadata.clone();
+    let pricing_store = request_pricing.clone();
+    let openrouter_providers = app_config
+        .providers
+        .iter()
+        .filter(|provider| provider.r#type == "openrouter")
+        .cloned()
+        .collect::<Vec<_>>();
     let metadata_shutdown = restart.clone();
     let model_metadata_task = tokio::spawn(async move {
         tokio::select! {
             _ = metadata_shutdown.cancelled() => {},
-            result = metadata_store.refresh(&metadata_path) => {
-                if let Err(error) = result {
-                    warn!(error = %format!("{error:#}"), "模型资料库在线更新失败");
-                }
-            }
+            _ = async {
+                tokio::join!(
+                    async {
+                        if let Err(error) = metadata_store.refresh(&metadata_path).await {
+                            warn!(error = %format!("{error:#}"), "模型资料库在线更新失败");
+                        }
+                    },
+                    async {
+                        for provider in openrouter_providers {
+                            if let Err(error) = pricing_store.refresh_openrouter(&provider.base_url, &provider.key).await {
+                                warn!(provider = %provider.name, error = %format!("{error:#}"), "OpenRouter 参考价格更新失败");
+                            }
+                        }
+                    }
+                );
+            } => {}
         }
     });
     let runtime = Arc::new(RuntimeState::default());
@@ -225,6 +254,7 @@ async fn run_worker() -> Result<WorkerExit> {
         restart.clone(),
         model_metadata,
         request_statistics,
+        request_pricing,
     ));
     let admin_router = admin::router(admin_state);
 

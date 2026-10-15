@@ -21,6 +21,7 @@ use crate::config::AppConfig;
 use crate::repository::db_manager::{
     ImageSource, NewReceivedImage, QQChatContextManager, ReceivedImageRecord, ReferencedMessage,
 };
+use crate::request_statistics::{with_request_purpose, RequestPurpose};
 use crate::transport::message::{preferred_sender_name, IncomingMessage};
 
 const IMAGE_READ_FAILED_TEXT: &str = "[图片消息 读取失败]";
@@ -584,9 +585,12 @@ impl MessageEnricher {
             match run_ai_request_with_timeout(
                 app_config.app.ai_request_timeout_seconds,
                 "图片识别 API 请求",
-                visual_provider.describe_image(
-                    &image_data_url,
-                    app_config.prompt_config.image_description_prompt.trim(),
+                with_request_purpose(
+                    RequestPurpose::Vision,
+                    visual_provider.describe_image(
+                        &image_data_url,
+                        app_config.prompt_config.image_description_prompt.trim(),
+                    ),
                 ),
             )
             .await

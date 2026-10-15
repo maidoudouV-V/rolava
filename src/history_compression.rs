@@ -16,6 +16,7 @@ use crate::conversation_trigger::{ConversationTrigger, RoutedConversationTrigger
 use crate::repository::db_manager::{
     ChatMessage, NewConversationDailySummary, PendingDailySummary, QQChatContextManager,
 };
+use crate::request_statistics::{with_request_purpose, RequestPurpose};
 use crate::runtime_state::RuntimeState;
 use crate::tools::ToolRegistry;
 use crate::transport::message::{Conversation, ConversationKind, MessageTarget};
@@ -256,7 +257,10 @@ impl HistoryCompressionService {
                 .ai_models
                 .get(&self.app_config.app.chat_model_name)
                 .expect("找不到聊天模型配置");
-            let request = provider.chat_completions(messages, &[]);
+            let request = with_request_purpose(
+                RequestPurpose::HistorySummary,
+                provider.chat_completions(messages, &[]),
+            );
             let result =
                 run_ai_request_with_timeout(timeout_seconds, "聊天记录压缩请求", request).await;
             match result.and_then(completed_summary_text) {

@@ -1,15 +1,15 @@
 .statistics-filters { margin-bottom: 18px; }
 .statistics-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px; }
 .statistics-presets button.active { color: var(--green); border-color: var(--green); background: var(--green-soft); }
-.statistics-range { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr) auto; align-items: end; gap: 14px; }
+.statistics-range { display: grid; grid-template-columns: minmax(120px,.7fr) minmax(0,1fr) minmax(0,1fr) auto; align-items: end; gap: 14px; }
 .statistics-range .button { height: 38px; }
 .statistics-range-label { margin: 14px 0 0; color: var(--muted); font-size: 12px; }
-#page-statistics .metric-grid { grid-template-columns: repeat(5,minmax(0,1fr)); }
+#page-statistics .metric-grid { grid-template-columns: repeat(6,minmax(0,1fr)); }
 #page-statistics .metric-grid article { padding: 16px; }
 #page-statistics .metric-grid strong { font-size: clamp(17px,1.7vw,24px); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 #page-statistics .metric-grid p { white-space: normal; }
 .statistics-caption { margin: 0 0 18px; color: var(--muted); font-size: 12px; }
-.statistics-table table { min-width: 1100px; }
+.statistics-table table { min-width: 1320px; }
 .statistics-table th, .statistics-table td { padding: 12px 9px; vertical-align: middle; font-size: 12px; }
 .statistics-table th { white-space: nowrap; }
 .statistics-table td strong, .statistics-table td small { display: block; }

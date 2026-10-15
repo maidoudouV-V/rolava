@@ -19,7 +19,7 @@ use crate::history_compression::render_summary_date_heading;
 use crate::memory::{GroupMemorySession, MAX_RETENTION_DAYS, SECONDS_PER_DAY};
 use crate::model_metadata::ModelPricing;
 use crate::repository::db_manager::ConversationRecord;
-use crate::request_statistics::RequestRecorder;
+use crate::request_statistics::{with_request_purpose, RequestPurpose, RequestRecorder};
 use crate::runtime_state::RuntimeGroupMember;
 use crate::tools::ToolRegistry;
 use crate::transport::message::{
@@ -269,6 +269,10 @@ async fn test_model(
         state.request_statistics.clone(),
         request.provider.name.clone(),
         request.model.name.clone(),
+    )
+    .with_pricing(
+        state.request_pricing.clone(),
+        request.provider.base_url.clone(),
     );
     let mut provider: Box<dyn AIProvider + Send + Sync> = match request.provider.r#type.as_str() {
         "openai_compatible" => Box::new(
@@ -316,11 +320,14 @@ async fn test_model(
     provider.set_request_recorder(recorder);
     let response = tokio::time::timeout(
         Duration::from_secs(30),
-        provider.chat_completions(
-            &[ToolChatMessage::User {
-                content: ToolChatUserContent::text("仅回复 OK"),
-            }],
-            &[],
+        with_request_purpose(
+            RequestPurpose::ModelTest,
+            provider.chat_completions(
+                &[ToolChatMessage::User {
+                    content: ToolChatUserContent::text("仅回复 OK"),
+                }],
+                &[],
+            ),
         ),
     )
     .await
@@ -356,7 +363,12 @@ async fn provider_models(
         "gemini" => fetch_gemini_models(&request.provider, &key).await?,
         _ => return Err(ApiError::bad_request("不支持的 Provider 类型")),
     };
-    if request.provider.r#type != "openrouter" {
+    if request.provider.r#type == "openrouter" {
+        state.request_pricing.update_openrouter(
+            &request.provider.base_url,
+            items.iter().map(|item| (item.id.clone(), item.pricing.clone())),
+        );
+    } else {
         for item in &mut items {
             if let Some(metadata) = state.model_metadata.lookup(
                 &request.provider.r#type,
@@ -575,20 +587,7 @@ fn normalize_model_items(models: &[Value], openrouter: bool) -> Vec<ProviderMode
 }
 
 fn openrouter_model_pricing(model: &Value) -> ModelPricing {
-    let price = |key: &str| {
-        let value = model.get("pricing")?.get(key)?;
-        let value = value
-            .as_f64()
-            .or_else(|| value.as_str()?.parse::<f64>().ok())?;
-        let value = value * 1_000_000.0;
-        (value.is_finite() && value >= 0.0).then_some(value)
-    };
-    ModelPricing {
-        input: price("prompt"),
-        output: price("completion"),
-        cache_read: price("input_cache_read"),
-        cache_write: price("input_cache_write"),
-    }
+    ModelPricing::from_openrouter(model)
 }
 
 fn infer_model_vision(model: &Value) -> Option<bool> {

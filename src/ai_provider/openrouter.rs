@@ -556,7 +556,7 @@ fn parse_openrouter_chat_response(response_text: &str) -> anyhow::Result<ToolCha
         );
     }
 
-    let usage = ChatUsage::from_openrouter(&raw_response);
+    let usage = ChatUsage::from_chat_completions(&raw_response);
 
     Ok(ToolChatResponse {
         content,
