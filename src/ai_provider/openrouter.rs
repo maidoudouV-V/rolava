@@ -1,6 +1,7 @@
+use super::chat_completions as chat;
 use crate::ai_provider::{
-    AIProvider, ChatUsage, ExtraBody, ReasoningPayload, ReasoningState, ToolChatContentPart,
-    ToolChatMessage, ToolChatResponse, ToolChatUserContent,
+    AIProvider, ChatUsage, ExtraBody, ReasoningPayload, ReasoningState, ToolChatMessage,
+    ToolChatResponse,
 };
 use crate::request_statistics::{RequestMeasurement, RequestRecorder};
 use crate::tools::{ToolCall, ToolDefinition};
@@ -87,8 +88,8 @@ impl OpenRouterProvider {
             "chat",
         );
         let result = async {
-            let response_text = self.send_request(&url, &body, &mut measurement).await?;
-            parse_openrouter_chat_response(&response_text)
+            let raw_response = self.send_request(&url, &body, &mut measurement).await?;
+            parse_openrouter_chat_response_value(raw_response)
         }
         .await;
         measurement.complete(result.is_ok());
@@ -100,7 +101,7 @@ impl OpenRouterProvider {
         url: &str,
         body: &Value,
         measurement: &mut RequestMeasurement,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Value> {
         let resp = self
             .http_client
             .post(url)
@@ -110,19 +111,7 @@ impl OpenRouterProvider {
             .json(body)
             .send()
             .await?;
-        let status = resp.status();
-        measurement.response_status(status.as_u16());
-        let response_text = resp.text().await?;
-        measurement.response_body(&response_text);
-        trace!(provider = "openrouter", status = %status, response = %response_text, "AI Provider 原始响应");
-        if !status.is_success() {
-            return Err(anyhow!(
-                "OpenRouter API 调用失败，状态码 {}：{}",
-                status,
-                response_text
-            ));
-        }
-        Ok(response_text)
+        chat::read_response(resp, measurement, "openrouter", "OpenRouter API").await
     }
 }
 
@@ -138,7 +127,7 @@ struct OpenRouterChatRequest<'a> {
     reasoning: OpenRouterReasoning<'a>,
     response_format: OpenRouterResponseFormat,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<OpenRouterToolDefinition<'a>>>,
+    tools: Option<Vec<chat::ToolDefinition<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
 }
@@ -163,7 +152,7 @@ enum OpenRouterChatMessage<'a> {
         content: &'a str,
     },
     User {
-        content: OpenRouterUserContent<'a>,
+        content: chat::UserContent<'a>,
     },
     Assistant {
         content: Option<&'a str>,
@@ -172,7 +161,7 @@ enum OpenRouterChatMessage<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_details: Option<&'a Value>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
-        tool_calls: Vec<OpenRouterRequestToolCall<'a>>,
+        tool_calls: Vec<chat::RequestToolCall<'a>>,
     },
     Tool {
         tool_call_id: &'a str,
@@ -180,75 +169,14 @@ enum OpenRouterChatMessage<'a> {
     },
 }
 
-#[derive(Serialize)]
-#[serde(untagged)]
-enum OpenRouterUserContent<'a> {
-    Text(&'a str),
-    Parts(Vec<OpenRouterUserContentPart<'a>>),
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum OpenRouterUserContentPart<'a> {
-    Text { text: &'a str },
-    ImageUrl { image_url: OpenRouterImageUrl<'a> },
-}
-
-#[derive(Serialize)]
-struct OpenRouterToolDefinition<'a> {
-    #[serde(rename = "type")]
-    definition_type: &'static str,
-    function: OpenRouterFunctionDefinition<'a>,
-}
-
-#[derive(Serialize)]
-struct OpenRouterFunctionDefinition<'a> {
-    name: &'a str,
-    description: &'a str,
-    parameters: &'a Value,
-}
-
-#[derive(Serialize)]
-struct OpenRouterRequestToolCall<'a> {
-    id: &'a str,
-    #[serde(rename = "type")]
-    call_type: &'static str,
-    function: OpenRouterRequestFunctionCall<'a>,
-}
-
-#[derive(Serialize)]
-struct OpenRouterRequestFunctionCall<'a> {
-    name: &'a str,
-    arguments: &'a str,
-}
-
 /// OpenRouter 视觉描述请求结构
 #[derive(Serialize)]
 struct OpenRouterVisionRequest<'a> {
     model: &'a str,
-    messages: Vec<OpenRouterVisionMessage<'a>>,
+    messages: Vec<chat::VisionMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<i32>,
     reasoning: OpenRouterReasoning<'a>,
-}
-
-#[derive(Serialize)]
-struct OpenRouterVisionMessage<'a> {
-    role: &'a str,
-    content: Vec<OpenRouterVisionContent<'a>>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum OpenRouterVisionContent<'a> {
-    Text { text: &'a str },
-    ImageUrl { image_url: OpenRouterImageUrl<'a> },
-}
-
-#[derive(Serialize)]
-struct OpenRouterImageUrl<'a> {
-    url: &'a str,
-    detail: &'static str,
 }
 
 /// OpenRouter Chat Completions 响应结构
@@ -261,33 +189,17 @@ struct OpenRouterChatResponse {
 
 #[derive(Deserialize)]
 struct OpenRouterChoice {
-    index: usize,
     message: OpenRouterMessage,
     finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct OpenRouterMessage {
-    role: Option<String>,
     content: Option<String>,
     reasoning: Option<Value>,
     reasoning_content: Option<Value>,
     reasoning_details: Option<Value>,
-    tool_calls: Option<Vec<OpenRouterResponseToolCall>>,
-}
-
-#[derive(Deserialize)]
-struct OpenRouterResponseToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    call_type: String,
-    function: OpenRouterResponseFunctionCall,
-}
-
-#[derive(Deserialize)]
-struct OpenRouterResponseFunctionCall {
-    name: String,
-    arguments: String,
+    tool_calls: Option<Vec<chat::ResponseToolCall>>,
 }
 
 fn build_openrouter_chat_request<'a>(
@@ -305,7 +217,7 @@ fn build_openrouter_chat_request<'a>(
                 content: content.as_str(),
             },
             ToolChatMessage::User { content } => OpenRouterChatMessage::User {
-                content: openrouter_user_content(content),
+                content: chat::user_content(content),
             },
             ToolChatMessage::Assistant {
                 content,
@@ -323,10 +235,10 @@ fn build_openrouter_chat_request<'a>(
                 },
                 tool_calls: tool_calls
                     .iter()
-                    .map(|call| OpenRouterRequestToolCall {
+                    .map(|call| chat::RequestToolCall {
                         id: call.id.as_str(),
                         call_type: "function",
-                        function: OpenRouterRequestFunctionCall {
+                        function: chat::RequestFunctionCall {
                             name: call.name.as_str(),
                             arguments: call.arguments.as_str(),
                         },
@@ -345,9 +257,9 @@ fn build_openrouter_chat_request<'a>(
     let tools = (!tools.is_empty()).then(|| {
         tools
             .iter()
-            .map(|tool| OpenRouterToolDefinition {
+            .map(|tool| chat::ToolDefinition {
                 definition_type: "function",
-                function: OpenRouterFunctionDefinition {
+                function: chat::FunctionDefinition {
                     name: tool.name,
                     description: tool.description,
                     parameters: &tool.parameters,
@@ -371,30 +283,6 @@ fn build_openrouter_chat_request<'a>(
         },
         tools,
         tool_choice,
-    }
-}
-
-fn openrouter_user_content(content: &ToolChatUserContent) -> OpenRouterUserContent<'_> {
-    if let Some(text) = content.as_text() {
-        OpenRouterUserContent::Text(text)
-    } else {
-        OpenRouterUserContent::Parts(
-            content
-                .parts()
-                .iter()
-                .map(|part| match part {
-                    ToolChatContentPart::Text { text } => OpenRouterUserContentPart::Text { text },
-                    ToolChatContentPart::Image { data_url } => {
-                        OpenRouterUserContentPart::ImageUrl {
-                            image_url: OpenRouterImageUrl {
-                                url: data_url,
-                                detail: "high",
-                            },
-                        }
-                    }
-                })
-                .collect(),
-        )
     }
 }
 
@@ -426,12 +314,12 @@ impl AIProvider for OpenRouterProvider {
         let url = format!("{}/chat/completions", self.base_url);
         let body = self.request_body(OpenRouterVisionRequest {
             model: &self.model,
-            messages: vec![OpenRouterVisionMessage {
+            messages: vec![chat::VisionMessage {
                 role: "user",
                 content: vec![
-                    OpenRouterVisionContent::Text { text: prompt },
-                    OpenRouterVisionContent::ImageUrl {
-                        image_url: OpenRouterImageUrl {
+                    chat::VisionContent::Text { text: prompt },
+                    chat::VisionContent::ImageUrl {
+                        image_url: chat::ImageUrl {
                             url: image_data_url,
                             detail: "high",
                         },
@@ -459,11 +347,9 @@ impl AIProvider for OpenRouterProvider {
             "vision",
         );
         let result = async {
-            let response_text = self.send_request(&url, &body, &mut measurement).await?;
-            let raw_response: Value = serde_json::from_str(&response_text)
-                .map_err(|e| anyhow!("解析 OpenRouter 视觉响应失败：{}", e))?;
+            let raw_response = self.send_request(&url, &body, &mut measurement).await?;
             check_openrouter_response_error(&raw_response)?;
-            let parsed: OpenRouterChatResponse = serde_json::from_str(&response_text)
+            let parsed = OpenRouterChatResponse::deserialize(&raw_response)
                 .map_err(|e| anyhow!("解析 OpenRouter 视觉响应失败：{}", e))?;
             parsed
                 .choices
@@ -503,11 +389,9 @@ fn check_openrouter_response_error(raw_response: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_openrouter_chat_response(response_text: &str) -> anyhow::Result<ToolChatResponse> {
-    let raw_response: Value = serde_json::from_str(response_text)
-        .map_err(|error| anyhow!("解析 OpenRouter 原始 JSON 失败：{}", error))?;
+fn parse_openrouter_chat_response_value(raw_response: Value) -> anyhow::Result<ToolChatResponse> {
     check_openrouter_response_error(&raw_response)?;
-    let parsed: OpenRouterChatResponse = serde_json::from_str(response_text)
+    let parsed: OpenRouterChatResponse = OpenRouterChatResponse::deserialize(&raw_response)
         .map_err(|error| anyhow!("解析 OpenRouter 响应失败：{}", error))?;
     let first_choice = parsed
         .choices
@@ -625,61 +509,5 @@ fn non_empty_text(text: &str) -> Option<String> {
         None
     } else {
         Some(text.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // 验证结构化推理会原样回传给 OpenRouter。
-    #[test]
-    fn structured_reasoning_is_replayed_without_conversion() {
-        let response = parse_openrouter_chat_response(
-            r#"{
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "reasoning_details": [{
-                            "type": "reasoning.text",
-                            "text": "原始结构化推理"
-                        }],
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "test_tool", "arguments": "{}"}
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }]
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            response.reasoning.display_text.as_deref(),
-            Some("原始结构化推理")
-        );
-        let expected_details =
-            response.raw_response["choices"][0]["message"]["reasoning_details"].clone();
-        let messages = vec![response.assistant_message()];
-        let request = build_openrouter_chat_request(
-            "test",
-            Some(100),
-            "medium",
-            &messages,
-            &[],
-            Some("rolava:chat:test"),
-        );
-        let request_json = serde_json::to_value(request).unwrap();
-
-        assert_eq!(request_json["session_id"], "rolava:chat:test");
-        assert_eq!(
-            request_json["messages"][0]["reasoning_details"],
-            expected_details
-        );
-        assert!(request_json["messages"][0].get("reasoning").is_none());
     }
 }

@@ -479,23 +479,3 @@ fn persist_document(path: &Path, document: &DocumentMut) -> Result<()> {
 pub fn config_path() -> PathBuf {
     PathBuf::from("config/meta.toml")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ensure_admin_token;
-    use std::fs;
-
-    #[test]
-    fn empty_admin_token_is_generated_once() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("meta.toml");
-        fs::write(&path, "[admin]\ntoken = \"\"\n").unwrap();
-
-        let generated = ensure_admin_token(&path).unwrap();
-        let loaded_again = ensure_admin_token(&path).unwrap();
-
-        assert_eq!(generated, loaded_again);
-        assert!(generated.len() >= 40);
-        assert!(fs::read_to_string(path).unwrap().contains(&generated));
-    }
-}

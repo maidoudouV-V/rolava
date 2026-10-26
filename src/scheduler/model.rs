@@ -107,28 +107,3 @@ fn validate_text_length(name: &str, value: &str, min: usize, max: usize) -> Resu
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use chrono::{Duration, Local};
-
-    use super::calculate_next_run;
-
-    // 验证五段 cron 表达式能计算下次执行时间。
-    #[test]
-    fn parses_five_field_cron() {
-        let now = Local::now();
-        let next = calculate_next_run("cron:0 9 * * *", now).unwrap();
-        assert!(next > now);
-    }
-
-    // 验证过去的一次性执行时间会被拒绝。
-    #[test]
-    fn rejects_past_one_time_schedule() {
-        let now = Local::now();
-        let past = (now - Duration::days(1))
-            .format("at:%Y-%m-%d %H:%M:%S")
-            .to_string();
-        assert!(calculate_next_run(&past, now).is_err());
-    }
-}

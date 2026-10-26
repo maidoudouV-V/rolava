@@ -194,8 +194,8 @@ impl AIProvider for GeminiProvider {
             "chat",
         );
         let result = async {
-            let response_text = self.send_generate_content(&body, &mut measurement).await?;
-            chat::parse_response(&response_text, &self.model)
+            let raw = self.send_generate_content(&body, &mut measurement).await?;
+            chat::parse_response_value(raw, &self.model)
         }
         .await;
         measurement.complete(result.is_ok());
@@ -244,8 +244,8 @@ impl AIProvider for GeminiProvider {
             "vision",
         );
         let result = async {
-            let response_text = self.send_generate_content(&body, &mut measurement).await?;
-            let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
+            let raw = self.send_generate_content(&body, &mut measurement).await?;
+            let parsed = GeminiGenerateContentResponse::deserialize(&raw)
                 .map_err(|err| anyhow!("解析 Gemini 视觉响应失败：{}", err))?;
             extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Gemini 视觉响应内容为空"))
         }
@@ -271,8 +271,8 @@ impl AIProvider for GeminiProvider {
             "web_search",
         );
         let result = async {
-            let response_text = self.send_generate_content(&body, &mut measurement).await?;
-            let parsed: GeminiGenerateContentResponse = serde_json::from_str(&response_text)
+            let raw = self.send_generate_content(&body, &mut measurement).await?;
+            let parsed = GeminiGenerateContentResponse::deserialize(&raw)
                 .map_err(|err| anyhow!("解析 Gemini 联网搜索响应失败：{}", err))?;
             extract_gemini_text(&parsed).ok_or_else(|| anyhow!("Gemini 联网搜索响应内容为空"))
         }
@@ -315,7 +315,7 @@ impl GeminiProvider {
         &self,
         body: &(impl Serialize + Sync),
         measurement: &mut RequestMeasurement,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Value> {
         let body = self.request_body(body)?;
         let url = self.generate_content_url();
         trace!(provider = "gemini", model = %self.model, thinking_config = ?body.pointer("/generationConfig/thinkingConfig"), "Gemini 思考配置");
@@ -335,7 +335,10 @@ impl GeminiProvider {
             .text()
             .await
             .with_context(|| format!("读取 Gemini 响应失败：{}，HTTP {}", url, status))?;
-        measurement.response_body(&response_text);
+        let raw = serde_json::from_str::<Value>(&response_text);
+        if let Ok(raw) = &raw {
+            measurement.response_json(raw);
+        }
         trace!(provider = "gemini", status = %status, response = %response_text, "AI Provider 原始响应");
         if !status.is_success() {
             return Err(anyhow!(
@@ -346,11 +349,10 @@ impl GeminiProvider {
             ));
         }
 
-        let raw: Value =
-            serde_json::from_str(&response_text).context("解析 Gemini 响应 JSON 失败")?;
+        let raw = raw.context("解析 Gemini 响应 JSON 失败")?;
         chat::validate_response(&raw)?;
 
-        Ok(response_text)
+        Ok(raw)
     }
 }
 

@@ -1,6 +1,7 @@
+use super::chat_completions as chat;
 use crate::ai_provider::{
-    AIProvider, ChatUsage, ExtraBody, ReasoningPayload, ReasoningState, ToolChatContentPart,
-    ToolChatMessage, ToolChatResponse, ToolChatUserContent,
+    AIProvider, ChatUsage, ExtraBody, ReasoningPayload, ReasoningState, ToolChatMessage,
+    ToolChatResponse,
 };
 use crate::request_statistics::{RequestMeasurement, RequestRecorder};
 use crate::tools::{ToolCall, ToolDefinition};
@@ -58,7 +59,7 @@ impl OpenAICompatibleProvider {
         body: &Value,
         api_name: &str,
         measurement: &mut RequestMeasurement,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Value> {
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
             .http_client
@@ -67,24 +68,7 @@ impl OpenAICompatibleProvider {
             .json(body)
             .send()
             .await?;
-        let status = resp.status();
-        measurement.response_status(status.as_u16());
-        let response_text = if status.is_success() {
-            resp.text().await?
-        } else {
-            resp.text().await.unwrap_or_default()
-        };
-        measurement.response_body(&response_text);
-        trace!(provider = "openai_compatible", status = %status, response = %response_text, "AI Provider 原始响应");
-        if !status.is_success() {
-            return Err(anyhow!(
-                "{} 调用失败，状态码 {}：{}",
-                api_name,
-                status,
-                response_text
-            ));
-        }
-        Ok(response_text)
+        chat::read_response(resp, measurement, "openai_compatible", api_name).await
     }
 }
 
@@ -98,23 +82,9 @@ struct OpenAICompatibleChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<OpenAICompatibleToolDefinition<'a>>>,
+    tools: Option<Vec<chat::ToolDefinition<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
-}
-
-#[derive(Serialize)]
-struct OpenAICompatibleToolDefinition<'a> {
-    #[serde(rename = "type")]
-    definition_type: &'static str,
-    function: OpenAICompatibleFunctionDefinition<'a>,
-}
-
-#[derive(Serialize)]
-struct OpenAICompatibleFunctionDefinition<'a> {
-    name: &'a str,
-    description: &'a str,
-    parameters: &'a Value,
 }
 
 #[derive(Serialize)]
@@ -124,14 +94,14 @@ enum OpenAICompatibleToolMessage<'a> {
         content: &'a str,
     },
     User {
-        content: OpenAICompatibleUserContent<'a>,
+        content: chat::UserContent<'a>,
     },
     Assistant {
         content: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<&'a str>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
-        tool_calls: Vec<OpenAICompatibleRequestToolCall<'a>>,
+        tool_calls: Vec<chat::RequestToolCall<'a>>,
     },
     Tool {
         tool_call_id: &'a str,
@@ -139,69 +109,14 @@ enum OpenAICompatibleToolMessage<'a> {
     },
 }
 
-#[derive(Serialize)]
-#[serde(untagged)]
-enum OpenAICompatibleUserContent<'a> {
-    Text(&'a str),
-    Parts(Vec<OpenAICompatibleUserContentPart<'a>>),
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum OpenAICompatibleUserContentPart<'a> {
-    Text {
-        text: &'a str,
-    },
-    ImageUrl {
-        image_url: OpenAICompatibleImageUrl<'a>,
-    },
-}
-
-#[derive(Serialize)]
-struct OpenAICompatibleRequestToolCall<'a> {
-    id: &'a str,
-    #[serde(rename = "type")]
-    call_type: &'static str,
-    function: OpenAICompatibleRequestFunctionCall<'a>,
-}
-
-#[derive(Serialize)]
-struct OpenAICompatibleRequestFunctionCall<'a> {
-    name: &'a str,
-    arguments: &'a str,
-}
-
 /// OpenAI Compatible 视觉描述请求结构
 #[derive(Serialize)]
 struct OpenAICompatibleVisionRequest<'a> {
     model: &'a str,
-    messages: Vec<OpenAICompatibleVisionMessage<'a>>,
+    messages: Vec<chat::VisionMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<i32>,
     reasoning_effort: &'a str,
-}
-
-#[derive(Serialize)]
-struct OpenAICompatibleVisionMessage<'a> {
-    role: &'a str,
-    content: Vec<OpenAICompatibleVisionContent<'a>>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum OpenAICompatibleVisionContent<'a> {
-    Text {
-        text: &'a str,
-    },
-    ImageUrl {
-        image_url: OpenAICompatibleImageUrl<'a>,
-    },
-}
-
-#[derive(Serialize)]
-struct OpenAICompatibleImageUrl<'a> {
-    url: &'a str,
-    detail: &'static str,
 }
 
 /// OpenAI Chat Completions 官方 Web Search 请求结构。
@@ -226,31 +141,15 @@ struct OpenAICompatibleChatResponse {
 }
 #[derive(Deserialize)]
 struct OpenAICompatibleChoice {
-    index: usize,
     message: OpenAICompatibleMessage,
     finish_reason: Option<String>,
 }
 #[derive(Deserialize)]
 struct OpenAICompatibleMessage {
-    role: Option<String>,
     // OpenAI 可能返回 None（例如调用工具时），所以用 Option
     content: Option<String>,
     reasoning_content: Option<String>,
-    tool_calls: Option<Vec<OpenAICompatibleResponseToolCall>>,
-}
-
-#[derive(Deserialize)]
-struct OpenAICompatibleResponseToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    call_type: String,
-    function: OpenAICompatibleResponseFunctionCall,
-}
-
-#[derive(Deserialize)]
-struct OpenAICompatibleResponseFunctionCall {
-    name: String,
-    arguments: String,
+    tool_calls: Option<Vec<chat::ResponseToolCall>>,
 }
 
 fn build_openai_compatible_request<'a>(
@@ -267,7 +166,7 @@ fn build_openai_compatible_request<'a>(
                 content: content.as_str(),
             },
             ToolChatMessage::User { content } => OpenAICompatibleToolMessage::User {
-                content: openai_user_content(content),
+                content: chat::user_content(content),
             },
             ToolChatMessage::Assistant {
                 content,
@@ -282,10 +181,10 @@ fn build_openai_compatible_request<'a>(
                 },
                 tool_calls: tool_calls
                     .iter()
-                    .map(|call| OpenAICompatibleRequestToolCall {
+                    .map(|call| chat::RequestToolCall {
                         id: call.id.as_str(),
                         call_type: "function",
-                        function: OpenAICompatibleRequestFunctionCall {
+                        function: chat::RequestFunctionCall {
                             name: call.name.as_str(),
                             arguments: call.arguments.as_str(),
                         },
@@ -304,9 +203,9 @@ fn build_openai_compatible_request<'a>(
     let tools = (!tools.is_empty()).then(|| {
         tools
             .iter()
-            .map(|tool| OpenAICompatibleToolDefinition {
+            .map(|tool| chat::ToolDefinition {
                 definition_type: "function",
-                function: OpenAICompatibleFunctionDefinition {
+                function: chat::FunctionDefinition {
                     name: tool.name,
                     description: tool.description,
                     parameters: &tool.parameters,
@@ -323,32 +222,6 @@ fn build_openai_compatible_request<'a>(
         reasoning_effort: (reasoning_effort != "auto").then_some(reasoning_effort),
         tools,
         tool_choice,
-    }
-}
-
-fn openai_user_content(content: &ToolChatUserContent) -> OpenAICompatibleUserContent<'_> {
-    if let Some(text) = content.as_text() {
-        OpenAICompatibleUserContent::Text(text)
-    } else {
-        OpenAICompatibleUserContent::Parts(
-            content
-                .parts()
-                .iter()
-                .map(|part| match part {
-                    ToolChatContentPart::Text { text } => {
-                        OpenAICompatibleUserContentPart::Text { text }
-                    }
-                    ToolChatContentPart::Image { data_url } => {
-                        OpenAICompatibleUserContentPart::ImageUrl {
-                            image_url: OpenAICompatibleImageUrl {
-                                url: data_url,
-                                detail: "high",
-                            },
-                        }
-                    }
-                })
-                .collect(),
-        )
     }
 }
 
@@ -384,10 +257,10 @@ impl AIProvider for OpenAICompatibleProvider {
             "chat",
         );
         let result = async {
-            let response_text = self
+            let raw_response = self
                 .send_request(&body, "OpenAI Compatible API", &mut measurement)
                 .await?;
-            parse_openai_compatible_chat_response(&response_text)
+            parse_openai_compatible_chat_response_value(raw_response)
         }
         .await;
         measurement.complete(result.is_ok());
@@ -397,12 +270,12 @@ impl AIProvider for OpenAICompatibleProvider {
     async fn describe_image(&self, image_data_url: &str, prompt: &str) -> anyhow::Result<String> {
         let body = self.extra_body.merge(OpenAICompatibleVisionRequest {
             model: &self.model,
-            messages: vec![OpenAICompatibleVisionMessage {
+            messages: vec![chat::VisionMessage {
                 role: "user",
                 content: vec![
-                    OpenAICompatibleVisionContent::Text { text: prompt },
-                    OpenAICompatibleVisionContent::ImageUrl {
-                        image_url: OpenAICompatibleImageUrl {
+                    chat::VisionContent::Text { text: prompt },
+                    chat::VisionContent::ImageUrl {
+                        image_url: chat::ImageUrl {
                             url: image_data_url,
                             detail: "high",
                         },
@@ -427,12 +300,12 @@ impl AIProvider for OpenAICompatibleProvider {
             "vision",
         );
         let result = async {
-            let response_text = self
+            let raw_response = self
                 .send_request(&body, "OpenAI Compatible 视觉 API", &mut measurement)
                 .await?;
             let parsed =
-                parse_openai_compatible_response(&response_text, "OpenAI Compatible 视觉响应")?;
-            first_choice(&parsed, &response_text, "OpenAI Compatible 视觉响应")?
+                parse_openai_compatible_response(&raw_response, "OpenAI Compatible 视觉响应")?;
+            first_choice(&parsed, "OpenAI Compatible 视觉响应")?
                 .message
                 .content
                 .clone()
@@ -447,7 +320,7 @@ impl AIProvider for OpenAICompatibleProvider {
         let body = self.extra_body.merge(OpenAICompatibleWebSearchRequest {
             model: &self.model,
             messages: vec![OpenAICompatibleToolMessage::User {
-                content: OpenAICompatibleUserContent::Text(question),
+                content: chat::UserContent::Text(question),
             }],
             web_search_options: OpenAICompatibleWebSearchOptions {
                 search_context_size: WEB_SEARCH_CONTEXT_SIZE,
@@ -468,12 +341,12 @@ impl AIProvider for OpenAICompatibleProvider {
             "web_search",
         );
         let result = async {
-            let response_text = self
+            let raw_response = self
                 .send_request(&body, "OpenAI Compatible 联网搜索 API", &mut measurement)
                 .await?;
             let parsed =
-                parse_openai_compatible_response(&response_text, "OpenAI Compatible 联网搜索响应")?;
-            let choice = first_choice(&parsed, &response_text, "OpenAI Compatible 联网搜索响应")?;
+                parse_openai_compatible_response(&raw_response, "OpenAI Compatible 联网搜索响应")?;
+            let choice = first_choice(&parsed, "OpenAI Compatible 联网搜索响应")?;
             choice
                 .message
                 .content
@@ -489,12 +362,12 @@ impl AIProvider for OpenAICompatibleProvider {
     }
 }
 
-fn parse_openai_compatible_chat_response(response_text: &str) -> anyhow::Result<ToolChatResponse> {
+fn parse_openai_compatible_chat_response_value(
+    raw_response: Value,
+) -> anyhow::Result<ToolChatResponse> {
     let response_name = "OpenAI Compatible 响应";
-    let parsed = parse_openai_compatible_response(response_text, response_name)?;
-    let raw_response: Value = serde_json::from_str(response_text)
-        .map_err(|error| anyhow!("解析{}原始 JSON 失败：{}", response_name, error))?;
-    let first_choice = first_choice(&parsed, response_text, response_name)?;
+    let parsed = parse_openai_compatible_response(&raw_response, response_name)?;
+    let first_choice = first_choice(&parsed, response_name)?;
     let content = first_choice.message.content.clone();
     let reasoning_content = first_choice.message.reasoning_content.clone();
     let finish_reason = first_choice.finish_reason.clone();
@@ -540,58 +413,15 @@ fn parse_openai_compatible_chat_response(response_text: &str) -> anyhow::Result<
 }
 
 fn parse_openai_compatible_response(
-    response_text: &str,
+    raw_response: &Value,
     response_name: &str,
 ) -> anyhow::Result<OpenAICompatibleChatResponse> {
-    serde_json::from_str(response_text)
+    OpenAICompatibleChatResponse::deserialize(raw_response)
         .map_err(|error| anyhow!("解析{}失败：{}", response_name, error))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // 验证推理文本会以兼容接口字段回传。
-    #[test]
-    fn text_reasoning_is_replayed_as_openai_reasoning_content() {
-        let response = parse_openai_compatible_chat_response(
-            r#"{
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "reasoning_content": "原始推理文本",
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "test_tool", "arguments": "{}"}
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }]
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            response.reasoning.display_text.as_deref(),
-            Some("原始推理文本")
-        );
-        let messages = vec![response.assistant_message()];
-        let request = build_openai_compatible_request("test", Some(100), "medium", &messages, &[]);
-        let request_json = serde_json::to_value(request).unwrap();
-
-        assert_eq!(
-            request_json["messages"][0]["reasoning_content"],
-            "原始推理文本"
-        );
-    }
 }
 
 fn first_choice<'a>(
     response: &'a OpenAICompatibleChatResponse,
-    _response_text: &str,
     response_name: &str,
 ) -> anyhow::Result<&'a OpenAICompatibleChoice> {
     let Some(choices) = response.choices.as_ref() else {

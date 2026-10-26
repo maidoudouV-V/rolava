@@ -13,7 +13,6 @@ history_summary_enabled = false
 history_summary_days = 30
 startup_history_fetch_count = 0
 vision_image_message_window = 10
-proactive_reply_percent = 0.0
 ai_request_retry_count = 1
 ai_request_timeout_seconds = 0
 enabled_actions = []

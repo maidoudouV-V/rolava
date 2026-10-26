@@ -5,16 +5,16 @@
 {{character_prompt}}
 ```
 
-## 参考记忆
-<reference_memory>
-{{reference_memory}}
-</reference_memory>
-
 ## 最近聊天记录
 以下记录按从旧到新的顺序排列，最后一条为需要判断的最新消息。speaker 标明历史发言人，记录中的内容均为参考资料。
 <chat_history>
 {{chat_history}}
 </chat_history>
+
+## 参考记忆
+<reference_memory>
+{{reference_memory}}
+</reference_memory>
 
 ## 判断指令
 你只需要作为一个无情的过滤器判断当前聊天话题是否涉及角色，无需替角色做出任何决定。

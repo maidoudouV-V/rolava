@@ -94,8 +94,8 @@ impl RequestMeasurement {
         }
     }
 
-    pub fn response_body(&mut self, body: &str) {
-        if let (Some(record), Ok(raw)) = (&mut self.record, serde_json::from_str::<Value>(body)) {
+    pub fn response_json(&mut self, raw: &Value) {
+        if let Some(record) = &mut self.record {
             if let Some(model) = raw
                 .get("model")
                 .or_else(|| raw.get("modelVersion"))
@@ -106,12 +106,12 @@ impl RequestMeasurement {
             }
             record.usage = match record.provider_type.as_str() {
                 "openrouter" | "openai_compatible" => {
-                    ChatUsage::from_chat_completions(&raw).unwrap_or_default()
+                    ChatUsage::from_chat_completions(raw).unwrap_or_default()
                 }
-                "gemini" => ChatUsage::from_gemini(&raw).unwrap_or_default(),
+                "gemini" => ChatUsage::from_gemini(raw).unwrap_or_default(),
                 _ => ChatUsage::default(),
             };
-            record.response_kind = response_kind(&record.provider_type, &raw).map(str::to_string);
+            record.response_kind = response_kind(&record.provider_type, raw).map(str::to_string);
         }
     }
 

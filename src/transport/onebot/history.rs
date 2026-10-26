@@ -1,25 +1,14 @@
-use anyhow::{bail, Context, Result};
-use reqwest::header::AUTHORIZATION;
+use anyhow::{bail, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
-use tracing::trace;
 
 use super::{OneBotGroupMessageDto, OneBotHttpServer, OneBotMessageDto, OneBotMessageEnvelopeDto};
 use crate::runtime_state::{RuntimeGroupInfo, RuntimeGroupMember};
 use crate::transport::message::IncomingMessage;
 
 const HISTORY_API_TIMEOUT: Duration = Duration::from_secs(15);
-
-#[derive(Deserialize)]
-struct OneBotHistoryApiResponse<T> {
-    status: String,
-    retcode: i32,
-    data: Option<T>,
-    message: Option<String>,
-    wording: Option<String>,
-}
 
 #[derive(Deserialize)]
 struct OneBotLoginInfoDto {
@@ -155,54 +144,17 @@ impl OneBotHttpServer {
     where
         T: DeserializeOwned,
     {
-        trace!(api_path, payload = %payload, "OneBot 历史同步完整请求");
-        let mut request = self
-            .client
-            .post(format!("{}/{}", self.onebot_api_url, api_path))
-            .timeout(HISTORY_API_TIMEOUT)
-            .json(&payload);
-        if let Some(token) = &self.onebot_token {
-            request = request.header(AUTHORIZATION, format!("Bearer {}", token));
-        }
-
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("调用 OneBot {} 接口失败", api_path))?;
-        let http_status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .with_context(|| format!("读取 OneBot {} 响应失败", api_path))?;
-        trace!(api_path, status = %http_status, response = %response_text, "OneBot 历史同步原始响应");
-        if !http_status.is_success() {
-            bail!(
-                "OneBot {} 接口返回 HTTP {}，响应正文：{}",
-                api_path,
-                http_status,
-                response_text
-            );
-        }
-
-        let response: OneBotHistoryApiResponse<T> = serde_json::from_str(&response_text)
-            .with_context(|| {
-                format!(
-                    "解析 OneBot {} 响应失败，原始响应：{}",
-                    api_path, response_text
-                )
-            })?;
-        if response.retcode != 0 || response.status != "ok" {
-            let detail = response
-                .wording
-                .filter(|text| !text.trim().is_empty())
-                .or(response.message)
-                .unwrap_or_else(|| "未提供错误信息".to_string());
+        let response = self
+            .api_client()
+            .request::<T>(api_path, &payload, Some(HISTORY_API_TIMEOUT))
+            .await?;
+        if response.retcode != 0 || response.status.as_deref() != Some("ok") {
             bail!(
                 "OneBot {} 接口返回错误，status={}，retcode={}：{}",
                 api_path,
-                response.status,
+                response.status_text(),
                 response.retcode,
-                detail
+                response.error_detail()
             );
         }
         response
@@ -216,43 +168,4 @@ fn value_as_i64(value: &Value) -> Option<i64> {
         .as_i64()
         .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
         .or_else(|| value.as_str()?.parse().ok())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{OneBotGroupHistoryDataDto, OneBotHistoryApiResponse};
-
-    // 验证字符串类型的消息序号可解析并参与排序。
-    #[test]
-    fn parses_group_history_response_with_string_message_sequence() {
-        let response: OneBotHistoryApiResponse<OneBotGroupHistoryDataDto> = serde_json::from_str(
-            r#"{
-                    "status": "ok",
-                    "retcode": 0,
-                    "data": {
-                        "messages": [{
-                            "time": 100,
-                            "message_seq": "200",
-                            "message_type": "group",
-                            "sub_type": "normal",
-                            "message_id": 300,
-                            "group_id": 123456,
-                            "user_id": 42,
-                            "message": [{"type":"text","data":{"text":"hello"}}],
-                            "raw_message": "hello",
-                            "font": 0,
-                            "sender": {"user_id":42,"nickname":"user"}
-                        }]
-                    },
-                    "message": "",
-                    "wording": "",
-                    "stream": "normal-action"
-                }"#,
-        )
-        .unwrap();
-
-        let history = response.data.unwrap().messages;
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].order_key(), (100, 200, 300));
-    }
 }

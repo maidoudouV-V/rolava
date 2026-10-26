@@ -1,6 +1,5 @@
-use reqwest::header::AUTHORIZATION;
+use crate::transport::onebot::client::OneBotApiClient;
 use reqwest::Client;
-use serde::Deserialize;
 use tracing::warn;
 
 use crate::config::AppConfig;
@@ -9,38 +8,6 @@ use crate::transport::message::{ConversationKind, MessageTarget};
 pub(super) struct MemberProfile {
     pub nickname: String,
     pub group_card: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct OneBotResponse<T> {
-    #[serde(default)]
-    status: Option<String>,
-    retcode: i32,
-    data: Option<T>,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
-    wording: Option<String>,
-}
-
-impl<T> OneBotResponse<T> {
-    fn error_detail(&self) -> &str {
-        self.wording
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-            .or_else(|| {
-                self.message
-                    .as_deref()
-                    .filter(|text| !text.trim().is_empty())
-            })
-            .unwrap_or("未提供错误详情")
-    }
-}
-
-#[derive(Deserialize)]
-struct OneBotGroupMemberInfo {
-    nickname: String,
-    card: Option<String>,
 }
 
 /// 按需读取最近活跃用户的 QQ 昵称和群名片。
@@ -72,69 +39,23 @@ impl OneBotMemberProfileClient {
         {
             return None;
         }
-
-        let mut request = self
-            .client
-            .post(format!("{}/get_group_member_info", self.onebot_api_url))
-            .json(&serde_json::json!({
-                "group_id": self.target.conversation.id,
-                "user_id": user_id,
-            }));
-        if let Some(token) = &self.onebot_token {
-            request = request.header(AUTHORIZATION, format!("Bearer {}", token));
-        }
-
-        let response = match request.send().await {
-            Ok(response) => response,
+        let api = OneBotApiClient::new(
+            &self.client,
+            &self.onebot_api_url,
+            self.onebot_token.as_deref(),
+        );
+        match api
+            .group_member_info(&self.target.conversation.id, user_id)
+            .await
+        {
+            Ok(member) => member.map(|member| MemberProfile {
+                nickname: member.nickname,
+                group_card: member.card,
+            }),
             Err(error) => {
                 warn!(user_id, error = %format!("{error:#}"), "查询记忆成员资料失败");
-                return None;
+                None
             }
-        };
-        let http_status = response.status();
-        let response_text = match response.text().await {
-            Ok(text) => text,
-            Err(error) => {
-                warn!(user_id, error = %format!("{error:#}"), "读取记忆成员资料响应失败");
-                return None;
-            }
-        };
-        if !http_status.is_success() {
-            warn!(
-                user_id,
-                status = %http_status,
-                response = %response_text,
-                "查询记忆成员资料返回 HTTP 错误"
-            );
-            return None;
         }
-        let result =
-            match serde_json::from_str::<OneBotResponse<OneBotGroupMemberInfo>>(&response_text) {
-                Ok(result) => result,
-                Err(error) => {
-                    warn!(
-                        user_id,
-                        response = %response_text,
-                        error = %format!("{error:#}"),
-                        "解析记忆成员资料失败"
-                    );
-                    return None;
-                }
-            };
-        if result.retcode != 0 {
-            warn!(
-                user_id,
-                status = result.status.as_deref().unwrap_or("<missing>"),
-                retcode = result.retcode,
-                error = result.error_detail(),
-                "查询记忆成员资料返回错误"
-            );
-            return None;
-        }
-
-        result.data.map(|member| MemberProfile {
-            nickname: member.nickname,
-            group_card: member.card,
-        })
     }
 }

@@ -108,8 +108,6 @@ pub struct AppSection {
     /// 主模型请求中允许附带原始图片的最近正文消息数；0 表示不附带原图。
     #[serde(default = "default_vision_image_message_window")]
     pub vision_image_message_window: usize,
-    /// 更主动回复的概率，范围 0-100；保留供后续流程使用。
-    pub proactive_reply_percent: f64,
     /// 默认聊天模型名称
     pub chat_model_name: String,
     /// 消息过滤模型名称。

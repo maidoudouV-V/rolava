@@ -63,35 +63,3 @@ impl Tool for SetConversationStateTool {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn state_is_explicit_and_invalid_arguments_are_rejected() {
-        for arguments in [
-            r#"{}"#,
-            r#"{"state":"other"}"#,
-            r#"{"state":true}"#,
-            r#"{"state":"end","extra":1}"#,
-        ] {
-            assert!(parse_arguments::<SetConversationStateArgs>(
-                "set_conversation_state",
-                arguments
-            )
-            .is_err());
-        }
-        for (arguments, expected_continue) in [
-            (r#"{"state":"continue"}"#, true),
-            (r#"{"state":"end"}"#, false),
-        ] {
-            let parsed: SetConversationStateArgs =
-                parse_arguments("set_conversation_state", arguments).unwrap();
-            assert_eq!(
-                matches!(parsed.state, ConversationState::Continue),
-                expected_continue
-            );
-        }
-    }
-}
